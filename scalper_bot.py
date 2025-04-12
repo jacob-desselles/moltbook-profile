@@ -85,16 +85,15 @@ class DataManager:
             self.log_trade(f"Error in _calculate_indicators for {symbol}: {str(e)}")
 
     def update_price_data(self, symbol: str, new_data: dict):
-        """Update price data with initialization tracking"""
+        """Update price data with proper timestamp handling"""
         try:
-            # Debug logging
-            self.log_trade(f"Updating price data for {symbol}")
-            self.log_trade(f"Current time: {pd.Timestamp.now()}")
+            # Create timestamp for current data
+            current_timestamp = pd.Timestamp.now()
             
             # Validate incoming data
             required_fields = ['last', 'quoteVolume', 'bid', 'ask']
             if not all(new_data.get(field) is not None for field in required_fields):
-                self.log_trade(f"Missing required fields for {symbol}")
+                self.log_function(f"Missing required fields for {symbol}")
                 return
 
             try:
@@ -104,57 +103,52 @@ class DataManager:
                 ask = float(new_data['ask'])
                 
                 if any(val <= 0 for val in [price, volume, bid, ask]):
-                    self.log_trade(f"Invalid values for {symbol}")
+                    self.log_function(f"Invalid values for {symbol}")
                     return
                     
             except (TypeError, ValueError) as e:
-                self.log_trade(f"Data conversion error for {symbol}: {str(e)}")
+                self.log_function(f"Data conversion error for {symbol}: {str(e)}")
                 return
 
-            timestamp = pd.Timestamp.now()
-            
-            # Create new row with current timestamp
-            new_row = pd.DataFrame({
-                'timestamp': [timestamp],
+            # Create new data point with explicit timestamp index
+            new_data_point = pd.DataFrame({
                 'price': [price],
                 'volume': [volume],
                 'bid': [bid],
                 'ask': [ask]
-            })
-            
+            }, index=[current_timestamp])
+
+            # Initialize or update price data
             if symbol not in self.price_data:
-                self.price_data[symbol] = new_row
-                self.log_trade(f"Created new price data entry for {symbol}")
+                self.price_data[symbol] = new_data_point
             else:
-                # Ensure index is unique by using timestamp
-                new_row.set_index('timestamp', inplace=True)
+                # Remove data older than 2 minutes
+                cutoff_time = current_timestamp - pd.Timedelta(minutes=2)
+                
+                # Ensure existing data has datetime index
                 if not isinstance(self.price_data[symbol].index, pd.DatetimeIndex):
-                    self.price_data[symbol].set_index('timestamp', inplace=True)
+                    try:
+                        self.price_data[symbol].index = pd.to_datetime(self.price_data[symbol].index)
+                    except:
+                        # If conversion fails, initialize new DataFrame
+                        self.price_data[symbol] = new_data_point
+                        return
                 
-                # Remove any data older than 5 minutes before concatenating
-                now = pd.Timestamp.now()
-                cutoff = now - pd.Timedelta(minutes=5)
-                
-                # Filter existing data
-                self.price_data[symbol] = self.price_data[symbol][
-                    self.price_data[symbol].index > cutoff
-                ]
-                
-                # Concatenate with new data
+                # Filter old data and append new
                 self.price_data[symbol] = pd.concat([
-                    self.price_data[symbol],
-                    new_row
+                    self.price_data[symbol][self.price_data[symbol].index > cutoff_time],
+                    new_data_point
                 ]).sort_index()
-                
-                self.log_trade(f"Updated price data for {symbol}, total points: {len(self.price_data[symbol])}")
-                self.log_trade(f"Latest timestamp: {self.price_data[symbol].index[-1]}")
-                
-            # Calculate technical indicators if we have enough data
+
+            # Calculate indicators if we have enough data
             if len(self.price_data[symbol]) >= 5:
                 self._calculate_indicators(symbol)
                 
+            self.log_function(f"Updated {symbol} price data - points: {len(self.price_data[symbol])}")
+            self.log_function(f"Latest timestamp: {self.price_data[symbol].index[-1]}")
+            
         except Exception as e:
-            self.log_trade(f"Error updating price data for {symbol}: {str(e)}")
+            self.log_function(f"Error updating price data for {symbol}: {str(e)}")
 class CryptoScalpingBot:
     def __init__(self):
         super().__init__()
@@ -1373,6 +1367,131 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error adding tooltip: {str(e)}")
 
+    def calculate_momentum_intensity(self, df):
+        """Calculate momentum intensity (Beta) - Market sensitivity"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            # Ensure DataFrame is properly sorted
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate returns using pct_change
+            returns = df['price'].pct_change().fillna(0)
+            
+            # Calculate short and long momentum using standard periods
+            short_momentum = returns.rolling(window=5).mean()
+            long_momentum = returns.rolling(window=15).mean()
+            
+            # Calculate trend strength using the difference between short and long momentum
+            trend_strength = abs(short_momentum.iloc[-1] - long_momentum.iloc[-1]) * 100
+            
+            # Log calculation details
+            self.log_trade(f"Momentum calculation details:")
+            self.log_trade(f"Recent returns: {returns.tail()}")
+            self.log_trade(f"Short momentum: {short_momentum.iloc[-1]:.8f}")
+            self.log_trade(f"Long momentum: {long_momentum.iloc[-1]:.8f}")
+            self.log_trade(f"Trend strength: {trend_strength:.8f}")
+            
+            # Normalize to 0-1 range
+            result = min(trend_strength, 1.0)
+            return max(result, 0.0)
+            
+        except Exception as e:
+            self.log_trade(f"Error in momentum calculation: {str(e)}")
+            return 0.0
+
+    def calculate_price_acceleration(self, df):
+        """Calculate price acceleration (Alpha)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate price changes and acceleration
+            price_changes = df['price'].pct_change().fillna(0)
+            acceleration = price_changes.diff().fillna(0)
+            
+            # Use recent acceleration (last 5 periods)
+            recent_acceleration = acceleration.tail(5).mean() * 100
+            
+            self.log_trade(f"Price acceleration details:")
+            self.log_trade(f"Recent price changes: {price_changes.tail()}")
+            self.log_trade(f"Recent acceleration: {recent_acceleration:.8f}")
+            
+            # Normalize
+            result = min(abs(recent_acceleration), 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in acceleration calculation: {str(e)}")
+            return 0.0
+
+    def calculate_volatility_sensitivity(self, df):
+        """Calculate volatility sensitivity (Vega)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate rolling volatility using standard deviation
+            returns = df['price'].pct_change().fillna(0)
+            volatility = returns.rolling(window=5).std()
+            
+            # Calculate volatility change
+            vol_change = volatility.pct_change().fillna(0)
+            recent_vol_change = abs(vol_change.tail(5).mean()) * 100
+            
+            self.log_trade(f"Volatility details:")
+            self.log_trade(f"Recent volatility: {volatility.tail()}")
+            self.log_trade(f"Recent vol change: {recent_vol_change:.8f}")
+            
+            # Normalize
+            result = min(recent_vol_change, 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in volatility calculation: {str(e)}")
+            return 0.0
+
+    def calculate_volume_impact(self, df, current_volume):
+        """Calculate volume impact (Rho)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate average volume
+            avg_volume = df['volume'].rolling(window=5).mean().fillna(0)
+            if avg_volume.iloc[-1] == 0:
+                return 0.0
+                
+            # Calculate volume ratio
+            volume_ratio = current_volume / avg_volume.iloc[-1]
+            
+            # Calculate excess volume
+            excess_volume = max(0, volume_ratio - 1)
+            
+            self.log_trade(f"Volume impact details:")
+            self.log_trade(f"Current volume: {current_volume}")
+            self.log_trade(f"Average volume: {avg_volume.iloc[-1]}")
+            self.log_trade(f"Volume ratio: {volume_ratio:.8f}")
+            
+            # Normalize
+            result = min(excess_volume, 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in volume impact calculation: {str(e)}")
+            return 0.0
+
     def calculate_current_momentum(self, df):
         """Calculate current momentum percentage"""
         try:
@@ -2352,13 +2471,14 @@ class CryptoScalpingBot:
             self.log_trade(f"Volume USD: {volume_usd}")
             self.log_trade(f"Pair data: {pair_data}")
             
+            # Check data freshness
             df = self.data_manager.price_data.get(pair_data['symbol'])
             if df is not None and len(df) > 0:
                 latest_time = df.index[-1]
                 current_time = pd.Timestamp.now()
                 data_age = (current_time - latest_time).total_seconds()
             
-                if data_age > 300:  # 5 minutes
+                if data_age > 120:  # Changed from 300 to 120 seconds (2 minutes)
                     self.log_trade(f"Skipping {pair_data['symbol']}: Data too old ({data_age:.1f} seconds)")
                     return False
             # Debug: Check DataFrame
