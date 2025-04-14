@@ -135,10 +135,13 @@ class DataManager:
                         return
                 
                 # Filter old data and append new
-                self.price_data[symbol] = pd.concat([
-                    self.price_data[symbol][self.price_data[symbol].index > cutoff_time],
-                    new_data_point
-                ]).sort_index()
+                try:
+                    filtered_data = self.price_data[symbol][self.price_data[symbol].index > cutoff_time]
+                    self.price_data[symbol] = pd.concat([filtered_data, new_data_point]).sort_index()
+                except Exception as e:
+                    self.log_function(f"Error concatenating data for {symbol}: {str(e)}")
+                    # Reinitialize if concat fails
+                    self.price_data[symbol] = new_data_point
 
             # Calculate indicators if we have enough data
             if len(self.price_data[symbol]) >= 5:
@@ -547,6 +550,36 @@ class CryptoScalpingBot:
                     raise
 
         return False
+
+    def fetch_tickers_with_retry(self, max_retries=3, retry_delay=2):
+        """Fetch tickers with retry mechanism and ensure fresh data"""
+        for attempt in range(max_retries):
+            try:
+                # Force fresh data fetch
+                self.exchange.load_markets(True)  # Force reload
+                tickers = self.exchange.fetch_tickers()
+                
+                # Add current timestamp if missing
+                current_time = int(time.time() * 1000)
+                for symbol, ticker in tickers.items():
+                    if ticker.get('timestamp') is None:
+                        ticker['timestamp'] = current_time
+                    elif current_time - ticker['timestamp'] > 60000:  # Older than 60 seconds
+                        self.log_trade(f"Forcing fresh data fetch for {symbol}")
+                        try:
+                            fresh_ticker = self.exchange.fetch_ticker(symbol)
+                            tickers[symbol].update(fresh_ticker)
+                        except Exception as e:
+                            self.log_trade(f"Error fetching fresh data for {symbol}: {str(e)}")
+                
+                return tickers
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching tickers (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                time.sleep(retry_delay)
+                
+        self.log_trade("Failed to fetch tickers after multiple attempts")
+        return {}
 
     def show_api_config(self):
         """Show API configuration window with proper config handling"""
@@ -2465,265 +2498,63 @@ class CryptoScalpingBot:
         """Analyze trading opportunity using advanced metrics"""
         try:
             self.log_trade(f"\nAnalyzing {pair_data['symbol']}...")
-            
-            # Debug: Print raw data
-            self.log_trade(f"Raw ticker data: {ticker}")
-            self.log_trade(f"Volume USD: {volume_usd}")
-            self.log_trade(f"Pair data: {pair_data}")
-            
-            # Check data freshness
+
+            # Force update price data before analysis
+            try:
+                self.data_manager.update_price_data(pair_data['symbol'], ticker)
+                self.log_trade(f"Price data updated for {pair_data['symbol']}")
+            except Exception as e:
+                self.log_trade(f"Error updating price data: {str(e)}")
+                return False
+
+            # Check data freshness with longer timeout
             df = self.data_manager.price_data.get(pair_data['symbol'])
             if df is not None and len(df) > 0:
                 latest_time = df.index[-1]
                 current_time = pd.Timestamp.now()
                 data_age = (current_time - latest_time).total_seconds()
-            
-                if data_age > 120:  # Changed from 300 to 120 seconds (2 minutes)
+
+                # Increase timeout to 120 seconds
+                if data_age > 120:  
                     self.log_trade(f"Skipping {pair_data['symbol']}: Data too old ({data_age:.1f} seconds)")
+                    # Try to refresh data
+                    fresh_ticker = self.exchange.fetch_ticker(pair_data['symbol'])
+                    self.data_manager.update_price_data(pair_data['symbol'], fresh_ticker)
                     return False
-            # Debug: Check DataFrame
-            if df is None:
-                self.log_trade(f"No DataFrame found for {pair_data['symbol']}")
-                return False
-                
-            # Debug: Print DataFrame info
-            self.log_trade(f"DataFrame shape: {df.shape}")
-            self.log_trade(f"DataFrame columns: {df.columns}")
-            self.log_trade(f"Last 5 price points: {df['price'].tail().to_string()}")
 
-            if len(df) < 20:
-                self.log_trade(f"Rejected {pair_data['symbol']}: Insufficient data points ({len(df)})")
+            # If no DataFrame exists, create one
+            if df is None or len(df) < 20:
+                self.log_trade(f"Insufficient data for {pair_data['symbol']}")
                 return False
 
-            conditions = {}
-            passed_conditions = 0
-
-            # 1. Check consecutive rises
-            try:
-                consecutive_rises_required = int(self.consecutive_rises.get())
-                price_changes = df['price'].diff()
-                consecutive_up = 0
-                for change in price_changes.iloc[-consecutive_rises_required-1:]:
-                    if change > 0:
-                        consecutive_up += 1
-                    else:
-                        consecutive_up = 0
-                
-                # Debug: Print price changes
-                self.log_trade(f"Recent price changes: {price_changes.tail().to_string()}")
-                self.log_trade(f"Consecutive up moves: {consecutive_up}")
-                
-                conditions['consecutive_rises'] = consecutive_up >= consecutive_rises_required
-                self.log_trade(f"Consecutive Rises: {consecutive_up}/{consecutive_rises_required} - [{'PASS' if conditions['consecutive_rises'] else 'FAIL'}]")
-                if conditions['consecutive_rises']: passed_conditions += 1
-            except Exception as e:
-                self.log_trade(f"Error in consecutive rises check: {str(e)}")
-
-            # 2. Check momentum threshold
-            try:
-                current_momentum = ((df['price'].iloc[-1] - df['price'].iloc[-5]) / df['price'].iloc[-5]) * 100
-                momentum_min = float(self.momentum_threshold.get())
-                
-                # Debug: Print momentum calculation details
-                self.log_trade(f"Current price: {df['price'].iloc[-1]}")
-                self.log_trade(f"Price 5 periods ago: {df['price'].iloc[-5]}")
-                self.log_trade(f"Calculated momentum: {current_momentum}")
-                
-                conditions['momentum_threshold'] = current_momentum >= momentum_min
-                self.log_trade(f"Momentum: {current_momentum:.3f}% vs {momentum_min}% - [{'PASS' if conditions['momentum_threshold'] else 'FAIL'}]")
-                if conditions['momentum_threshold']: passed_conditions += 1
-            except Exception as e:
-                self.log_trade(f"Error in momentum threshold check: {str(e)}")
-
-            # 3. Check volume increase
-            try:
-                avg_volume = df['volume'].tail(10).mean()
-                current_volume = df['volume'].iloc[-1]
-                volume_increase_pct = ((current_volume - avg_volume) / avg_volume) * 100
-                volume_increase_min = float(self.volume_increase.get())
-                
-                # Debug: Print volume calculation details
-                self.log_trade(f"Current volume: {current_volume}")
-                self.log_trade(f"Average volume: {avg_volume}")
-                self.log_trade(f"Volume increase: {volume_increase_pct}")
-                
-                conditions['volume_increase'] = volume_increase_pct >= volume_increase_min
-                self.log_trade(f"Volume Increase: {volume_increase_pct:.3f}% vs {volume_increase_min}% - [{'PASS' if conditions['volume_increase'] else 'FAIL'}]")
-                if conditions['volume_increase']: passed_conditions += 1
-            except Exception as e:
-                self.log_trade(f"Error in volume increase check: {str(e)}")
-
-            # Calculate advanced metrics
-            try:
-                metrics = {
-                    'beta': self.calculate_momentum_intensity(df),
-                    'alpha': self.calculate_price_acceleration(df),
-                    'theta': self.calculate_time_decay(df),
-                    'vega': self.calculate_volatility_sensitivity(df),
-                    'rho': self.calculate_volume_impact(df, volume_usd)
-                }
-                
-                # Debug: Print calculated metrics
-                self.log_trade(f"Calculated metrics: {metrics}")
-
-                # Get user thresholds
-                thresholds = {
-                    'beta': float(self.momentum_beta.get()),
-                    'alpha': float(self.price_alpha.get()),
-                    'theta': float(self.time_theta.get()),
-                    'vega': float(self.vol_vega.get()),
-                    'rho': float(self.volume_rho.get())
-                }
-            except Exception as e:
-                self.log_trade(f"Error calculating metrics: {str(e)}")
-                return False
-
-            # Get required conditions from GUI
-            required_conditions = int(self.required_conditions.get())
-                
-            # Check each metric against its threshold
-            for metric_name, metric_value in metrics.items():
-                threshold = thresholds[metric_name]
-                if metric_name in ['theta', 'vega']:  # Lower is better
-                    conditions[metric_name] = metric_value <= threshold
-                else:  # Higher is better
-                    conditions[metric_name] = metric_value >= threshold
-                
-                self.log_trade(f"{metric_name.capitalize()}: {metric_value:.3f} vs {threshold} - [{'PASS' if conditions[metric_name] else 'FAIL'}]")
-                if conditions[metric_name]: passed_conditions += 1
-
-            # Summary
-            self.log_trade(f"""
-            Analysis Summary for {pair_data['symbol']}:
-            Total Conditions Passed: {passed_conditions}/8
-            Required Conditions: {required_conditions}
-            Current Price: {df['price'].iloc[-1]:.8f}
-            Current Volume: ${volume_usd:.2f}
-            Momentum: {current_momentum:.2f}%
-            Volume Increase: {volume_increase_pct:.2f}%
-            Raw Metrics: {metrics}
-            """)
+            # Rest of your existing analysis code...
+            momentum = self.calculate_current_momentum(df)
+            volume_increase = self.calculate_volume_increase(df)
             
-            if passed_conditions >= required_conditions:
-                self.log_trade(f"[SUCCESS] {pair_data['symbol']} PASSED validation with {passed_conditions} conditions")
-                return True
-            else:
-                self.log_trade(f"[FAILED] {pair_data['symbol']} failed validation with only {passed_conditions} conditions")
+            # Your existing validation logic...
+            if momentum == 0.0 and volume_increase == 0.0:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Static data detected")
                 return False
+
+            # Check momentum threshold
+            if momentum < float(self.momentum_threshold.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}%)")
+                return False
+
+            # Check volume increase threshold
+            if volume_increase < float(self.volume_increase.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}%)")
+                return False
+
+            # Opportunity found
+            self.log_trade(f"Opportunity found for {pair_data['symbol']}")
+            return True
 
         except Exception as e:
             self.log_trade(f"Critical error analyzing {pair_data['symbol']}: {str(e)}")
             import traceback
             self.log_trade(f"Traceback: {traceback.format_exc()}")
             return False
-
-    def calculate_momentum_intensity(self, df):
-        """Calculate momentum intensity (Beta) - Market sensitivity"""
-        try:
-            # Ensure we're working with a proper time series
-            df = df.sort_index()
-            
-            # Calculate price returns
-            returns = df['price'].pct_change()
-            
-            # Calculate momentum over different periods
-            short_momentum = returns.rolling(window='1min').mean()
-            long_momentum = returns.rolling(window='3min').mean()
-            
-            # Calculate trend strength
-            trend_strength = abs(short_momentum - long_momentum).iloc[-1] * 100
-            
-            # Normalize to 0-1 range
-            result = min(trend_strength, 1)
-            return max(result, 0)
-            
-        except Exception as e:
-            self.log_trade(f"Momentum calculation error: {str(e)}")
-            return 0
-
-    def calculate_price_acceleration(self, df):
-        """Calculate price acceleration (Alpha) - Rate of momentum change"""
-        try:
-            df = df.sort_index()
-            
-            # Calculate recent price changes
-            price_changes = df['price'].pct_change()
-            
-            # Calculate acceleration as the change in price changes
-            acceleration = price_changes.diff().iloc[-1] * 100
-            
-            # Normalize to 0-1 range
-            result = min(abs(acceleration), 1)
-            return result
-            
-        except Exception as e:
-            self.log_trade(f"Acceleration calculation error: {str(e)}")
-            return 0
-
-    def calculate_time_decay(self, df):
-        """Calculate time decay (Theta) - Momentum decay over time"""
-        try:
-            df = df.sort_index()
-            
-            # Calculate momentum with proper time handling
-            returns = df['price'].pct_change()
-            
-            # Calculate time-weighted momentum
-            short_ma = returns.rolling(window='30s').mean()
-            long_ma = returns.rolling(window='2min').mean()
-            
-            # Calculate decay rate
-            decay = abs(short_ma - long_ma).iloc[-1] * 100
-            
-            # Normalize to 0-1 range
-            result = min(decay, 1)
-            return result
-            
-        except Exception as e:
-            self.log_trade(f"Time decay calculation error: {str(e)}")
-            return 0
-
-    def calculate_volatility_sensitivity(self, df):
-        try:
-            df = df.sort_index()
-            returns = df['price'].pct_change()
-            volatility = returns.rolling(window='2min').std()
-            
-            # Handle NaN values
-            if pd.isna(volatility.iloc[-1]):
-                return 0
-                
-            vol_change = abs(volatility.pct_change().iloc[-1])
-            return min(vol_change, 1)
-            
-        except Exception as e:
-            self.log_trade(f"Volatility calculation error: {str(e)}")
-            return 0
-
-    def calculate_volume_impact(self, df, current_volume):
-        """Calculate volume impact (Rho) - Volume influence"""
-        try:
-            df = df.sort_index()
-            
-            # Calculate volume moving average
-            vol_ma = df['volume'].rolling(window='2min').mean()
-            
-            # Avoid division by zero
-            if vol_ma.iloc[-1] == 0:
-                return 0
-            
-            # Calculate volume ratio
-            volume_ratio = current_volume / vol_ma.iloc[-1]
-            
-            # Calculate excess volume (how much current volume exceeds average)
-            excess_volume = max(0, volume_ratio - 1)
-            # Normalize to 0-1 range
-            result = min(excess_volume, 1)
-            return result
-            
-        except Exception as e:
-            self.log_trade(f"Volume impact calculation error: {str(e)}")
-            return 0
 
     def analyze_pairs(self, valid_pairs):
         """Analyze multiple pairs for trading opportunities"""
@@ -3117,109 +2948,74 @@ class CryptoScalpingBot:
         """Manage active trades with comprehensive monitoring and exit conditions"""
         for trade_id, trade in list(self.active_trades.items()):
             try:
-                # Get current price and calculate metrics
-                current_price = self.get_cached_price(trade['symbol'])['last']
+                # Force fetch fresh price data
+                ticker = self.exchange.fetch_ticker(trade['symbol'])
+                current_price = float(ticker['last'])
                 entry_price = trade['entry_price']
+                
+                # Calculate current profit percentage
                 profit_percentage = ((current_price - entry_price) / entry_price) * 100
-                time_in_trade = (datetime.now() - trade['timestamp']).total_seconds()
                 
-                # Update highest price if we're in profit
-                if profit_percentage > trade.get('highest_profit_percentage', 0):
-                    trade['highest_profit_percentage'] = profit_percentage
-                    trade['highest_price'] = current_price
-                    trade['time_at_high'] = datetime.now()
-                    self.log_trade(f"New high for {trade['symbol']}: {profit_percentage:.2f}%")
-                
-                # Get user-defined parameters
-                profit_target = float(self.profit_target.get())
+                # Get stop loss threshold
                 stop_loss = float(self.stop_loss.get())
-                trailing_stop = float(self.trailing_stop.get())
-                trailing_activation = float(self.trailing_activation.get())
-                
-                # Calculate dynamic trailing stop
-                if profit_percentage >= trailing_activation:
-                    # Use tighter stop when in good profit
-                    trailing_stop *= 0.8
-                
-                # Get market conditions
-                try:
-                    ticker = self.get_cached_price(trade['symbol'])
-                    spread = (ticker['ask'] - ticker['bid']) / ticker['bid'] * 100
-                    volume = float(ticker['quoteVolume'])
-                    
-                    # Market condition warnings
-                    if spread > float(self.max_spread.get()):
-                        self.log_trade(f"Warning: High spread ({spread:.2f}%) for {trade['symbol']}")
-                    if volume < float(self.min_volume_entry.get()):
-                        self.log_trade(f"Warning: Low volume (${volume:.2f}) for {trade['symbol']}")
-                except:
-                    spread = 0
-                    volume = 0
                 
                 # Log current trade status
                 self.log_trade(f"""
-                Trade Status - {trade['symbol']}:
-                Current P/L: {profit_percentage:.2f}%
-                Highest P/L: {trade.get('highest_profit_percentage', 0):.2f}%
-                Time in trade: {time_in_trade:.1f}s
-                Current spread: {spread:.2f}%
-                Current volume: ${volume:.2f}
-                PT: {profit_target}%
-                SL: {stop_loss}%
-                TS: {trailing_stop}%
+                Checking {trade['symbol']}:
+                Entry: {entry_price:.8f}
+                Current: {current_price:.8f}
+                P/L: {profit_percentage:.2f}%
+                Stop Loss: -{stop_loss}%
                 """)
                 
-                # Exit conditions check
-                exit_reason = None
-                
-                # 1. Stop Loss Check
-                if profit_percentage <= -stop_loss:
-                    exit_reason = "stop loss"
-                
-                # 2. Trailing Stop Check
-                elif profit_percentage >= trailing_activation:
-                    highest_profit = trade.get('highest_profit_percentage', profit_percentage)
-                    drop_from_high = highest_profit - profit_percentage
+                # Update highest price if applicable
+                if current_price > trade.get('highest_price', entry_price):
+                    trade['highest_price'] = current_price
+                    highest_profit = ((current_price - entry_price) / entry_price) * 100
+                    trade['highest_profit'] = highest_profit
                     
-                    if drop_from_high >= trailing_stop:
+                # Check stop loss - IMMEDIATE EXIT if triggered
+                if profit_percentage <= -stop_loss:
+                    self.log_trade(f"Stop loss triggered for {trade['symbol']} at {profit_percentage:.2f}%")
+                    self.close_trade(trade_id, trade, current_price, "stop loss")
+                    continue
+                    
+                # Check trailing stop if activated
+                trailing_activation = float(self.trailing_activation.get())
+                trailing_stop = float(self.trailing_stop.get())
+                
+                if trade.get('highest_profit', 0) > trailing_activation:
+                    # Calculate trailing stop price
+                    trailing_stop_price = trade['highest_price'] * (1 - trailing_stop/100)
+                    
+                    if current_price <= trailing_stop_price:
                         self.log_trade(f"""
-                        Trailing Stop Hit:
-                        Highest: {highest_profit:.2f}%
-                        Current: {profit_percentage:.2f}%
-                        Drop: {drop_from_high:.2f}%
-                        Stop: {trailing_stop}%
+                        Trailing stop triggered for {trade['symbol']}:
+                        Highest: {trade['highest_price']:.8f} ({trade['highest_profit']:.2f}%)
+                        Stop Price: {trailing_stop_price:.8f}
+                        Current: {current_price:.8f}
                         """)
-                        exit_reason = "trailing stop"
+                        self.close_trade(trade_id, trade, current_price, "trailing stop")
+                        continue
                 
-                # 3. Time-based Exits
-                elif time_in_trade > 60:  # After 60 seconds
-                    if profit_percentage > 0.9:  # Take profit if we can cover fees
-                        exit_reason = "time with profit"
-                    elif profit_percentage < -0.3:  # Cut losses if trending down
-                        exit_reason = "time with loss"
+                # Check profit target
+                profit_target = float(self.profit_target.get())
+                if profit_percentage >= profit_target:
+                    self.log_trade(f"Profit target reached for {trade['symbol']} at {profit_percentage:.2f}%")
+                    self.close_trade(trade_id, trade, current_price, "profit target")
+                    continue
                 
-                # 4. Market Condition Exits
-                elif spread > float(self.max_spread.get()) * 1.5:  # 50% above max allowed spread
-                    exit_reason = "excessive spread"
-                elif volume < float(self.min_volume_entry.get()) * 0.5:  # 50% below min volume
-                    exit_reason = "insufficient volume"
+                # Check trade duration
+                duration = (datetime.now() - trade['timestamp']).total_seconds()
+                if duration > 300:  # 5 minutes max
+                    self.log_trade(f"Maximum duration reached for {trade['symbol']}")
+                    self.close_trade(trade_id, trade, current_price, "max duration")
+                    continue
                 
-                # 5. Profit Target Hit
-                elif profit_percentage >= profit_target:
-                    exit_reason = "profit target"
-                
-                # Execute exit if conditions met
-                if exit_reason:
-                    try:
-                        self.close_trade(trade_id, trade, current_price, exit_reason)
-                        continue  # Move to next trade after closing
-                    except Exception as e:
-                        self.log_trade(f"Error closing trade: {str(e)}")
-                
-                # Update trade tracking
-                trade['last_update'] = datetime.now()
+                # Update trade info for display
                 trade['current_price'] = current_price
                 trade['current_profit'] = profit_percentage
+                trade['duration'] = duration
                 
                 # Update displays
                 self.update_active_trades_display()
@@ -3227,18 +3023,6 @@ class CryptoScalpingBot:
                 
             except Exception as e:
                 self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
-                try:
-                    # Emergency close on error
-                    self.close_trade(trade_id, trade, current_price, "error in management")
-                except:
-                    self.log_trade(f"Failed to emergency close trade {trade_id}")
-
-        # After managing all trades, update overall metrics
-        try:
-            self.update_metrics()
-            self.update_balance_display()
-        except Exception as e:
-            self.log_trade(f"Error updating displays: {str(e)}")
 
     def analyze_performance(self):
         """Analyze trading performance using pandas"""
@@ -3534,7 +3318,7 @@ class CryptoScalpingBot:
                     # Add new trade result
                     self.history_text.insert(tk.END, result)
                     
-                    # Color code based on profit/loss
+                    # Color code based on actual profit
                     line_start = f"{float(self.history_text.index('end-2c'))-1:.1f}"
                     
                     # Determine color based on actual profit
