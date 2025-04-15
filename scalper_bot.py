@@ -1963,7 +1963,7 @@ class CryptoScalpingBot:
             self.log_trade(f"Error in display update: {str(e)}")
 
     def close_all_positions(self):
-        """Manually close all open positions"""
+        """Manually close all open positions with accurate P/L calculation"""
         try:
             if not self.active_trades:
                 self.log_trade("No active trades to close")
@@ -1971,16 +1971,70 @@ class CryptoScalpingBot:
 
             for trade_id, trade in list(self.active_trades.items()):
                 try:
-                    current_price = self.exchange.fetch_ticker(trade['symbol'])['last']
-                    profit = (current_price - trade['entry_price']) * trade['amount']
-                    self.close_trade(trade_id, trade, profit, "manual closure")
+                    # Get fresh price data with error checking
+                    try:
+                        ticker = self.exchange.fetch_ticker(trade['symbol'])
+                        current_price = float(ticker['last'])
+                    except Exception as e:
+                        self.log_trade(f"Error getting price for {trade['symbol']}: {str(e)}")
+                        # Use last known price as fallback
+                        current_price = float(trade.get('current_price', trade['entry_price']))
+
+                    # Calculate exact P/L
+                    entry_price = float(trade['entry_price'])
+                    amount = float(trade['amount'])
+                    position_size = float(trade['position_size'])
+                    
+                    # Calculate raw P/L numbers
+                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    gross_profit = (current_price - entry_price) * amount
+                    
+                    # Calculate fees
+                    entry_fee = position_size * self.taker_fee
+                    exit_fee = (position_size * (1 + (profit_pct/100))) * self.taker_fee
+                    total_fees = entry_fee + exit_fee
+                    
+                    # Calculate net P/L
+                    net_profit = gross_profit - total_fees
+                    net_profit_pct = (net_profit / position_size) * 100
+
+                    # Update paper balance
+                    if self.is_paper_trading:
+                        self.paper_balance += (position_size + net_profit)
+
+                    # Log closure with exact numbers
+                    self.log_trade(f"""
+                    Closing trade {trade['symbol']}:
+                    Entry: ${entry_price:.8f}
+                    Exit: ${current_price:.8f}
+                    Gross P/L: {profit_pct:.2f}%
+                    Fees: ${total_fees:.2f}
+                    Net P/L: {net_profit_pct:.2f}%
+                    """)
+
+                    # Update trade history with accurate numbers
+                    self.update_trade_history(
+                        symbol=trade['symbol'],
+                        percentage=net_profit_pct,
+                        profit=net_profit,
+                        is_win=(net_profit > 0)
+                    )
+
+                    # Remove from active trades
+                    del self.active_trades[trade_id]
+
                 except Exception as e:
                     self.log_trade(f"Error closing trade {trade_id}: {str(e)}")
+                    continue
 
-            self.log_trade("All positions closed manually")
-            
+            # Update displays
+            self.update_active_trades_display()
+            self.update_metrics()
+            self.update_balance_display()
+            self.log_trade("All positions closed")
+
         except Exception as e:
-            self.log_trade(f"Error closing all positions: {str(e)}")
+            self.log_trade(f"Error in close_all_positions: {str(e)}")
 
     def close_profitable_positions(self):
         """Manually close only positions that are currently profitable"""
