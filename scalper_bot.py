@@ -3017,53 +3017,57 @@ class CryptoScalpingBot:
             self.log_trade(f"Error updating trades display: {str(e)}")
 
     def manage_trades(self):
-        """Manage active trades with strict stop loss enforcement"""
+        """Manage trades with straightforward exit conditions"""
         try:
             for trade_id, trade in list(self.active_trades.items()):
                 try:
-                    # Get fresh price data with error checking
-                    ticker = self.exchange.fetch_ticker(trade['symbol'])
-                    current_price = float(ticker['last'])
-                    entry_price = float(trade['entry_price'])  # Ensure float conversion
+                    # Get current price and calculate profit
+                    current_price = float(self.exchange.fetch_ticker(trade['symbol'])['last'])
+                    entry_price = float(trade['entry_price'])
+                    profit_pct = ((current_price - entry_price) / entry_price) * 100
                     
-                    # Calculate current profit percentage with explicit float conversion
-                    profit_percentage = float(((current_price - entry_price) / entry_price) * 100)
-                    
-                    # Get thresholds with explicit float conversion and force positive
-                    stop_loss = abs(float(self.stop_loss.get()))
-                    trailing_stop = abs(float(self.trailing_stop.get()))
-                    trailing_activation = abs(float(self.trailing_activation.get()))
-                    
-                    # Debug log the exact values being compared
+                    # Update highest profit if we have a new high
+                    if 'highest_profit' not in trade or profit_pct > trade['highest_profit']:
+                        trade['highest_profit'] = profit_pct
+
+                    # Get exit thresholds
+                    stop_loss = float(self.stop_loss.get())
+                    trailing_stop = float(self.trailing_stop.get())
+                    trailing_activation = float(self.trailing_activation.get())
+
+                    # Debug log
                     self.log_trade(f"""
-                    STOP LOSS CHECK for {trade['symbol']}:
-                    Current Price: ${current_price:.8f}
-                    Entry Price: ${entry_price:.8f}
-                    P/L: {profit_percentage:.8f}%
-                    Stop Loss: -{stop_loss:.8f}%
+                    Trade Check - {trade['symbol']}:
+                    Current P/L: {profit_pct:.2f}%
+                    Highest: {trade['highest_profit']:.2f}%
+                    Stop Loss: -{stop_loss:.2f}%
+                    Trailing Stop: {trailing_stop:.2f}%
+                    Trailing Activation: {trailing_activation:.2f}%
                     """)
-                    
-                    # CRITICAL: Stop loss check with explicit float comparison
-                    if float(profit_percentage) <= float(-stop_loss):
-                        self.log_trade(f"""
-                        !!! STOP LOSS TRIGGERED !!!
-                        Symbol: {trade['symbol']}
-                        Entry: ${entry_price:.8f}
-                        Current: ${current_price:.8f}
-                        Loss: {profit_percentage:.8f}%
-                        Stop Level: -{stop_loss:.8f}%
-                        """)
+
+                    # CASE 1: Stop Loss - Immediate exit if loss exceeds stop loss
+                    if profit_pct <= -stop_loss:
+                        self.log_trade(f"Stop Loss hit on {trade['symbol']} at {profit_pct:.2f}%")
                         self.close_trade(trade_id, trade, current_price, "stop loss")
                         continue
 
-                    # Rest of the method remains the same...
+                    # CASE 2: Trailing Stop
+                    if trade['highest_profit'] >= trailing_activation:
+                        drop_from_high = trade['highest_profit'] - profit_pct
+                        
+                        if drop_from_high >= trailing_stop:
+                            self.log_trade(f"""
+                            Trailing Stop hit on {trade['symbol']}:
+                            Peak profit: {trade['highest_profit']:.2f}%
+                            Current profit: {profit_pct:.2f}%
+                            Drop from peak: {drop_from_high:.2f}%
+                            """)
+                            self.close_trade(trade_id, trade, current_price, "trailing stop")
+                            continue
+
                 except Exception as e:
                     self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
                     continue
-
-            # Update displays
-            self.update_active_trades_display()
-            self.update_chart()
 
         except Exception as e:
             self.log_trade(f"Error in trade management: {str(e)}")
@@ -3634,220 +3638,74 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error updating trades display: {str(e)}")
 
-    def run_bot(self):  # Fixed indentation
-        """Main trading loop optimized for stability and performance"""
+    def run_bot(self):
+        """Main trading loop with straightforward logic"""
         try:
-            # Initialize timestamps for periodic actions
-            last_cleanup = time.time()
-            last_performance_check = time.time()
-            collection_start = time.time()
-            data_points_required = 20
-            data_collection_time = 30
+            # Initial startup checks
+            self.log_trade("\n=== BOT STARTED ===")
+            self.update_status(f"Running ({'Paper' if self.is_paper_trading else 'Real'})")
 
-            # Initial startup message
-            startup_message = f"""
-            Bot Started:
-            Mode: {'Paper' if self.is_paper_trading else 'Real'} Trading
-            Initial Balance: ${self.paper_balance:.2f}
-            Max Concurrent Trades: {self.max_trades_entry.get()}
-            Monitoring Top: {self.top_list_size.get()} pairs
-            Profit Target: {self.profit_target.get()}%
-            Stop Loss: {self.stop_loss.get()}%
-            Min Volume: ${self.min_volume_entry.get()}
-            """
-            self.log_trade(startup_message)
-
-            # Initial data collection period
-            self.update_status("Collecting initial market data...")
-            self.log_trade("Starting initial data collection period (30 seconds)...")
-
-            while (time.time() - collection_start) < data_collection_time:
-                if not self.running:
-                    return
-
-                try:
-                    tickers = self.exchange.fetch_tickers()
-                    valid_pairs = []
-
-                    for symbol, ticker in tickers.items():
-                        try:
-                            if not symbol.endswith('/USD'):
-                                continue
-
-                            # Basic validation
-                            if not self.validate_ticker(ticker, symbol):
-                                continue
-
-                            processed = self.process_ticker(symbol, ticker)
-                            if processed:
-                                valid_pairs.append(processed)
-                                self.data_manager.update_price_data(symbol, ticker)
-
-                        except Exception as e:
-                            continue  # Skip problematic pairs
-
-                    if valid_pairs:
-                        self.log_trade(f"Found {len(valid_pairs)} valid pairs")
-
-                    time.sleep(1)
-
-                    # Update status with progress
-                    elapsed = time.time() - collection_start
-                    self.update_status(f"Collecting data: {elapsed:.0f}/{data_collection_time}s")
-
-                except Exception as e:
-                    self.log_trade(f"Data collection error: {str(e)}")
-                    time.sleep(1)
-                    continue
-
-            # Verify data collection
-            valid_symbols = []
-            for symbol in self.data_manager.price_data.keys():
-                df = self.data_manager.price_data.get(symbol)
-                if df is not None and len(df) >= data_points_required:
-                    valid_symbols.append(symbol)
-
-            if not valid_symbols:
-                self.log_trade("No symbols have sufficient data. Restarting data collection...")
-                time.sleep(5)
-                return self.run_bot()
-
-            self.log_trade(f"Initial data collection complete. {len(valid_symbols)} pairs ready.")
-            self.update_status("Trading Active")
-
-            # Start the price monitoring thread
-            self.price_monitor_thread = threading.Thread(
-                target=self.monitor_prices_continuously,
-                daemon=True
-            )
-            self.price_monitor_thread.start()
-
-            # Main trading loop
             while self.running:
                 try:
-                    current_time = time.time()
-
-                    # Memory management
-                    if current_time - last_cleanup >= 300:  # Every 5 minutes
-                        self.cleanup_old_data()
-                        last_cleanup = current_time
-
-                    # Performance analysis
-                    if current_time - last_performance_check >= 600:  # Every 10 minutes
-                        metrics = self.analyze_performance()
-                        if metrics:
-                            self.adjust_parameters(metrics)
-                        last_performance_check = current_time
-
-                    # Market scanning with timeout
-                    scan_timeout = 30  # seconds
-                    scan_start = time.time()
-
-                    self.update_status("Scanning market...")
-                    scan_success = self.scan_opportunities()
-
-                    scan_duration = time.time() - scan_start
-
-                    if scan_duration > scan_timeout:
-                        self.log_trade(f"Warning: Market scan took too long ({scan_duration:.1f}s)")
-
-                    if not scan_success:
-                        self.log_trade("No trading opportunities found this scan")
-                        time.sleep(5)  # Wait before next scan
-                        continue
-
-                    # Manage existing trades
+                    # 1. SCAN MARKET
+                    self.update_status("Fetching market data...")
+                    tickers = self.fetch_tickers_with_retry()  # Get fresh data
+                    
+                    # 2. MANAGE ACTIVE TRADES FIRST (Exit conditions)
                     if self.active_trades:
-                        self.manage_trades()
-                        # Update chart for active trades
-                        self.update_chart()
-                        # Schedule next chart update
-                        self.root.after(2000, self.update_chart)
+                        for trade_id, trade in list(self.active_trades.items()):
+                            try:
+                                current_price = float(self.exchange.fetch_ticker(trade['symbol'])['last'])
+                                entry_price = float(trade['entry_price'])
+                                profit_pct = ((current_price - entry_price) / entry_price) * 100
+                                
+                                # Update highest profit if new high
+                                if profit_pct > trade.get('highest_profit', -999):
+                                    trade['highest_profit'] = profit_pct
+                                
+                                # Get thresholds
+                                stop_loss = float(self.stop_loss.get())
+                                trailing_stop = float(self.trailing_stop.get())
+                                trailing_activation = float(self.trailing_activation.get())
+                                highest_profit = trade.get('highest_profit', 0)
 
-                    # Update displays
+                                # Exit conditions in order of priority
+                                if profit_pct <= -stop_loss:  # Stop loss hit
+                                    self.close_trade(trade_id, trade, current_price, "stop loss")
+                                    continue
+                                    
+                                if highest_profit >= trailing_activation:  # Check trailing stop
+                                    drop = highest_profit - profit_pct
+                                    if drop >= trailing_stop:
+                                        self.close_trade(trade_id, trade, current_price, "trailing stop")
+                                        continue
+
+                            except Exception as e:
+                                self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
+
+                    # 3. LOOK FOR NEW TRADES (Entry conditions)
+                    self.update_status("Scanning for opportunities...")
+                    scan_success = self.scan_opportunities()
+                    
+                    # 4. UPDATE DISPLAYS
                     self.update_active_trades_display()
+                    self.update_chart()
                     self.update_metrics()
-                    self.update_balance_display()
-
-                    # Enforce minimum scan interval
-                    elapsed = time.time() - scan_start
-                    if elapsed < self.scan_interval:
-                        time.sleep(self.scan_interval - elapsed)
+                    
+                    # 5. WAIT BEFORE NEXT SCAN
+                    time.sleep(2)  # Pause between cycles
 
                 except Exception as e:
-                    self.log_trade(f"Main loop error: {str(e)}")
-                    time.sleep(5)
+                    self.log_trade(f"Error in main loop: {str(e)}")
+                    time.sleep(5)  # Longer pause on error
                     continue
 
         except Exception as e:
-            self.log_trade(f"Critical error: {str(e)}")
+            self.log_trade(f"Critical error in run_bot: {str(e)}")
         finally:
             self.running = False
-            self.log_trade("Bot shutting down...")
-
-            # Clean shutdown
-            try:
-                if hasattr(self, 'price_monitor_thread'):
-                    self.price_monitor_thread.join(timeout=5)
-
-                # Close all positions
-                if self.active_trades:
-                    self.log_trade("Closing all positions...")
-                    for trade_id, trade in list(self.active_trades.items()):
-                        try:
-                            current_price = self.get_cached_price(trade['symbol'])['last']
-                            self.close_trade(trade_id, trade, current_price, "shutdown")
-                        except Exception as e:
-                            self.log_trade(f"Error closing trade {trade_id}: {str(e)}")
-
-                # Final cleanup
-                self.cleanup_old_data()
-                gc.collect()
-
-            except Exception as e:
-                self.log_trade(f"Error during shutdown: {str(e)}")
-
-    def adjust_parameters(self, metrics):
-        """Adjust trading parameters based on performance metrics"""
-        try:
-            # Only adjust if we have significant data
-            if metrics['total_trades'] < 10:
-                return
-
-            # Adjust profit target based on average profit
-            if metrics['win_rate'] > 60:
-                new_profit_target = min(
-                    float(self.profit_target.get()) * 0.95,  # Reduce target if winning a lot
-                    1.5  # Maximum target
-                )
-                self.profit_target.set(f"{new_profit_target:.1f}")
-
-            # Adjust position size based on profit factor
-            if metrics['profit_factor'] > 2:
-                current_size = float(self.position_size.get())
-                new_size = min(
-                    current_size * 1.1,  # Increase size if performing well
-                    self.paper_balance * 0.1  # Max 10% of balance
-                )
-                self.position_size.set(f"{new_size:.0f}")
-
-            # Adjust stop loss based on volatility
-            if metrics['avg_loss'] > float(self.stop_loss.get()) * 0.8:
-                new_stop = min(
-                    float(self.stop_loss.get()) * 1.1,
-                    0.8  # Maximum stop loss
-                )
-                self.stop_loss.set(f"{new_stop:.1f}")
-
-            self.log_trade(f"""
-            Parameters Adjusted:
-            Profit Target: {self.profit_target.get()}%
-            Position Size: {self.position_size.get()}
-            Stop Loss: {self.stop_loss.get()}%
-            """)
-
-        except Exception as e:
-            self.log_trade(f"Error adjusting parameters: {str(e)}")   
+            self.update_status("Stopped")
+            self.log_trade("=== BOT STOPPED ===")
 
     def run(self):
         """Main run method"""
