@@ -173,7 +173,7 @@ class CryptoScalpingBot:
         self.style.configure('Dark.TButton',
             background='#1a1a1a',
             foreground='white')
-        self.root.title("Crypto Scalping Bot (Kraken) - Low Price Focus") 
+        self.root.title("Kairos Trading v1.0") 
         self.root.geometry("1200x1000")
 
         # Initialize basic variables
