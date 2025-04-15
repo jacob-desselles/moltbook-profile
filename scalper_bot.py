@@ -21,14 +21,15 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.dates import DateFormatter
 class DataManager:
-    def __init__(self, log_function=None):
+    def __init__(self, exchange=None, log_function=None):
         self.price_data = {}
+        self.exchange = exchange  # Store exchange instance
         self.lookback_periods = {
-        'short': 5,
-        'medium': 10,
-        'long': 15
+            'short': 5,
+            'medium': 10,
+            'long': 15
         }
-        self.log_function = log_function if log_function else print # Default to print if no log function provided
+        self.log_function = log_function if log_function else print
         self.min_data_points = 20
         self.initialization_complete = {}
     def log_trade(self, message):
@@ -85,9 +86,8 @@ class DataManager:
             self.log_trade(f"Error in _calculate_indicators for {symbol}: {str(e)}")
 
     def update_price_data(self, symbol: str, new_data: dict):
-        """Update price data with proper timestamp handling"""
+        """Update price data with proper data accumulation"""
         try:
-            # Create timestamp for current data
             current_timestamp = pd.Timestamp.now()
             
             # Validate incoming data
@@ -102,6 +102,16 @@ class DataManager:
                 bid = float(new_data['bid'])
                 ask = float(new_data['ask'])
                 
+                # Check for duplicate data
+                if symbol in self.price_data and not self.price_data[symbol].empty:
+                    last_price = self.price_data[symbol]['price'].iloc[-1]
+                    last_time = self.price_data[symbol].index[-1]
+                    
+                    # Skip if price hasn't changed and time difference is small
+                    if price == last_price and (current_timestamp - last_time).total_seconds() < 1:
+                        self.log_function(f"Skipping duplicate price for {symbol}")
+                        return
+                    
                 if any(val <= 0 for val in [price, volume, bid, ask]):
                     self.log_function(f"Invalid values for {symbol}")
                     return
@@ -110,7 +120,7 @@ class DataManager:
                 self.log_function(f"Data conversion error for {symbol}: {str(e)}")
                 return
 
-            # Create new data point with explicit timestamp index
+            # Create new data point
             new_data_point = pd.DataFrame({
                 'price': [price],
                 'volume': [volume],
@@ -122,33 +132,31 @@ class DataManager:
             if symbol not in self.price_data:
                 self.price_data[symbol] = new_data_point
             else:
-                # Remove data older than 2 minutes
-                cutoff_time = current_timestamp - pd.Timedelta(minutes=2)
+                # Remove data older than 5 minutes
+                cutoff_time = current_timestamp - pd.Timedelta(minutes=5)
                 
-                # Ensure existing data has datetime index
+                # Ensure DataFrame has datetime index
                 if not isinstance(self.price_data[symbol].index, pd.DatetimeIndex):
                     try:
                         self.price_data[symbol].index = pd.to_datetime(self.price_data[symbol].index)
                     except:
-                        # If conversion fails, initialize new DataFrame
                         self.price_data[symbol] = new_data_point
                         return
                 
-                # Filter old data and append new
-                try:
-                    filtered_data = self.price_data[symbol][self.price_data[symbol].index > cutoff_time]
-                    self.price_data[symbol] = pd.concat([filtered_data, new_data_point]).sort_index()
-                except Exception as e:
-                    self.log_function(f"Error concatenating data for {symbol}: {str(e)}")
-                    # Reinitialize if concat fails
-                    self.price_data[symbol] = new_data_point
+                # Concatenate new data with existing data
+                self.price_data[symbol] = pd.concat([
+                    self.price_data[symbol][self.price_data[symbol].index > cutoff_time],
+                    new_data_point
+                ]).sort_index()
+
+                # Log data points
+                self.log_function(f"Updated {symbol} data: {len(self.price_data[symbol])} points collected")
 
             # Calculate indicators if we have enough data
             if len(self.price_data[symbol]) >= 5:
                 self._calculate_indicators(symbol)
                 
-            self.log_function(f"Updated {symbol} price data - points: {len(self.price_data[symbol])}")
-            self.log_function(f"Latest timestamp: {self.price_data[symbol].index[-1]}")
+            self.log_function(f"Latest price: {price:.8f}")
             
         except Exception as e:
             self.log_function(f"Error updating price data for {symbol}: {str(e)}")
@@ -229,7 +237,7 @@ class CryptoScalpingBot:
 
 
         # Initialize DataManager
-        self.data_manager = DataManager(log_function=self.log_trade)
+        #self.data_manager = DataManager(log_function=self.log_trade)
         self.log_trade("Testing logger initialization")
         print("Direct print test from __init__")
 
@@ -526,6 +534,12 @@ class CryptoScalpingBot:
                     self.log_trade("Testing ticker fetch...")
                     test_tickers = self.exchange.fetch_tickers()
                     self.log_trade(f"Successfully fetched {len(test_tickers)} tickers")
+                    
+                    # Initialize DataManager with exchange instance
+                    self.data_manager = DataManager(
+                        exchange=self.exchange,
+                        log_function=self.log_trade
+                    )
                     
                     self.log_trade("Exchange initialization successful")
                     return True
@@ -1871,7 +1885,7 @@ class CryptoScalpingBot:
             else:
                 self.trades_text.insert(tk.END, f"Active Trades: {len(self.active_trades)}\n\n")
                 
-                for trade_id, trade in list(self.active_trades.items()):
+                for trade_id in list(self.active_trades.keys()):
                     try:
                         current_price = self.get_cached_price(trade['symbol'])['last']
                         profit_percentage = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
@@ -2383,6 +2397,42 @@ class CryptoScalpingBot:
             'time': current_time
         }
         return ticker
+
+    def process_ticker(self, symbol, ticker):
+        """Process a single ticker with data collection tracking"""
+        try:
+            if not self.validate_ticker(ticker, symbol):
+                return None
+                
+            price = float(ticker['last'])
+            volume = float(ticker['quoteVolume'])
+            bid = float(ticker['bid'])
+            ask = float(ticker['ask'])
+            
+            # Update price data
+            self.data_manager.update_price_data(symbol, ticker)
+            
+            # Get current data points
+            df = self.data_manager.price_data.get(symbol)
+            if df is not None:
+                data_points = len(df)
+                self.log_trade(f"Updated {symbol} data: {data_points} points collected")
+            
+            spread = (ask - bid) / bid * 100
+            
+            return {
+                'symbol': symbol,
+                'ticker': ticker,
+                'volume': volume,
+                'price': price,
+                'spread': spread,
+                'data_points': data_points if df is not None else 0
+            }
+            
+        except Exception as e:
+            self.log_trade(f"Error processing {symbol}: {str(e)}")
+            return None
+
     def update_displays(self):
         """Batch update displays to reduce GUI overhead"""
         try:
@@ -2560,25 +2610,80 @@ class CryptoScalpingBot:
         """Analyze multiple pairs for trading opportunities"""
         try:
             trades_executed = False
+            self.log_trade("\nAnalyzing pairs for trading opportunities...")
             
             for pair_data in valid_pairs:
                 try:
-                    if self.analyze_opportunity(pair_data['ticker'], pair_data['volume'], pair_data):
-                        self.log_trade(f"[TARGET] Opportunity found: {pair_data['symbol']}")
-                        if self.execute_trade(pair_data):
-                            self.log_trade(f"Trade executed for {pair_data['symbol']}")
-                            trades_executed = True
-                        else:
-                            self.log_trade(f"Failed to execute trade for {pair_data['symbol']}")
+                    symbol = pair_data['symbol']
+                    
+                    # Get DataFrame and ensure we have enough data
+                    df = self.data_manager.price_data.get(symbol)
+                    if df is None or len(df) < 20:  # Need at least 20 points
+                        continue
+                    
+                    # Calculate metrics
+                    momentum = self.calculate_current_momentum(df)
+                    volume_increase = self.calculate_volume_increase(df)
+                    
+                    # Debug logging
+                    self.log_trade(f"""
+                    Detailed Analysis for {symbol}:
+                    Current Price: ${pair_data['price']:.8f}
+                    24h Volume: ${pair_data['volume']:,.2f}
+                    Momentum: {momentum:.2f}%
+                    Volume Change: {volume_increase:.2f}%
+                    Spread: {pair_data['spread']:.2f}%
+                    Data Points: {len(df)}
+                    """)
+                    
+                    # Check trading conditions
+                    conditions_met = []
+                    
+                    # 1. Momentum check
+                    if momentum > float(self.momentum_threshold.get()):
+                        conditions_met.append("Momentum")
+                        self.log_trade(f"✓ Momentum condition met: {momentum:.2f}%")
+                    
+                    # 2. Volume check
+                    min_volume = float(self.min_volume_entry.get())
+                    if pair_data['volume'] >= min_volume:
+                        conditions_met.append("Volume")
+                        self.log_trade(f"✓ Volume condition met: ${pair_data['volume']:,.2f}")
+                    
+                    # 3. Spread check
+                    max_spread = float(self.max_spread.get())
+                    if pair_data['spread'] < max_spread:
+                        conditions_met.append("Spread")
+                        self.log_trade(f"✓ Spread condition met: {pair_data['spread']:.2f}%")
+                    
+                    # Check if we have enough conditions met
+                    required_conditions = int(self.required_conditions.get())
+                    self.log_trade(f"Conditions met ({len(conditions_met)}/{required_conditions}): {', '.join(conditions_met)}")
+                    
+                    if len(conditions_met) >= required_conditions:
+                        self.log_trade(f"[TARGET] Trade opportunity found: {symbol}")
+                        
+                        # Validate and execute trade
+                        if self.validate_trade(pair_data, pair_data['price']):
+                            if self.execute_trade(pair_data):
+                                trades_executed = True
+                                self.log_trade(f"Trade executed successfully for {symbol}")
+                            else:
+                                self.log_trade(f"Failed to execute trade for {symbol}")
+                    
                 except Exception as e:
                     self.log_trade(f"Error analyzing {pair_data['symbol']}: {str(e)}")
                     continue
+            
+            if not trades_executed:
+                self.log_trade("No trading opportunities found this scan")
             
             return trades_executed
             
         except Exception as e:
             self.log_trade(f"Error in analyze_pairs: {str(e)}")
             return False
+
     def calculate_trade_parameters(self, entry_price):
         """Calculate optimal trade parameters considering fees"""
         try:
@@ -2755,27 +2860,19 @@ class CryptoScalpingBot:
 
 
     def close_trade(self, trade_id, trade, current_price, reason):
-        """Close a trade and update all relevant data"""
+        """Close a trade with accurate P/L calculation"""
         try:
-            if trade_id not in self.active_trades:
-                self.log_trade(f"Trade {trade_id} not found in active trades")
-                return
+            # Validate inputs
+            if not all([trade_id, trade, current_price]):
+                self.log_trade("Invalid trade closure parameters")
+                return False
                 
-            # Validate current price
-            if not current_price or current_price <= 0:
-                try:
-                    current_price = self.exchange.fetch_ticker(trade['symbol'])['last']
-                except Exception as e:
-                    self.log_trade(f"Error getting close price, using entry price: {str(e)}")
-                    current_price = trade['entry_price']
-
             # Calculate exact values
-            position_size = trade['position_size']
             entry_price = trade['entry_price']
             amount = trade['amount']
-            duration = (datetime.now() - trade['timestamp']).total_seconds()
+            position_size = trade['position_size']
             
-            # Calculate profit/loss
+            # Calculate raw P/L
             gross_profit = (current_price - entry_price) * amount
             gross_profit_percentage = ((current_price - entry_price) / entry_price) * 100
             
@@ -2784,7 +2881,7 @@ class CryptoScalpingBot:
             exit_fee = position_size * self.taker_fee
             total_fees = entry_fee + exit_fee
             
-            # Calculate net profit
+            # Calculate net P/L
             net_profit = gross_profit - total_fees
             net_profit_percentage = (net_profit / position_size) * 100
             
@@ -2792,54 +2889,19 @@ class CryptoScalpingBot:
             if self.is_paper_trading:
                 self.paper_balance += position_size + net_profit
             
-            # Create trade record
-            trade_record = {
-                'symbol': trade['symbol'],
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'amount': amount,
-                'position_size': position_size,
-                'gross_profit': gross_profit,
-                'gross_profit_percentage': gross_profit_percentage,
-                'fees': total_fees,
-                'net_profit': net_profit,
-                'net_profit_percentage': net_profit_percentage,
-                'duration': duration,
-                'reason': reason,
-                'timestamp': trade['timestamp'],
-                'exit_time': datetime.now()
-            }
-            
-            # Update trade history
-            self.trades.append(trade_record)
-            
-            # Update performance metrics
-            if net_profit > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
-            
-            self.total_trades += 1
-            self.total_profit += gross_profit
-            self.total_fees += total_fees
-            
-            # Remove from active trades
-            del self.active_trades[trade_id]
-            
             # Log closure details
             self.log_trade(f"""
             Trade Closed: {trade['symbol']}
             Reason: {reason.upper()}
-            Duration: {duration:.1f}s
-            Entry: {entry_price:.8f}
-            Exit: {current_price:.8f}
+            Entry: ${entry_price:.8f}
+            Exit: ${current_price:.8f}
             Gross P/L: ${gross_profit:.2f} ({gross_profit_percentage:.2f}%)
             Fees: ${total_fees:.2f}
             Net P/L: ${net_profit:.2f} ({net_profit_percentage:.2f}%)
-            Balance: ${self.paper_balance:.2f}
+            Current Balance: ${self.paper_balance:.2f}
             """)
             
-            # Update trade history display
+            # Update trade history
             self.update_trade_history(
                 symbol=trade['symbol'],
                 percentage=net_profit_percentage,
@@ -2847,15 +2909,24 @@ class CryptoScalpingBot:
                 is_win=net_profit > 0
             )
             
-            # Force update all displays
-            try:
-                self.update_active_trades_display()
-                self.update_metrics()
-                self.update_balance_display()
-                # Force GUI update
-                self.root.update_idletasks()
-            except Exception as e:
-                self.log_trade(f"Error updating displays: {str(e)}")
+            # Remove from active trades
+            if trade_id in self.active_trades:
+                del self.active_trades[trade_id]
+            
+            # Update performance metrics
+            if net_profit > 0:
+                self.winning_trades += 1
+            else:
+                self.losing_trades += 1
+                
+            self.total_trades += 1
+            self.total_profit += net_profit
+            self.total_fees += total_fees
+            
+            # Update displays
+            self.update_active_trades_display()
+            self.update_metrics()
+            self.update_balance_display()
             
             return True
             
@@ -2919,6 +2990,7 @@ class CryptoScalpingBot:
                         f"P/L: {profit:.2f} USD ({profit_percentage:.3f}%) | "
                         f"Duration: {duration:.1f}s | "
                         f"Target: {trade['target_price']:.8f}\n"
+                        f"-----------------\n"
                     )
                     
                     # Color code based on profit/loss
@@ -2945,84 +3017,78 @@ class CryptoScalpingBot:
             self.log_trade(f"Error updating trades display: {str(e)}")
 
     def manage_trades(self):
-        """Manage active trades with comprehensive monitoring and exit conditions"""
-        for trade_id, trade in list(self.active_trades.items()):
-            try:
-                # Force fetch fresh price data
-                ticker = self.exchange.fetch_ticker(trade['symbol'])
-                current_price = float(ticker['last'])
-                entry_price = trade['entry_price']
-                
-                # Calculate current profit percentage
-                profit_percentage = ((current_price - entry_price) / entry_price) * 100
-                
-                # Get stop loss threshold
-                stop_loss = float(self.stop_loss.get())
-                
-                # Log current trade status
-                self.log_trade(f"""
-                Checking {trade['symbol']}:
-                Entry: {entry_price:.8f}
-                Current: {current_price:.8f}
-                P/L: {profit_percentage:.2f}%
-                Stop Loss: -{stop_loss}%
-                """)
-                
-                # Update highest price if applicable
-                if current_price > trade.get('highest_price', entry_price):
-                    trade['highest_price'] = current_price
-                    highest_profit = ((current_price - entry_price) / entry_price) * 100
-                    trade['highest_profit'] = highest_profit
+        """Manage active trades with proper exit conditions"""
+        try:
+            for trade_id, trade in list(self.active_trades.items()):
+                try:
+                    # Get current price with error handling
+                    ticker = self.exchange.fetch_ticker(trade['symbol'])
+                    current_price = float(ticker['last'])
+                    entry_price = trade['entry_price']
                     
-                # Check stop loss - IMMEDIATE EXIT if triggered
-                if profit_percentage <= -stop_loss:
-                    self.log_trade(f"Stop loss triggered for {trade['symbol']} at {profit_percentage:.2f}%")
-                    self.close_trade(trade_id, trade, current_price, "stop loss")
-                    continue
+                    # Calculate current profit percentage
+                    profit_percentage = ((current_price - entry_price) / entry_price) * 100
                     
-                # Check trailing stop if activated
-                trailing_activation = float(self.trailing_activation.get())
-                trailing_stop = float(self.trailing_stop.get())
-                
-                if trade.get('highest_profit', 0) > trailing_activation:
-                    # Calculate trailing stop price
-                    trailing_stop_price = trade['highest_price'] * (1 - trailing_stop/100)
+                    # Get thresholds - use string to float conversion explicitly
+                    stop_loss = abs(float(self.stop_loss.get()))  # Make sure it's positive
+                    trailing_stop = float(self.trailing_stop.get())
+                    trailing_activation = float(self.trailing_activation.get())
                     
-                    if current_price <= trailing_stop_price:
-                        self.log_trade(f"""
-                        Trailing stop triggered for {trade['symbol']}:
-                        Highest: {trade['highest_price']:.8f} ({trade['highest_profit']:.2f}%)
-                        Stop Price: {trailing_stop_price:.8f}
-                        Current: {current_price:.8f}
-                        """)
-                        self.close_trade(trade_id, trade, current_price, "trailing stop")
+                    # Update highest values if price is better
+                    if current_price > trade.get('highest_price', entry_price):
+                        trade['highest_price'] = current_price
+                        trade['highest_profit_percentage'] = profit_percentage
+
+                    # Debug logging
+                    self.log_trade(f"""
+                    Trade Status Check - {trade['symbol']}:
+                    Current Price: ${current_price:.8f}
+                    Entry Price: ${entry_price:.8f}
+                    Current P/L: {profit_percentage:.2f}%
+                    Stop Loss Level: -{stop_loss:.2f}%
+                    Highest P/L: {trade.get('highest_profit_percentage', 0):.2f}%
+                    Trailing Stop: {trailing_stop:.2f}%
+                    Trailing Activation: {trailing_activation:.2f}%
+                    """)
+
+                    # 1. Check hard stop loss - IMMEDIATE EXIT
+                    if profit_percentage <= -stop_loss:
+                        self.log_trade(f"!!! STOP LOSS TRIGGERED for {trade['symbol']} !!!")
+                        self.log_trade(f"Loss: {profit_percentage:.2f}% exceeded stop loss: {stop_loss:.2f}%")
+                        self.close_trade(trade_id, trade, current_price, "stop loss")
                         continue
-                
-                # Check profit target
-                profit_target = float(self.profit_target.get())
-                if profit_percentage >= profit_target:
-                    self.log_trade(f"Profit target reached for {trade['symbol']} at {profit_percentage:.2f}%")
-                    self.close_trade(trade_id, trade, current_price, "profit target")
+
+                    # 2. Check trailing stop if activated
+                    highest_profit = trade.get('highest_profit_percentage', 0)
+                    if highest_profit >= trailing_activation:
+                        drop_from_high = highest_profit - profit_percentage
+                        
+                        if drop_from_high >= trailing_stop:
+                            self.log_trade(f"""
+                            !!! TRAILING STOP TRIGGERED for {trade['symbol']} !!!
+                            Highest Profit: {highest_profit:.2f}%
+                            Current Profit: {profit_percentage:.2f}%
+                            Drop from High: {drop_from_high:.2f}%
+                            Trailing Stop: {trailing_stop:.2f}%
+                            """)
+                            self.close_trade(trade_id, trade, current_price, "trailing stop")
+                            continue
+
+                    # Update trade info
+                    trade['current_price'] = current_price
+                    trade['current_profit_percentage'] = profit_percentage
+                    trade['last_update'] = datetime.now()
+
+                except Exception as e:
+                    self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
                     continue
-                
-                # Check trade duration
-                duration = (datetime.now() - trade['timestamp']).total_seconds()
-                if duration > 300:  # 5 minutes max
-                    self.log_trade(f"Maximum duration reached for {trade['symbol']}")
-                    self.close_trade(trade_id, trade, current_price, "max duration")
-                    continue
-                
-                # Update trade info for display
-                trade['current_price'] = current_price
-                trade['current_profit'] = profit_percentage
-                trade['duration'] = duration
-                
-                # Update displays
-                self.update_active_trades_display()
-                self.update_chart()
-                
-            except Exception as e:
-                self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
+
+            # Update displays
+            self.update_active_trades_display()
+            self.update_chart()
+
+        except Exception as e:
+            self.log_trade(f"Error in trade management: {str(e)}")
 
     def analyze_performance(self):
         """Analyze trading performance using pandas"""
@@ -3302,7 +3368,7 @@ class CryptoScalpingBot:
             # Format timestamp
             timestamp = datetime.now().strftime("%H:%M:%S")
             
-            # Format the trade result with timestamp
+            # Format the trade result
             result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}\n"
             
             # Update GUI trade history if available
@@ -3471,47 +3537,6 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error validating {symbol}: {str(e)}")
             return False
-
-    def process_ticker(self, symbol, ticker):
-        """Process a single ticker safely"""
-        try:
-            # Validate required fields
-            required_fields = ['last', 'quoteVolume', 'bid', 'ask']
-            if not all(field in ticker and ticker[field] is not None for field in required_fields):
-                return None
-
-            try:
-                price = float(ticker['last'])
-                volume = float(ticker['quoteVolume'])
-                bid = float(ticker['bid'])
-                ask = float(ticker['ask'])
-            except (TypeError, ValueError):
-                return None
-
-            # Price must be under $5
-            if not (0.00001 <= price <= 5.0):
-                return None
-
-            # Volume must meet minimum
-            min_volume = float(self.min_volume_entry.get())
-            if volume < min_volume:
-                return None
-
-            # Spread check
-            spread = (ask - bid) / bid * 100
-            if spread > 2.0:  # 2% max spread
-                return None
-
-            return {
-                'symbol': symbol,
-                'ticker': ticker,
-                'volume': volume,
-                'price': price,
-                'spread': spread
-            }
-        except Exception as e:
-            self.log_trade(f"Error processing ticker for {symbol}: {str(e)}")
-            return None
 
     def monitor_prices_continuously(self):
         """Monitor active trades with real-time updates"""
