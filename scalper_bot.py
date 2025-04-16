@@ -2975,7 +2975,7 @@ class CryptoScalpingBot:
                 
             self.total_trades += 1
             self.total_profit += net_profit
-            self.total_fees += total_fees
+            self.total_fees = total_fees / 2  # Only count fees once
             
             # Update displays
             self.update_active_trades_display()
