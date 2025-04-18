@@ -2803,12 +2803,12 @@ class CryptoScalpingBot:
             if len(self.active_trades) >= max_trades:
                 self.log_trade(f"Maximum trades ({max_trades}) already active")
                 return False
-                
+                    
             # Get current price with error handling
             try:
                 current_price = pair_data['ticker']['last']
                 if not current_price:
-                    self.log_trade(f"Invalid price for {pair_data['symbol']}")  # Fixed: pair -> pair_data
+                    self.log_trade(f"Invalid price for {pair_data['symbol']}")
                     return False
             except Exception as e:
                 self.log_trade(f"Error getting price: {str(e)}")
@@ -2836,8 +2836,11 @@ class CryptoScalpingBot:
                 balance = self.exchange.fetch_balance()
                 available_balance = float(balance['USD']['free'])
 
-            if available_balance < position_size:
-                self.log_trade(f"Insufficient balance. Available: {available_balance:.2f} USD")
+            # Calculate entry fee
+            entry_fee = position_size * self.taker_fee
+
+            if available_balance < (position_size + entry_fee):
+                self.log_trade(f"Insufficient balance. Available: {available_balance:.2f} USD, Required: {position_size + entry_fee:.2f} USD")
                 return False
 
             # Calculate target price
@@ -2847,7 +2850,7 @@ class CryptoScalpingBot:
             try:
                 if self.is_paper_trading:
                     order_id = f"paper_trade_{datetime.now().timestamp()}"
-                    self.paper_balance -= position_size
+                    self.paper_balance -= (position_size + entry_fee)  # Deduct position size and entry fee
                 else:
                     order = self.exchange.create_market_buy_order(
                         pair_data['symbol'],
@@ -2868,7 +2871,8 @@ class CryptoScalpingBot:
                     'highest_price': current_price,
                     'last_update': datetime.now(),
                     'order_ids': {'entry': order_id},
-                    'is_paper': self.is_paper_trading
+                    'is_paper': self.is_paper_trading,
+                    'entry_fee': entry_fee  # Store entry fee for reference
                 }
 
                 # Generate unique trade ID
@@ -2895,6 +2899,8 @@ class CryptoScalpingBot:
                 Position Size: ${position_size:.2f}
                 Target: {target_price:.8f} (+{profit_target*100:.1f}%)
                 Trailing Stop: {trailing_stop*100:.1f}%
+                Entry Fee: ${entry_fee:.2f}
+                Total Fees Accumulated: ${self.total_fees + entry_fee:.2f}
                 Balance After Entry: ${self.paper_balance:.2f}
                 Order ID: {order_id}
                 """)
@@ -2931,7 +2937,7 @@ class CryptoScalpingBot:
             gross_profit_percentage = ((current_price - entry_price) / entry_price) * 100
             
             # Calculate fees
-            entry_fee = position_size * self.taker_fee
+            entry_fee = trade.get('entry_fee', position_size * self.taker_fee)  # Use stored entry fee if available
             exit_fee = position_size * self.taker_fee
             total_fees = entry_fee + exit_fee
             
@@ -2974,8 +2980,8 @@ class CryptoScalpingBot:
                 self.losing_trades += 1
                 
             self.total_trades += 1
-            self.total_profit += net_profit
-            self.total_fees = total_fees / 2  # Only count fees once
+            self.total_profit += gross_profit  # Store raw profit
+            self.total_fees += total_fees  # Accumulate full fees
             
             # Update displays
             self.update_active_trades_display()
@@ -3173,6 +3179,18 @@ class CryptoScalpingBot:
             
             # Calculate net profit
             net_profit = self.total_profit - self.total_fees
+            
+            # Debug logging
+            self.log_trade(f"""
+            Updating Metrics:
+            Winning Trades: {self.winning_trades}
+            Losing Trades: {self.losing_trades}
+            Total Trades: {self.total_trades}
+            Total Profit: ${self.total_profit:.2f}
+            Total Fees: ${self.total_fees:.2f}
+            Net Profit: ${net_profit:.2f}
+            Win Rate: {win_rate:.1f}%
+            """)
             
             # Update labels with proper formatting
             self.total_profit_label.config(
