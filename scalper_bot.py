@@ -41,18 +41,16 @@ class DataManager:
                 print(message)
         except Exception as e:
             print(f"Logging error: {str(e)}")
+
     def _calculate_indicators(self, symbol: str):
-        """Calculate technical indicators using pandas"""
+        """Calculate technical indicators using pandas, including RSI"""
         try:
             if symbol not in self.price_data:
                 return
-                    
             df = self.price_data[symbol]
-            
-            # Need at least 2 data points
             if len(df) < 2:
                 return
-                    
+            
             try:
                 # Moving averages
                 for period in [5, 10, 20]:
@@ -74,14 +72,37 @@ class DataManager:
                 # Spread
                 df['spread'] = (df['ask'] - df['bid']) / df['price'] * 100
                 
+                # RSI Calculation
+                rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14  # Default to 14 if not set
+                if len(df) >= rsi_period + 1:  # Need enough data points for RSI
+                    # Calculate price changes
+                    delta = df['price'].diff()
+                    
+                    # Separate gains and losses
+                    gains = delta.where(delta > 0, 0)
+                    losses = -delta.where(delta < 0, 0)
+                    
+                    # Calculate average gains and losses over the period
+                    avg_gain = gains.rolling(window=rsi_period, min_periods=rsi_period).mean()
+                    avg_loss = losses.rolling(window=rsi_period, min_periods=rsi_period).mean()
+                    
+                    # Calculate RS and RSI
+                    rs = avg_gain / avg_loss
+                    rs = rs.replace([np.inf, -np.inf], np.nan)  # Avoid division by zero
+                    rsi = 100 - (100 / (1 + rs))
+                    
+                    # Store RSI in DataFrame
+                    df[f'rsi_{rsi_period}'] = rsi
+                    
+                    self.log_trade(f"RSI calculated for {symbol} with period {rsi_period}: {rsi.iloc[-1]:.2f}")
+                
                 # Store updated DataFrame
                 self.price_data[symbol] = df
-                
                 self.log_trade(f"Calculated indicators for {symbol}, data points: {len(df)}")
-                    
+            
             except Exception as e:
                 self.log_trade(f"Error calculating specific indicator for {symbol}: {str(e)}")
-                    
+        
         except Exception as e:
             self.log_trade(f"Error in _calculate_indicators for {symbol}: {str(e)}")
 
@@ -1112,6 +1133,11 @@ class CryptoScalpingBot:
             self.required_conditions.insert(0, "3")
             self.required_conditions.grid(row=1, column=3, padx=5, pady=2)
 
+            ttk.Label(filters_frame, text="Max Spread (%):").grid(row=4, column=0, padx=5, pady=2, sticky="w")
+            self.max_spread = ttk.Entry(filters_frame, width=8)
+            self.max_spread.insert(0, "0.3")  # Default to 0.3%
+            self.max_spread.grid(row=4, column=1, padx=5, pady=2)
+
             # Third row of filters
             ttk.Label(filters_frame, text="Consecutive Rises").grid(row=2, column=0, padx=5, pady=2, sticky="w")
             self.consecutive_rises = ttk.Entry(filters_frame, width=8)
@@ -1323,6 +1349,8 @@ class CryptoScalpingBot:
                 "Number of top pairs to analyze")
             self.add_tooltip(self.required_conditions, 
                 "Minimum number of conditions that must be met for entry")
+            self.add_tooltip(self.max_spread,
+                "Maximum bid-ask spread percentage allowed for trading")
                 
             # Validation Criteria Tooltips
             self.add_tooltip(self.momentum_beta, 
@@ -1448,7 +1476,36 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in momentum calculation: {str(e)}")
             return 0.0
+        
+    def calculate_momentum_quality(self, df):
+        """Calculate momentum quality (Theta) - Stability of momentum"""
+        try:
+            if df is None or len(df) < 5:
+                self.log_trade("Insufficient data for momentum quality calculation")
+                return 1.0  # Default to high instability if data is insufficient
 
+            df = df.copy()
+            df.sort_index(inplace=True)
+
+            # Calculate 5-period momentum (percentage change over 5 periods)
+            momentum = df['price'].pct_change(periods=5).fillna(0)
+
+            # Calculate stability as the standard deviation of momentum over the last 5 periods
+            momentum_stability = momentum.rolling(window=5).std().iloc[-1] * 100
+
+            # Log calculation details
+            self.log_trade(f"Momentum quality details:")
+            self.log_trade(f"Recent momentum: {momentum.tail()}")
+            self.log_trade(f"Momentum stability: {momentum_stability:.8f}")
+
+            # Normalize to 0-1 range
+            result = min(momentum_stability, 1.0)
+            return max(result, 0.0)
+
+        except Exception as e:
+            self.log_trade(f"Error in momentum quality calculation: {str(e)}")
+            return 1.0  # Default to high instability on error
+    
     def calculate_price_acceleration(self, df):
         """Calculate price acceleration (Alpha)"""
         try:
@@ -2421,16 +2478,15 @@ class CryptoScalpingBot:
         try:
             if not self.validate_ticker(ticker):
                 return False
-                
             price = float(ticker['last'])
             volume = float(ticker['quoteVolume'])
             spread = (float(ticker['ask']) - float(ticker['bid'])) / float(ticker['bid'])
-            
+            max_spread = float(self.max_spread.get()) / 100  # Convert percentage to decimal
             return (
                 price <= 5.0 and                         # Price under $5
                 price > 0.00001 and                      # Avoid extremely low prices
                 volume >= float(self.min_volume_entry.get()) and  # Minimum volume
-                spread < 0.02 and                        # 2% max spread
+                spread < max_spread and                  # Use user-defined max spread
                 ticker['bid'] > 0 and ticker['ask'] > 0  # Valid bid/ask
             )
         except:
@@ -2529,10 +2585,14 @@ class CryptoScalpingBot:
 
         except Exception as e:
             self.log_trade(f"Batch update error: {str(e)}")
+            
     def cleanup_on_shutdown(self):
         """Clean up resources and close positions before shutdown"""
         try:
             self.log_trade("Performing cleanup before shutdown...")
+            
+            # Stop all threads
+            self.running = False
             
             # Close all active trades
             if self.active_trades:
@@ -2543,7 +2603,7 @@ class CryptoScalpingBot:
                         self.close_trade(trade_id, trade, current_price, "shutdown")
                     except Exception as e:
                         self.log_trade(f"Error closing trade {trade_id}: {str(e)}")
-
+            
             # Save trade history
             try:
                 if hasattr(self, 'trades') and self.trades:
@@ -2554,8 +2614,8 @@ class CryptoScalpingBot:
                     self.log_trade(f"Trade history saved to {filename}")
             except Exception as e:
                 self.log_trade(f"Error saving trade history: {str(e)}")
-
-            # Final performance log
+            
+            # Log final performance
             self.log_trade(f"""
             Final Performance Summary:
             Total Trades: {self.total_trades}
@@ -2567,12 +2627,16 @@ class CryptoScalpingBot:
             Net Profit: ${(self.total_profit - self.total_fees):.2f}
             Final Balance: ${self.paper_balance:.2f}
             """)
-
+            
             # Clear data structures
             self.active_trades.clear()
             self.price_history.clear()
             self.price_cache.clear()
-
+            
+            # Close any matplotlib figures
+            if hasattr(self, 'fig'):
+                plt.close(self.fig)
+            
             self.log_trade("Cleanup completed successfully")
             
         except Exception as e:
@@ -2599,7 +2663,7 @@ class CryptoScalpingBot:
             self.log_trade(f"Error in cleanup: {str(e)}")
 
     def analyze_opportunity(self, ticker, volume_usd, pair_data):
-        """Analyze trading opportunity using advanced metrics"""
+        """Analyze trading opportunity using advanced metrics, Validation Criteria, and Advanced Parameters"""
         try:
             self.log_trade(f"\nAnalyzing {pair_data['symbol']}...")
 
@@ -2617,38 +2681,75 @@ class CryptoScalpingBot:
                 latest_time = df.index[-1]
                 current_time = pd.Timestamp.now()
                 data_age = (current_time - latest_time).total_seconds()
-
-                # Increase timeout to 120 seconds
                 if data_age > 120:  
                     self.log_trade(f"Skipping {pair_data['symbol']}: Data too old ({data_age:.1f} seconds)")
-                    # Try to refresh data
                     fresh_ticker = self.exchange.fetch_ticker(pair_data['symbol'])
                     self.data_manager.update_price_data(pair_data['symbol'], fresh_ticker)
                     return False
 
-            # If no DataFrame exists, create one
             if df is None or len(df) < 20:
                 self.log_trade(f"Insufficient data for {pair_data['symbol']}")
                 return False
 
-            # Rest of your existing analysis code...
+            # Calculate basic metrics for existing checks
             momentum = self.calculate_current_momentum(df)
             volume_increase = self.calculate_volume_increase(df)
-            
-            # Your existing validation logic...
+
+            # Validation logic for existing checks
             if momentum == 0.0 and volume_increase == 0.0:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Static data detected")
                 return False
 
-            # Check momentum threshold
             if momentum < float(self.momentum_threshold.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}%)")
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}% < {self.momentum_threshold.get()}%)")
                 return False
 
-            # Check volume increase threshold
             if volume_increase < float(self.volume_increase.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}%)")
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}% < {self.volume_increase.get()}%)")
                 return False
+
+            # Apply Validation Criteria (from previous implementation)
+            # 1. Trend Strength (Beta)
+            trend_strength = self.calculate_momentum_intensity(df)
+            if trend_strength < float(self.momentum_beta.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Trend strength below threshold ({trend_strength:.2f} < {self.momentum_beta.get()})")
+                return False
+            self.log_trade(f"✓ Trend Strength (Beta) passed: {trend_strength:.2f} >= {self.momentum_beta.get()}")
+
+            # 2. Price Momentum (Alpha)
+            price_acceleration = self.calculate_price_acceleration(df)
+            if price_acceleration < float(self.price_alpha.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Price acceleration below threshold ({price_acceleration:.2f} < {self.price_alpha.get()})")
+                return False
+            self.log_trade(f"✓ Price Momentum (Alpha) passed: {price_acceleration:.2f} >= {self.price_alpha.get()}")
+
+            # 3. Momentum Quality (Theta)
+            momentum_quality = self.calculate_momentum_quality(df)
+            if momentum_quality > float(self.time_theta.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum quality too unstable ({momentum_quality:.2f} > {self.time_theta.get()})")
+                return False
+            self.log_trade(f"✓ Momentum Quality (Theta) passed: {momentum_quality:.2f} <= {self.time_theta.get()}")
+
+            # 4. Volatility Filter (Vega)
+            volatility = self.calculate_volatility_sensitivity(df)
+            if volatility > float(self.vol_vega.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volatility too high ({volatility:.2f} > {self.vol_vega.get()})")
+                return False
+            self.log_trade(f"✓ Volatility Filter (Vega) passed: {volatility:.2f} <= {self.vol_vega.get()}")
+
+            # 5. Volume Quality (Rho)
+            current_volume = df['volume'].iloc[-1]
+            volume_impact = self.calculate_volume_impact(df, current_volume)
+            if volume_impact < float(self.volume_rho.get()):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volume impact below threshold ({volume_impact:.2f} < {self.volume_rho.get()})")
+                return False
+            self.log_trade(f"✓ Volume Quality (Rho) passed: {volume_impact:.2f} >= {self.vol_vega.get()}")
+
+            # Apply Advanced Parameters via advanced_checks
+            if not self.advanced_checks(pair_data['symbol'], df):
+                self.log_trade(f"Rejected {pair_data['symbol']}: Failed advanced checks")
+                return False
+            self.log_trade(f"✓ Advanced checks passed for {pair_data['symbol']}")
 
             # Opportunity found
             self.log_trade(f"Opportunity found for {pair_data['symbol']}")
@@ -2998,7 +3099,7 @@ class CryptoScalpingBot:
             return False
         
     def advanced_checks(self, symbol, df):
-        """Advanced market checks including order book analysis"""
+        """Advanced market checks including order book analysis and RSI"""
         try:
             # 1. EMA Cross (5/15)
             ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
@@ -3006,21 +3107,53 @@ class CryptoScalpingBot:
             
             # 2. Volume-Weighted Momentum
             vwap = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
-            vwm = (vwap.iloc[-1] - vwap.iloc[-5]) / vwap.iloc[-5] * 100  # 5-period % change
+            vwm = (vwap.iloc[-1] - vwap.iloc[-5]) / vwap.iloc[-5] * 100
             
             # 3. Order Book Imbalance
-            ob = self.exchange.fetch_order_book(symbol)  # Fixed: added self.
+            ob = self.exchange.fetch_order_book(symbol)
             bid_vol = sum(x[1] for x in ob['bids'][:3])
             ask_vol = sum(x[1] for x in ob['asks'][:3])
             ob_ratio = bid_vol / (ask_vol + 0.0001)  # Avoid division by zero
             
-            return all([
-                ema_cross,
-                vwm > 0.2,          # Min 0.2% VWAP rise
-                ob_ratio > 1.5,      # Bids > Asks by 50%
-                df['rsi_14'].iloc[-1] < 70  # Avoid overbought
-            ])
+            # 4. RSI Check
+            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
+            rsi_column = f'rsi_{rsi_period}'
+            if rsi_column not in df:
+                self.log_trade(f"RSI column {rsi_column} not found in DataFrame for {symbol}")
+                return False
             
+            rsi_value = df[rsi_column].iloc[-1]
+            if pd.isna(rsi_value):
+                self.log_trade(f"RSI value is NaN for {symbol}")
+                return False
+            
+            rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
+            rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
+            
+            # Avoid overbought conditions (RSI > overbought threshold)
+            if rsi_value > rsi_overbought:
+                self.log_trade(f"Rejected {symbol}: RSI indicates overbought condition ({rsi_value:.2f} > {rsi_overbought})")
+                return False
+            
+            # Optionally, prefer oversold conditions for entry (RSI < oversold threshold)
+            # This is a design choice; you can enable it if desired
+            # if rsi_value > rsi_oversold:
+            #     self.log_trade(f"Rejected {symbol}: RSI not in oversold range ({rsi_value:.2f} > {rsi_oversold})")
+            #     return False
+            
+            self.log_trade(f"Advanced checks passed for {symbol}:")
+            self.log_trade(f"- EMA Cross: {ema_cross}")
+            self.log_trade(f"- VWAP Momentum: {vwm:.2f}%")
+            self.log_trade(f"- Order Book Ratio: {ob_ratio:.2f}")
+            self.log_trade(f"- RSI: {rsi_value:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
+            
+            return all([
+                ema_cross,          # EMA crossover
+                vwm > 0.2,          # Min 0.2% VWAP rise
+                ob_ratio > 1.5,     # Bids > Asks by 50%
+                True                # RSI check already handled above
+            ])
+        
         except Exception as e:
             self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
             return False
