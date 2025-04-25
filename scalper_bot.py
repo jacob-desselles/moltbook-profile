@@ -194,7 +194,7 @@ class CryptoScalpingBot:
         self.style.configure('Dark.TButton',
             background='#1a1a1a',
             foreground='white')
-        self.root.title("Kairos Trading v1.0") 
+        self.root.title("Kairos Trading v1.05") 
         self.root.geometry("1200x1000")
 
         # Initialize basic variables
@@ -2585,7 +2585,7 @@ class CryptoScalpingBot:
 
         except Exception as e:
             self.log_trade(f"Batch update error: {str(e)}")
-            
+
     def cleanup_on_shutdown(self):
         """Clean up resources and close positions before shutdown"""
         try:
