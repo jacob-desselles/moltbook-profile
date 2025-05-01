@@ -174,7 +174,7 @@ class DataManager:
             else:
                 self.log(f"Skipping empty data update for {symbol}")
         except Exception as e:
-            self.log(f"Error updating price_data for {symbol}: {str(e)}")
+            self.log_trade(f"Error updating price_data for {symbol}: {str(e)}")
 
     def calculate_indicators(self, symbol):
         try:
@@ -212,7 +212,7 @@ class CryptoScalpingBot:
         # Initialize the Tkinter root window
         self.root = tk.Tk()
         self.root.title("Crypto Scalping Bot - Paper Trading")
-        self.root.geometry("1000x800")
+        self.root.geometry("1200x900")
         
         # Core state variables
         self.running = False
@@ -227,6 +227,7 @@ class CryptoScalpingBot:
         self.losses = 0
         self.is_shutting_down = False
         self.gui_ready = False
+        self.trades = []  # Store trade history
         
         # Create a queue for thread-safe GUI updates
         self.gui_update_queue = queue.Queue()
@@ -265,6 +266,9 @@ class CryptoScalpingBot:
             'ETH/USD': {'last': 3000.0, 'quoteVolume': 500000.0, 'bid': 2995.0, 'ask': 3005.0, 'change': 1.2}
         }
         
+        # Initialize DataManager
+        self.data_manager = DataManager(bot=self)
+        
         # Trading parameters
         self.profit_target = tk.StringVar(value="1.0")
         self.stop_loss = tk.StringVar(value="0.5")
@@ -274,16 +278,34 @@ class CryptoScalpingBot:
         self.trailing_activation = tk.StringVar(value="0.4")
         self.max_trades = tk.StringVar(value="5")
         self.min_volume = tk.StringVar(value="100000")
-        
+        self.volume_change_threshold = tk.StringVar(value="1.0")
+
+        # Advanced parameters (Greeks)
+        self.momentum_beta = tk.StringVar(value="0.8")  # Trend strength
+        self.price_alpha = tk.StringVar(value="0.6")    # Price momentum
+        self.momentum_theta = tk.StringVar(value="0.5") # Momentum quality
+        self.vol_vega = tk.StringVar(value="0.4")       # Volatility filter
+        self.volume_rho = tk.StringVar(value="0.7")     # Volume quality
+
+        # Technical indicators
+        self.rsi_period = tk.StringVar(value="14")
+        self.rsi_overbought = tk.StringVar(value="70")
+        self.rsi_oversold = tk.StringVar(value="30")
+        self.ema_short = tk.StringVar(value="5")
+        self.ema_long = tk.StringVar(value="15")
+
         # Fee structure
         self.taker_fee = 0.0026  # 0.26% for taker orders
-        
+
         # Setup GUI
         self.setup_gui()
-        
+
         # Start GUI update processor
         self.root.after(100, self.process_gui_updates)
-        
+
+        # Handle window close event properly
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         self.log_trade("Bot initialized successfully")
         self.gui_ready = True
 
@@ -305,83 +327,101 @@ class CryptoScalpingBot:
             self.log_text.see(tk.END)
 
     def setup_gui(self):
-        """Setup the GUI with essential components"""
-        # Main container
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Top frame for controls
-        top_frame = ttk.Frame(main_frame)
-        top_frame.pack(fill=tk.X, pady=5)
-        
-        # Control buttons
-        control_frame = ttk.LabelFrame(top_frame, text="Controls")
-        control_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        self.start_button = ttk.Button(control_frame, text="Start", command=self.toggle_bot)
-        self.start_button.grid(row=0, column=0, padx=5, pady=5)
-        
-        self.close_all_button = ttk.Button(control_frame, text="Close All", command=self.close_all_positions)
-        self.close_all_button.grid(row=0, column=1, padx=5, pady=5)
-        
-        # Balance display
-        self.balance_label = ttk.Label(control_frame, text=f"Paper Balance: ${self.paper_balance:.2f}")
-        self.balance_label.grid(row=0, column=2, padx=20, pady=5)
-        
-        # Status display
-        self.status_label = ttk.Label(control_frame, text="Status: Ready")
-        self.status_label.grid(row=0, column=3, padx=20, pady=5)
-        
-        # Parameters frame
-        params_frame = ttk.LabelFrame(top_frame, text="Trading Parameters")
-        params_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
-        
-        # Trading parameters
-        param_row = 0
-        ttk.Label(params_frame, text="Profit Target (%):").grid(row=param_row, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.profit_target, width=8).grid(row=param_row, column=1, padx=5, pady=2)
-        
-        ttk.Label(params_frame, text="Stop Loss (%):").grid(row=param_row, column=2, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.stop_loss, width=8).grid(row=param_row, column=3, padx=5, pady=2)
-        param_row += 1
-        
-        ttk.Label(params_frame, text="Position Size ($):").grid(row=param_row, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.position_size, width=8).grid(row=param_row, column=1, padx=5, pady=2)
-        
-        ttk.Label(params_frame, text="Min Price Rise (%):").grid(row=param_row, column=2, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.min_price_rise, width=8).grid(row=param_row, column=3, padx=5, pady=2)
-        param_row += 1
-        
-        ttk.Label(params_frame, text="Trailing Stop (%):").grid(row=param_row, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.trailing_stop, width=8).grid(row=param_row, column=1, padx=5, pady=2)
-        
-        ttk.Label(params_frame, text="Trailing Activation (%):").grid(row=param_row, column=2, sticky="w", padx=5, pady=2)
-        ttk.Entry(params_frame, textvariable=self.trailing_activation, width=8).grid(row=param_row, column=3, padx=5, pady=2)
-        
-        # Middle frame for chart
-        chart_frame = ttk.LabelFrame(main_frame, text="Price Chart")
-        chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Setup chart
-        self.setup_chart(chart_frame)
-        
-        # Bottom frame for trades and log
-        bottom_frame = ttk.Frame(main_frame)
-        bottom_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Active trades display
-        trades_frame = ttk.LabelFrame(bottom_frame, text="Active Trades")
-        trades_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        
-        self.trades_text = scrolledtext.ScrolledText(trades_frame, height=10)
-        self.trades_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Trading log
-        log_frame = ttk.LabelFrame(bottom_frame, text="Trading Log")
-        log_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        """Set up the GUI components"""
+        try:
+            # Create main frame
+            main_frame = ttk.Frame(self.root, padding="10")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Create left and right columns
+            left_column = ttk.Frame(main_frame)
+            left_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            
+            right_column = ttk.Frame(main_frame)
+            right_column.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            
+            # Create notebook for parameter tabs
+            param_notebook = ttk.Notebook(left_column)
+            param_notebook.pack(fill=tk.X, padx=5, pady=5)
+            
+            # Basic parameters tab
+            basic_tab = ttk.Frame(param_notebook)
+            param_notebook.add(basic_tab, text="Basic")
+            
+            # Advanced parameters tab
+            advanced_tab = ttk.Frame(param_notebook)
+            param_notebook.add(advanced_tab, text="Advanced")
+            
+            # Indicators tab
+            indicators_tab = ttk.Frame(param_notebook)
+            param_notebook.add(indicators_tab, text="Indicators")
+            
+            # Set up basic parameters
+            self.setup_basic_parameters(basic_tab)
+            
+            # Set up advanced parameters
+            self.setup_advanced_parameters(advanced_tab)
+            
+            # Set up technical indicators
+            self.setup_technical_indicators(indicators_tab)
+            
+            # Create trades and history frame
+            trades_frame = ttk.Frame(left_column)
+            trades_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Active trades (smaller size)
+            active_trades_frame = ttk.LabelFrame(trades_frame, text="Active Trades")
+            active_trades_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
+            
+            # Create scrolled text for trades (reduced height)
+            self.trades_text = scrolledtext.ScrolledText(active_trades_frame, height=6)
+            self.trades_text.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
+            
+            # Trade history (in main window, below active trades)
+            history_frame = ttk.LabelFrame(trades_frame, text="Trade History")
+            history_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Create scrolled text for trade history
+            self.history_text = scrolledtext.ScrolledText(history_frame)
+            self.history_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Create chart frame
+            chart_frame = ttk.LabelFrame(right_column, text="Trade Performance")
+            chart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Set up chart
+            self.setup_chart(chart_frame)
+            
+            # Performance metrics frame
+            metrics_frame = ttk.LabelFrame(right_column, text="Performance Metrics")
+            metrics_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            # Setup performance metrics
+            self.setup_performance_metrics(metrics_frame)
+            
+            # Control buttons frame
+            self.control_frame = ttk.Frame(right_column)
+            self.control_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            # Set up control buttons
+            self.setup_control_buttons(self.control_frame)
+            
+            # Status bar
+            status_frame = ttk.Frame(self.root)
+            status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=5, pady=2)
+            
+            # Status label
+            self.status_label = ttk.Label(status_frame, text="Ready")
+            self.status_label.pack(side=tk.LEFT)
+            
+            # Update the metrics display immediately
+            self.update_metrics()
+            
+            self.log_trade("GUI setup complete")
+            self.gui_ready = True
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up GUI: {str(e)}")
 
     def setup_chart(self, chart_frame):
         """Setup the price chart"""
@@ -770,101 +810,48 @@ class CryptoScalpingBot:
             row += 1
             
             # Net Profit
-            self.net_profit_label = ttk.Label(parent, text=f"Net Profit: ${self.net_profit:.2f} USD")
+            self.net_profit_label = ttk.Label(parent, text=f"Net Profit: ${self.total_profit - self.total_fees:.2f} USD")
             self.net_profit_label.grid(row=row, column=0, sticky="w", padx=5, pady=2)
             row += 1
             
             # Win/Loss
-            self.win_loss_label = ttk.Label(parent, text=f"Win/Loss: {self.wins}/{self.losses} ({0.0:.1f}%)")
+            win_rate = (self.wins / max(1, self.wins + self.losses)) * 100
+            self.win_loss_label = ttk.Label(parent, text=f"Win/Loss: {self.wins}/{self.losses} ({win_rate:.1f}%)")
             self.win_loss_label.grid(row=row, column=0, sticky="w", padx=5, pady=2)
             row += 1
             
-            # Active Trades Count
-            self.active_trades_label = ttk.Label(parent, text="Active Trades: 0")
+            # Active Trades
+            self.active_trades_label = ttk.Label(parent, text=f"Active Trades: {len(self.active_trades)}")
             self.active_trades_label.grid(row=row, column=0, sticky="w", padx=5, pady=2)
-            row += 1
             
-            # Daily Performance
-            self.daily_performance_label = ttk.Label(parent, text="Today: $0.00 (0.0%)")
-            self.daily_performance_label.grid(row=row, column=0, sticky="w", padx=5, pady=2)
-            row += 1
-            
-            self.log_trade("Performance metrics display initialized")
+            self.log_trade("Performance metrics setup complete")
             
         except Exception as e:
             self.log_trade(f"Error setting up performance metrics: {str(e)}")
 
     def close_all_positions(self):
-        """Manually close all open positions with accurate P/L calculation"""
+        """Close all active trades"""
         try:
             if not self.active_trades:
                 self.log_trade("No active trades to close")
                 return
-
-            for trade_id, trade in list(self.active_trades.items()):
+            
+            self.log_trade(f"Closing all {len(self.active_trades)} active trades")
+        
+            # Make a copy of trade IDs since we'll be modifying the dictionary
+            trade_ids = list(self.active_trades.keys())
+        
+            for trade_id in trade_ids:
                 try:
-                    # Get fresh price data with error checking
-                    try:
-                        ticker = self.exchange.fetch_ticker(trade['symbol'])
-                        current_price = float(ticker['last'])
-                    except Exception as e:
-                        self.log_trade(f"Error getting price for {trade['symbol']}: {str(e)}")
-                        # Use last known price as fallback
-                        current_price = float(trade.get('current_price', trade['entry_price']))
-
-                    # Calculate exact P/L
-                    entry_price = float(trade['entry_price'])
-                    amount = float(trade['amount'])
-                    position_size = float(trade['position_size'])
-                    
-                    # Calculate raw P/L numbers
-                    profit_pct = ((current_price - entry_price) / entry_price) * 100
-                    gross_profit = (current_price - entry_price) * amount
-                    
-                    # Calculate fees
-                    entry_fee = position_size * self.taker_fee
-                    exit_fee = (position_size * (1 + (profit_pct/100))) * self.taker_fee
-                    total_fees = entry_fee + exit_fee
-                    
-                    # Calculate net P/L
-                    net_profit = gross_profit - total_fees
-                    net_profit_pct = (net_profit / position_size) * 100
-
-                    # Update paper balance
-                    if self.is_paper_trading:
-                        self.paper_balance += (position_size + net_profit)
-
-                    # Log closure with exact numbers
-                    self.log_trade(f"""
-                    Closing trade {trade['symbol']}:
-                    Entry: ${entry_price:.8f}
-                    Exit: ${current_price:.8f}
-                    Gross P/L: {profit_pct:.2f}%
-                    Fees: ${total_fees:.2f}
-                    Net P/L: {net_profit_pct:.2f}%
-                    """)
-
-                    # Update trade history with accurate numbers
-                    self.update_trade_history(
-                        symbol=trade['symbol'],
-                        percentage=net_profit_pct,
-                        profit=net_profit,
-                        is_win=(net_profit > 0)
-                    )
-
-                    # Remove from active trades
-                    del self.active_trades[trade_id]
-
+                    trade = self.active_trades[trade_id]
+                    symbol = trade['symbol']
+                    current_price = self.get_current_price(symbol)
+                    self.close_trade(trade_id, trade, current_price, "manual close all")
                 except Exception as e:
                     self.log_trade(f"Error closing trade {trade_id}: {str(e)}")
-                    continue
-
-            # Update displays
-            self.update_active_trades_display()
-            self.update_metrics()
-            self.update_balance_display()
-            self.log_trade("All positions closed")
-
+                
+            self.log_trade("All trades closed")
+        
         except Exception as e:
             self.log_trade(f"Error in close_all_positions: {str(e)}")
 
@@ -892,43 +879,60 @@ class CryptoScalpingBot:
             self.log_trade(f"Error closing profitable positions: {str(e)}")
 
     def update_balance_display(self):
-        """Update the balance display in the GUI"""
+        """Update the balance display with current balance"""
         try:
-            if not hasattr(self, 'balance_label') or not self.balance_label:
-                return
-            
-            # Format balance with commas and 2 decimal places
-            balance_text = f"{self.paper_balance:,.2f} USD"
-            self.log_trade(f"Updating GUI paper balance label to: {balance_text}")
-            
-            # Update label
-            self.balance_label.config(text=balance_text)
+            # Update the metrics which includes the paper balance
+            self.update_metrics()
             
         except Exception as e:
             self.log_trade(f"Error updating balance display: {str(e)}")
 
     def update_metrics(self):
-        """Update trading metrics display"""
+        """Update trading metrics"""
         try:
-            if not hasattr(self, 'total_profit_label') or not hasattr(self, 'total_fees_label') or not hasattr(self, 'net_profit_label') or not hasattr(self, 'win_loss_label'):
-                return
+            # Calculate win rate
+            total_trades = self.wins + self.losses
+            win_rate = (self.wins / total_trades * 100) if total_trades > 0 else 0
             
-            # Update total profit
-            self.total_profit_label.config(text=f"Total Profit: ${self.total_profit:.2f} USD")
+            # Calculate net profit
+            net_profit = self.total_profit - self.total_fees
             
-            # Update total fees
-            self.total_fees_label.config(text=f"Total Fees: ${self.total_fees:.2f} USD")
+            # Calculate available balance (total - allocated to active trades)
+            allocated_balance = sum(trade.get('position_size', 0) for trade in self.active_trades.values())
+            available_balance = self.paper_balance - allocated_balance + net_profit
             
-            # Update net profit
-            self.net_profit_label.config(text=f"Net Profit: ${self.net_profit:.2f} USD")
+            # Update labels
+            if hasattr(self, 'paper_balance_label'):
+                self.paper_balance_label.config(
+                    text=f"Paper Balance: ${self.paper_balance:.2f} USD"
+                )
             
-            # Update win/loss
-            win_loss_text = f"Win/Loss: {self.wins}/{self.losses}"
-            if self.losses > 0:
-                win_loss_text += f" ({(self.wins / self.losses * 100):.1f}%)"
-            else:
-                win_loss_text += " (N/A)"
-            self.win_loss_label.config(text=win_loss_text)
+            if hasattr(self, 'total_profit_label'):
+                self.total_profit_label.config(
+                    text=f"Total Profit: ${self.total_profit:.2f} USD"
+                )
+            
+            if hasattr(self, 'total_fees_label'):
+                self.total_fees_label.config(
+                    text=f"Total Fees: ${self.total_fees:.2f} USD"
+                )
+            
+            if hasattr(self, 'net_profit_label'):
+                self.net_profit_label.config(
+                    text=f"Net Profit: ${net_profit:.2f} USD"
+                )
+            
+            if hasattr(self, 'win_loss_label'):
+                self.win_loss_label.config(
+                    text=f"Win/Loss: {self.wins}/{self.losses} ({win_rate:.1f}%)"
+                )
+            
+            if hasattr(self, 'active_trades_label'):
+                self.active_trades_label.config(
+                    text=f"Active Trades: {len(self.active_trades)}"
+                )
+            
+            self.log_trade(f"Updated metrics - Win Rate: {win_rate:.1f}%, Net Profit: ${net_profit:.2f}")
             
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
@@ -1093,52 +1097,27 @@ class CryptoScalpingBot:
             trailing_stop_pct = self.trading_params['trailing_stop']
             trailing_activation = self.trading_params['trailing_activation']
             
+            # Process each active trade
             for trade_id, trade in list(self.active_trades.items()):
                 try:
                     symbol = trade['symbol']
-                    
-                    # Get current price from tickers
-                    if symbol not in tickers:
-                        self.log_trade(f"Symbol {symbol} not found in tickers, skipping")
-                        continue
-                        
-                    ticker = tickers[symbol]
-                    current_price = float(ticker['last'])
                     entry_price = trade['entry_price']
                     
-                    # Update trade data
-                    trade['current_price'] = current_price
+                    # Get current price from tickers
+                    ticker = tickers.get(symbol, {})
+                    current_price = ticker.get('last')
+                    
+                    if not current_price:
+                        self.log_trade(f"No price data for {symbol}")
+                        continue
                     
                     # Calculate profit percentage
                     profit_percentage = ((current_price - entry_price) / entry_price) * 100
-                    trade['current_profit_percentage'] = profit_percentage
                     
-                    # Update highest price and profit if needed
-                    if current_price > trade['highest_price']:
-                        trade['highest_price'] = current_price
+                    # Update highest profit percentage if needed
+                    if profit_percentage > trade.get('highest_profit_percentage', 0):
                         trade['highest_profit_percentage'] = profit_percentage
-                    
-                    # Check exit conditions
-                    
-                    # 1. Take profit
-                    if profit_percentage >= profit_target * 100:
-                        self.close_trade(trade_id, trade, current_price, "take profit")
-                        continue
-                        
-                    # 2. Stop loss
-                    if profit_percentage <= -stop_loss * 100:
-                        self.close_trade(trade_id, trade, current_price, "stop loss")
-                        continue
-                        
-                    # 3. Trailing stop
-                    if profit_percentage >= trailing_activation * 100:
-                        # Calculate drop from highest price
-                        drop_from_high = ((trade['highest_price'] - current_price) / trade['highest_price']) * 100
-                        
-                        # Check if drop exceeds trailing stop
-                        if drop_from_high >= trailing_stop_pct * 100:
-                            self.close_trade(trade_id, trade, current_price, "trailing stop")
-                            continue
+                        trade['highest_price'] = current_price
                     
                     # Log current trade status
                     self.log_trade(f"""
@@ -1159,7 +1138,7 @@ class CryptoScalpingBot:
                     self.gui_update_queue.put(self.update_chart)
                 if hasattr(self, 'update_metrics'):
                     self.gui_update_queue.put(self.update_metrics)
-                
+            
         except Exception as e:
             self.log_trade(f"Error in trade monitoring: {str(e)}")
 
@@ -1398,8 +1377,13 @@ class CryptoScalpingBot:
         """Scan for trading opportunities"""
         if len(self.active_trades) >= int(self.max_trades.get()):
             return
-            
+        
         self.log_trade(f"Scanning {len(self.mock_ticker_state)} pairs for opportunities...")
+        
+        # Initialize DataManager if not already done
+        if not hasattr(self, 'data_manager'):
+            self.data_manager = DataManager(bot=self)
+            self.log_trade("Created DataManager instance")
         
         # Find potential trades
         potential_trades = []
@@ -1417,32 +1401,105 @@ class CryptoScalpingBot:
                 if symbol in self.active_trades:
                     continue
                 
-                # Random "analysis" for demo purposes
-                price_change = random.uniform(-1.0, 2.0)  # -1% to 2% change
+                # Update price data in DataManager
+                new_data = {
+                    'timestamp': datetime.now(),
+                    'price': price,
+                    'volume': volume
+                }
+                self.data_manager.update_price_data(symbol, new_data)
                 
-                # Only consider positive changes above threshold
-                if price_change > float(self.min_price_rise.get()):
-                    score = price_change * volume / 100000  # Simple scoring
-                    
-                    potential_trades.append({
-                        'symbol': symbol,
-                        'price': price,
-                        'volume': volume,
-                        'price_change': price_change,
-                        'score': score
-                    })
-                    
+                # Calculate indicators using DataManager
+                df = self.data_manager.calculate_indicators(symbol)
+                if df is None:
+                    continue
+                
+                # Calculate price change
+                if len(df) >= 2:
+                    price_change = ((df['price'].iloc[-1] - df['price'].iloc[-2]) / df['price'].iloc[-2]) * 100
+                else:
+                    price_change = 0
+                
+                # Check for minimum price rise
+                if price_change < float(self.min_price_rise.get()):
+                    continue
+                
+                # Advanced checks
+                if not self.advanced_checks(symbol, df):
+                    continue
+                
+                # If all checks pass, add to potential trades
+                potential_trades.append((symbol, price, df))
+                
             except Exception as e:
-                self.log_trade(f"Error analyzing {symbol}: {str(e)}")
+                self.log_trade(f"Error processing symbol {symbol}: {str(e)}")
+                continue
         
-        # Sort by score (highest first)
-        potential_trades.sort(key=lambda x: x['score'], reverse=True)
+        # Sort potential trades by price change (descending)
+        potential_trades.sort(key=lambda x: x[1], reverse=True)
         
-        # Take top opportunity
-        if potential_trades:
-            top_trade = potential_trades[0]
-            self.log_trade(f"Found opportunity: {top_trade['symbol']} with {top_trade['price_change']:.2f}% change")
-            self.execute_trade(top_trade['symbol'], top_trade['price'])
+        # Execute trades up to the maximum allowed
+        max_new_trades = int(self.max_trades.get()) - len(self.active_trades)
+        for symbol, price, df in potential_trades[:max_new_trades]:
+            try:
+                ticker = self.mock_ticker_state[symbol]
+                self.execute_trade(symbol, price)
+            except Exception as e:
+                self.log_trade(f"Error executing trade for {symbol}: {str(e)}")
+                continue
+    def advanced_checks(self, symbol, df):
+        """Advanced market checks including RSI and EMA analysis"""
+        try:
+            # 1. EMA Cross (Short/Long)
+            short_period = int(self.ema_short.get())
+            long_period = int(self.ema_long.get())
+            
+            # Check if EMAs are in the dataframe
+            ema_short_col = f'ema_{short_period}'
+            ema_long_col = f'ema_{long_period}'
+            
+            # Use existing EMAs or calculate if needed
+            if ema_short_col not in df.columns:
+                ema_short_col = 'ema_5'  # Use default if specific one not available
+            if ema_long_col not in df.columns:
+                ema_long_col = 'ema_15'  # Use default if specific one not available
+                
+            # Check for bullish EMA cross (short crosses above long)
+            if len(df) >= 2:
+                ema_cross = (df[ema_short_col].iloc[-2] < df[ema_long_col].iloc[-2]) and \
+                            (df[ema_short_col].iloc[-1] > df[ema_long_col].iloc[-1])
+            else:
+                ema_cross = False
+            
+            # 2. RSI Check
+            rsi_period = int(self.rsi_period.get())
+            rsi_overbought = float(self.rsi_overbought.get())
+            rsi_oversold = float(self.rsi_oversold.get())
+            
+            # Use existing RSI or default
+            rsi_col = f'rsi_{rsi_period}'
+            if rsi_col not in df.columns:
+                rsi_col = 'rsi_14'  # Use default if specific one not available
+                
+            # Check if RSI is available
+            if rsi_col in df.columns and not df[rsi_col].isna().all():
+                rsi = df[rsi_col].iloc[-1]
+                # Check RSI conditions
+                rsi_condition = rsi < rsi_overbought  # Not overbought
+            else:
+                rsi = 50  # Default neutral value
+                rsi_condition = True  # Pass by default
+            
+            self.log_trade(f"Advanced checks for {symbol}:")
+            self.log_trade(f"- EMA Cross: {ema_cross}")
+            self.log_trade(f"- RSI: {rsi:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
+            
+            # For paper trading demo, we'll consider checks passed
+            return True
+            
+        except Exception as e:
+            self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
+            return False
 
     def execute_trade(self, symbol, price):
         """Execute a paper trade"""
@@ -1498,81 +1555,285 @@ class CryptoScalpingBot:
 
     def monitor_trades(self):
         """Monitor active trades for exit conditions"""
-        if not self.active_trades:
-            return
+        try:
+            if not self.active_trades:
+                return
             
-        for trade_id in list(self.active_trades.keys()):
-            try:
-                trade = self.active_trades[trade_id]
-                symbol = trade['symbol']
-                entry_price = trade['entry_price']
-                
-                # Get current price
-                current_price = self.get_current_price(symbol)
-                
-                # Update trade data
-                trade['current_price'] = current_price
-                
-                # Calculate profit/loss
-                profit_percentage = (current_price - entry_price) / entry_price * 100
-                
-                # Update highest price and profit if applicable
-                if current_price > trade['highest_price']:
-                    trade['highest_price'] = current_price
-                    trade['highest_profit'] = (current_price - entry_price) * (trade['position_size'] / entry_price)
-                    trade['highest_profit_percentage'] = profit_percentage
-                
-                # Check exit conditions
-                
-                # 1. Stop Loss
-                if profit_percentage <= -float(self.stop_loss.get()):
-                    self.close_trade(trade_id, trade, current_price, "stop loss")
-                    continue
-                
-                # 2. Profit Target
-                if profit_percentage >= float(self.profit_target.get()):
-                    self.close_trade(trade_id, trade, current_price, "profit target")
-                    continue
-                
-                # 3. Trailing Stop
-                trailing_stop = float(self.trailing_stop.get())
-                trailing_activation = float(self.trailing_activation.get())
-                
-                if profit_percentage >= trailing_activation:
-                    # Calculate drop from highest
-                    drop_from_high = (trade['highest_price'] - current_price) / trade['highest_price'] * 100
-                    
-                    if drop_from_high >= trailing_stop:
-                        self.close_trade(trade_id, trade, current_price, "trailing stop")
+            for trade_id in list(self.active_trades.keys()):
+                try:
+                    # Get current price
+                    symbol = self.active_trades[trade_id]['symbol']
+                    current_price = self.get_current_price(symbol)
+                    if not current_price:
+                        self.log_trade(f"No current price data for {symbol}")
                         continue
+
+                    # Calculate profit percentage
+                    entry_price = self.active_trades[trade_id]['entry_price']
+                    profit_percentage = ((current_price - entry_price) / entry_price) * 100
+
+                    # Check for take profit
+                    profit_target = float(self.profit_target.get())
+                    if profit_percentage >= profit_target:
+                        self.close_trade(trade_id, self.active_trades[trade_id], current_price, "take profit")
+                        continue
+
+                    # Check for stop loss
+                    stop_loss = float(self.stop_loss.get())
+                    if profit_percentage <= -stop_loss:
+                        self.close_trade(trade_id, self.active_trades[trade_id], current_price, "stop loss")
+                        continue
+
+                    # Check for trailing stop
+                    trailing_stop = float(self.trailing_stop.get())
+                    
+                    # Update highest price and profit if needed
+                    if current_price > self.active_trades[trade_id].get('highest_price', 0):
+                        self.active_trades[trade_id]['highest_price'] = current_price
+                        self.active_trades[trade_id]['highest_profit_percentage'] = profit_percentage
+                    
+                    # Check trailing stop condition
+                    trailing_activation = float(self.trailing_activation.get())
+                    highest_profit = self.active_trades[trade_id].get('highest_profit_percentage', 0)
+                    
+                    if highest_profit >= trailing_activation:
+                        drop_from_high = highest_profit - profit_percentage
+                        if drop_from_high >= trailing_stop:
+                            self.close_trade(trade_id, self.active_trades[trade_id], current_price, "trailing stop")
+                            continue
+                    
+                    # Update price history for charting
+                    if symbol in self.price_history:
+                        self.price_history[symbol].append((datetime.now(), current_price))
+                        # Limit history size
+                        self.price_history[symbol] = self.price_history[symbol][-100:]
                 
-            except Exception as e:
-                self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
+                except Exception as e:
+                    self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
+                    continue
+                
+            # Update displays
+            if hasattr(self, 'gui_update_queue'):
+                self.gui_update_queue.put(self.update_active_trades_display)
+                self.gui_update_queue.put(self.update_chart)
+                self.gui_update_queue.put(self.update_metrics)
+            
+        except Exception as e:
+            self.log_trade(f"Error in trade monitoring: {str(e)}")
+    def setup_technical_indicators(self, parent):
+        """Set up technical indicators parameters"""
+        try:
+            # Create a grid layout
+            row = 0
+            
+            # RSI Period
+            ttk.Label(parent, text="RSI Period").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.rsi_period, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # RSI Overbought
+            ttk.Label(parent, text="RSI Overbought").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.rsi_overbought, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # RSI Oversold
+            ttk.Label(parent, text="RSI Oversold").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.rsi_oversold, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # EMA Short
+            ttk.Label(parent, text="EMA Short").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.ema_short, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # EMA Long (directly below EMA Short)
+            ttk.Label(parent, text="EMA Long").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.ema_long, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Apply button
+            ttk.Button(parent, text="Apply Indicators", command=self.live_update).grid(row=row, column=0, columnspan=2, padx=5, pady=10)
+            
+            self.log_trade("Technical indicators setup complete")
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up technical indicators: {str(e)}")
+
+    def setup_basic_parameters(self, parent):
+        """Set up basic trading parameters"""
+        try:
+            # Create a grid layout
+            row = 0
+            
+            # Profit Target
+            ttk.Label(parent, text="Profit Target (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.profit_target, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Stop Loss
+            ttk.Label(parent, text="Stop Loss (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.stop_loss, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Position Size
+            ttk.Label(parent, text="Position Size (USD)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.position_size, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Min Price Rise
+            ttk.Label(parent, text="Min Price Rise (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.min_price_rise, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Trailing Stop
+            ttk.Label(parent, text="Trailing Stop (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.trailing_stop, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Trailing Activation
+            ttk.Label(parent, text="Trailing Activation (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.trailing_activation, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Max Trades
+            ttk.Label(parent, text="Max Trades").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.max_trades, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Min Volume
+            ttk.Label(parent, text="Min Volume (USD)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.min_volume, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Volume Change Threshold (moved from Indicators to Basic)
+            ttk.Label(parent, text="Volume Change Threshold (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.volume_change_threshold, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Apply button
+            ttk.Button(parent, text="Apply Settings", command=self.live_update).grid(row=row, column=0, columnspan=2, padx=5, pady=10)
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up basic parameters: {str(e)}")
+
+    def setup_advanced_parameters(self, parent):
+        """Set up advanced trading parameters"""
+        try:
+            # Create a grid layout
+            row = 0
+            
+            # Momentum Beta
+            ttk.Label(parent, text="Momentum Beta").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.momentum_beta, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Price Alpha
+            ttk.Label(parent, text="Price Alpha").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.price_alpha, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Momentum Theta
+            ttk.Label(parent, text="Momentum Theta").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.momentum_theta, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Vol Vega
+            ttk.Label(parent, text="Vol Vega").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.vol_vega, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Volume Rho
+            ttk.Label(parent, text="Volume Rho").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(parent, textvariable=self.volume_rho, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Apply button
+            ttk.Button(parent, text="Apply Advanced", command=self.live_update).grid(row=row, column=0, columnspan=2, padx=5, pady=10)
+            
+            self.log_trade("Advanced parameters setup complete")
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up advanced parameters: {str(e)}")
+
+    def setup_control_buttons(self, parent):
+        """Set up control buttons"""
+        try:
+            # Create a frame for buttons
+            button_frame = ttk.Frame(parent)
+            button_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            # Start/Stop button
+            self.start_button = ttk.Button(button_frame, text="Start Bot", command=self.toggle_bot)
+            self.start_button.pack(side=tk.LEFT, padx=5)
+            
+            # Close All Positions button
+            self.close_all_button = ttk.Button(button_frame, text="Close All Positions", command=self.close_all_positions)
+            self.close_all_button.pack(side=tk.LEFT, padx=5)
+            
+            # Mode selection (Paper/Real)
+            self.mode_var = tk.StringVar(value="Paper Trading")
+            self.mode_button = ttk.Button(button_frame, text="Mode: Paper", command=self.toggle_mode)
+            self.mode_button.pack(side=tk.LEFT, padx=5)
+            
+            # Add a button to show trade history
+            self.history_button = ttk.Button(button_frame, text="Trade History", 
+                                           command=lambda: self.history_window.deiconify())
+            self.history_button.pack(side=tk.LEFT, padx=5)
+            
+            self.log_trade("Control buttons setup complete")
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up control buttons: {str(e)}")
+
+    def setup_trade_history_display(self):
+        """Set up the trade history display"""
+        try:
+            # Create a new window for trade history
+            self.history_window = tk.Toplevel(self.root)
+            self.history_window.title("Trade History")
+            self.history_window.geometry("800x400")
+            self.history_window.withdraw()  # Hide initially
+            
+            # Create scrolled text for trade history
+            self.history_text = scrolledtext.ScrolledText(self.history_window)
+            self.history_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Add history button to the main window
+            # We'll add this in the setup_gui method to ensure button_frame exists
+            
+            self.log_trade("Trade history display setup complete")
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up trade history display: {str(e)}")
 
     def close_trade(self, trade_id, trade, current_price, reason):
         """Close a trade and update balance"""
         try:
             if trade_id not in self.active_trades:
                 return False
-                
+            
             symbol = trade['symbol']
             entry_price = trade['entry_price']
             position_size = trade['position_size']
             
             # Calculate profit/loss
             price_change = (current_price - entry_price) / entry_price
-            profit_loss = position_size * price_change
+            gross_profit = position_size * price_change
             
-            # Apply fees
-            fees = position_size * self.taker_fee
-            net_profit = profit_loss - fees
+            # Apply fees (0.8% total - 0.4% entry + 0.4% exit)
+            entry_fee = position_size * (self.taker_fee / 2)
+            exit_fee = (position_size * (1 + price_change)) * (self.taker_fee / 2)
+            total_fees = entry_fee + exit_fee
+            
+            # Calculate net profit
+            net_profit = gross_profit - total_fees
             
             # Update paper balance
             self.paper_balance += position_size + net_profit
             
             # Update stats
-            self.total_profit += net_profit
-            self.total_fees += fees
+            self.total_profit += gross_profit
+            self.total_fees += total_fees
             
             if net_profit > 0:
                 self.wins += 1
@@ -1581,7 +1842,15 @@ class CryptoScalpingBot:
             
             # Log the trade
             profit_percentage = price_change * 100
-            self.log_trade(f"Closed trade: {symbol} at ${current_price:.6f}, P/L: {profit_percentage:.2f}%, ${net_profit:.2f} ({reason})")
+            self.log_trade(f"""
+            Closed trade: {symbol} at ${current_price:.6f}
+            Entry: ${entry_price:.6f}
+            Exit: ${current_price:.6f}
+            Gross P/L: {profit_percentage:.2f}%
+            Fees: ${total_fees:.2f}
+            Net P/L: ${net_profit:.2f}
+            Reason: {reason}
+            """)
             
             # Add to trade history
             trade_result = {
@@ -1598,18 +1867,25 @@ class CryptoScalpingBot:
             }
             self.trade_history.append(trade_result)
             
+            # Update trade history display
+            self.update_trade_history(symbol, profit_percentage, net_profit, net_profit > 0)
+            
             # Remove from active trades
             del self.active_trades[trade_id]
             
             # Update displays
             self.gui_update_queue.put(self.update_active_trades_display)
             self.gui_update_queue.put(self.update_balance_display)
+            self.gui_update_queue.put(self.update_metrics)
             self.gui_update_queue.put(self.update_chart)
             
             return True
             
         except Exception as e:
             self.log_trade(f"Error closing trade: {str(e)}")
+            # Emergency cleanup - try to remove the trade from active trades
+            if trade_id in self.active_trades:
+                del self.active_trades[trade_id]
             return False
 
     def update_active_trades_display(self):
@@ -1657,37 +1933,126 @@ class CryptoScalpingBot:
     def update_metrics(self):
         """Update trading metrics"""
         try:
-            win_rate = (self.wins / (self.wins + self.losses)) * 100 if (self.wins + self.losses) > 0 else 0
+            # Calculate win rate
+            total_trades = self.wins + self.losses
+            win_rate = (self.wins / total_trades * 100) if total_trades > 0 else 0
             
-            metrics_text = (
-                f"Total Profit: ${self.total_profit:.2f}\n"
-                f"Win Rate: {win_rate:.1f}%\n"
-                f"Wins: {self.wins}\n"
-                f"Losses: {self.losses}\n"
-                f"Fees Paid: ${self.total_fees:.2f}"
-            )
+            # Calculate net profit
+            self.net_profit = self.total_profit - self.total_fees
             
-            self.log_trade(f"Metrics Updated: Total Profit=${self.total_profit:.2f}, Net Profit=${self.total_profit-self.total_fees:.2f}, "
+            # Update labels
+            if hasattr(self, 'total_profit_label'):
+                self.total_profit_label.config(
+                    text=f"Total Profit: ${self.total_profit:.2f} USD",
+                    foreground="green" if self.total_profit > 0 else "red"
+                )
+            
+            if hasattr(self, 'total_fees_label'):
+                self.total_fees_label.config(
+                    text=f"Total Fees: ${self.total_fees:.2f} USD"
+                )
+            
+            if hasattr(self, 'net_profit_label'):
+                self.net_profit_label.config(
+                    text=f"Net Profit: ${self.net_profit:.2f} USD",
+                    foreground="green" if self.net_profit > 0 else "red"
+                )
+            
+            if hasattr(self, 'win_loss_label'):
+                self.win_loss_label.config(
+                    text=f"Win/Loss: {self.wins}/{self.losses} ({win_rate:.1f}%)"
+                )
+                
+            if hasattr(self, 'active_trades_label'):
+                self.active_trades_label.config(
+                    text=f"Active Trades: {len(self.active_trades)}"
+                )
+            
+            self.log_trade(f"Metrics Updated: Total Profit=${self.total_profit:.2f}, Net Profit=${self.net_profit:.2f}, "
                           f"Paper Balance=${self.paper_balance:.2f}, Wins={self.wins}, Losses={self.losses}")
             
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
+
+    def update_trade_history(self, symbol, percentage, profit, is_win=True):
+        """Update the trade history display"""
+        try:
+            # Format timestamp
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            
+            # Format the trade result
+            result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}\n"
+            
+            if hasattr(self, 'history_text'):
+                self.history_text.config(state=tk.NORMAL)
+                self.history_text.insert(tk.END, result)
+                
+                # Color code based on profit/loss
+                line_start = f"{float(self.history_text.index('end-2c'))-1:.1f}"
+                color = "green" if is_win else "red"
+                self.history_text.tag_add(color, f"{line_start} linestart", f"{line_start} lineend")
+                self.history_text.tag_config("green", foreground="green")
+                self.history_text.tag_config("red", foreground="red")
+                
+                self.history_text.see(tk.END)
+                self.history_text.config(state=tk.DISABLED)
+                
+        except Exception as e:
+            self.log_trade(f"Error updating trade history: {str(e)}")
 
     def run(self):
         """Run the application"""
         try:
             self.log_trade("Starting Crypto Scalping Bot (Paper Trading)")
             self.root.mainloop()
+        except KeyboardInterrupt:
+            self.log_trade("Keyboard interrupt detected")
         except Exception as e:
             self.log_trade(f"Error in main loop: {str(e)}")
         finally:
             self.is_shutting_down = True
-            if self.running:
-                self.running = False
-                self.log_trade("Shutting down bot...")
-                if hasattr(self, 'bot_thread') and self.bot_thread and self.bot_thread.is_alive():
-                    self.bot_thread.join(timeout=2)
+            self.running = False
+            self.log_trade("Shutting down bot...")
+            
+            # Close all trades if any are still open
+            if self.active_trades:
+                self.close_all_positions()
+            
+            # Wait for threads to finish
+            if hasattr(self, 'bot_thread') and self.bot_thread and self.bot_thread.is_alive():
+                try:
+                    self.bot_thread.join(timeout=1)
+                except:
+                    pass
+            
             self.log_trade("Bot shutdown complete")
+
+    def on_closing(self):
+        """Handle window close event properly"""
+        try:
+            self.log_trade("Closing application...")
+            self.is_shutting_down = True
+            self.running = False
+            
+            # Close all trades
+            if self.active_trades:
+                self.log_trade("Closing all active trades before shutdown")
+                self.close_all_positions()
+            
+            # Wait a moment for threads to notice shutdown flag
+            time.sleep(0.5)
+            
+            # Destroy the root window
+            if hasattr(self, 'root') and self.root:
+                self.root.destroy()
+            
+            # Force exit if needed
+            import sys
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error during shutdown: {str(e)}")
+            import sys
+            sys.exit(1)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s:%(name)s:%(message)s')
