@@ -211,7 +211,7 @@ class CryptoScalpingBot:
         
         # Initialize the Tkinter root window
         self.root = tk.Tk()
-        self.root.title("Crypto Scalping Bot - Paper Trading")
+        self.root.title("Vantrex (Paper Trading Only)")
         self.root.geometry("1200x900")
         
         # Core state variables
@@ -2014,7 +2014,7 @@ class CryptoScalpingBot:
     def run(self):
         """Run the application"""
         try:
-            self.log_trade("Starting Crypto Scalping Bot (Paper Trading)")
+            self.log_trade("Starting Vantrex (Paper Demo)")
             self.root.mainloop()
         except KeyboardInterrupt:
             self.log_trade("Keyboard interrupt detected")
