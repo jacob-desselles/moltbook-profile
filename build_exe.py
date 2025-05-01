@@ -4,7 +4,7 @@ import shutil
 
 def build_executable():
     # Verify public.pem exists
-    public_pem_path = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), 'KairosTrading', 'public.pem')
+    public_pem_path = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), 'Vantrex', 'public.pem')
     if not os.path.exists(public_pem_path):
         raise FileNotFoundError(f"public.pem not found at {public_pem_path}. Generate it using KeyGenerator first.")
 
@@ -34,7 +34,7 @@ def build_executable():
         'license_wrapper.py',  # Entry point
         '--onefile',
         '--noconsole',        # Hide console window
-        '--name=KairosTrading',
+        '--name=Vantrex',
         '--clean',
     ]
 
@@ -61,8 +61,8 @@ def build_executable():
     
     # Move the executable to the distribution folder
     try:
-        source = os.path.join('dist', 'KairosTrading.exe')
-        destination = os.path.join(dist_folder, 'KairosTrading.exe')
+        source = os.path.join('dist', 'Vantrex.exe')
+        destination = os.path.join(dist_folder, 'Vantrex.exe')
         
         if os.path.exists(destination):
             os.remove(destination)  # Remove existing file if it exists
