@@ -881,7 +881,11 @@ class CryptoScalpingBot:
     def update_balance_display(self):
         """Update the balance display with current balance"""
         try:
-            # Update the metrics which includes the paper balance
+            # Update the balance label directly
+            if hasattr(self, 'balance_label'):
+                self.balance_label.config(text=f"Paper Balance: ${self.paper_balance:.2f}")
+            
+            # Also update metrics which includes the paper balance
             self.update_metrics()
             
         except Exception as e:
@@ -1305,6 +1309,9 @@ class CryptoScalpingBot:
             self.close_trade(trade_id, trade, current_price, "manual close")
             
         self.log_trade("All positions closed")
+        
+        # Force update of paper balance display
+        self.update_metrics()
 
     def get_current_price(self, symbol):
         """Get the current price for a symbol from mock data"""
@@ -1544,8 +1551,11 @@ class CryptoScalpingBot:
             self.log_trade(f"Executed trade: {symbol} at ${price:.6f} with ${position_size:.2f}")
             
             # Update displays
-            self.gui_update_queue.put(self.update_active_trades_display)
-            self.gui_update_queue.put(self.update_balance_display)
+            self.update_metrics()  # This will update paper_balance_label
+            
+            # Queue other GUI updates
+            if hasattr(self, 'gui_update_queue'):
+                self.gui_update_queue.put(self.update_active_trades_display)
             
             return True
             
@@ -1807,10 +1817,9 @@ class CryptoScalpingBot:
             self.log_trade(f"Error setting up trade history display: {str(e)}")
 
     def close_trade(self, trade_id, trade, current_price, reason):
-        """Close a trade and update balance"""
+        """Close a trade with proper balance updates"""
         try:
-            if trade_id not in self.active_trades:
-                return False
+            self.log_trade(f"Closing trade {trade_id} ({trade['symbol']}) due to {reason}")
             
             symbol = trade['symbol']
             entry_price = trade['entry_price']
@@ -1821,8 +1830,8 @@ class CryptoScalpingBot:
             gross_profit = position_size * price_change
             
             # Apply fees (0.8% total - 0.4% entry + 0.4% exit)
-            entry_fee = position_size * (self.taker_fee / 2)
-            exit_fee = (position_size * (1 + price_change)) * (self.taker_fee / 2)
+            entry_fee = position_size * 0.004  # 0.4%
+            exit_fee = (position_size * (1 + price_change)) * 0.004  # 0.4%
             total_fees = entry_fee + exit_fee
             
             # Calculate net profit
@@ -1840,52 +1849,45 @@ class CryptoScalpingBot:
             else:
                 self.losses += 1
             
-            # Log the trade
-            profit_percentage = price_change * 100
+            # Log the trade result
             self.log_trade(f"""
-            Closed trade: {symbol} at ${current_price:.6f}
+            Trade closed:
+            Symbol: {symbol}
             Entry: ${entry_price:.6f}
             Exit: ${current_price:.6f}
-            Gross P/L: {profit_percentage:.2f}%
+            Change: {price_change*100:.2f}%
+            Gross P/L: ${gross_profit:.2f}
             Fees: ${total_fees:.2f}
             Net P/L: ${net_profit:.2f}
-            Reason: {reason}
+            New Balance: ${self.paper_balance:.2f}
             """)
             
             # Add to trade history
-            trade_result = {
-                'id': trade_id,
-                'symbol': symbol,
-                'entry_time': trade['entry_time'],
-                'exit_time': datetime.now(),
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'position_size': position_size,
-                'profit_loss': net_profit,
-                'profit_percentage': profit_percentage,
-                'reason': reason
-            }
-            self.trade_history.append(trade_result)
+            timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            profit_str = f"{price_change*100:.2f}%"
+            profit_usd = f"${net_profit:.2f}"
+            history_entry = f"({timestamp}) {symbol}: {profit_str}, {profit_usd}\n"
             
-            # Update trade history display
-            self.update_trade_history(symbol, profit_percentage, net_profit, net_profit > 0)
+            if hasattr(self, 'history_text'):
+                self.history_text.insert(tk.END, history_entry)
+                self.history_text.see(tk.END)
             
             # Remove from active trades
             del self.active_trades[trade_id]
             
             # Update displays
-            self.gui_update_queue.put(self.update_active_trades_display)
-            self.gui_update_queue.put(self.update_balance_display)
-            self.gui_update_queue.put(self.update_metrics)
-            self.gui_update_queue.put(self.update_chart)
+            self.update_metrics()
+            self.update_balance_display()
+            
+            # Queue other GUI updates if needed
+            if hasattr(self, 'gui_update_queue'):
+                self.gui_update_queue.put(self.update_active_trades_display)
+                self.gui_update_queue.put(self.update_chart)
             
             return True
             
         except Exception as e:
             self.log_trade(f"Error closing trade: {str(e)}")
-            # Emergency cleanup - try to remove the trade from active trades
-            if trade_id in self.active_trades:
-                del self.active_trades[trade_id]
             return False
 
     def update_active_trades_display(self):
@@ -1938,9 +1940,18 @@ class CryptoScalpingBot:
             win_rate = (self.wins / total_trades * 100) if total_trades > 0 else 0
             
             # Calculate net profit
-            self.net_profit = self.total_profit - self.total_fees
+            net_profit = self.total_profit - self.total_fees
+            
+            # Calculate available balance (total - allocated to active trades)
+            allocated_balance = sum(trade.get('position_size', 0) for trade in self.active_trades.values())
+            available_balance = self.paper_balance - allocated_balance + net_profit
             
             # Update labels
+            if hasattr(self, 'paper_balance_label'):
+                self.paper_balance_label.config(
+                    text=f"Paper Balance: ${self.paper_balance:.2f} USD"
+                )
+            
             if hasattr(self, 'total_profit_label'):
                 self.total_profit_label.config(
                     text=f"Total Profit: ${self.total_profit:.2f} USD",
@@ -1954,8 +1965,8 @@ class CryptoScalpingBot:
             
             if hasattr(self, 'net_profit_label'):
                 self.net_profit_label.config(
-                    text=f"Net Profit: ${self.net_profit:.2f} USD",
-                    foreground="green" if self.net_profit > 0 else "red"
+                    text=f"Net Profit: ${net_profit:.2f} USD",
+                    foreground="green" if net_profit > 0 else "red"
                 )
             
             if hasattr(self, 'win_loss_label'):
@@ -1968,7 +1979,7 @@ class CryptoScalpingBot:
                     text=f"Active Trades: {len(self.active_trades)}"
                 )
             
-            self.log_trade(f"Metrics Updated: Total Profit=${self.total_profit:.2f}, Net Profit=${self.net_profit:.2f}, "
+            self.log_trade(f"Metrics Updated: Total Profit=${self.total_profit:.2f}, Net Profit=${net_profit:.2f}, "
                           f"Paper Balance=${self.paper_balance:.2f}, Wins={self.wins}, Losses={self.losses}")
             
         except Exception as e:
