@@ -175,7 +175,159 @@ class DataManager:
                 self.log(f"Skipping empty data update for {symbol}")
         except Exception as e:
             self.log_trade(f"Error updating price_data for {symbol}: {str(e)}")
+            
+    def calculate_momentum_intensity(self, df):
+        """Calculate momentum intensity (Beta) - Trend strength"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate returns
+            returns = df['price'].pct_change().fillna(0)
+            
+            # Calculate short and long momentum
+            short_momentum = returns.rolling(window=3).mean().fillna(0)
+            long_momentum = returns.rolling(window=10).mean().fillna(0)
+            
+            # Calculate trend strength as correlation between short and long momentum
+            if len(short_momentum) >= 5 and len(long_momentum) >= 5:
+                # Use the sign of the product of short and long momentum
+                trend_strength = abs(short_momentum.iloc[-1] * long_momentum.iloc[-1]) * 10
+            else:
+                trend_strength = 0.0
+            
+            # Log calculation details
+            self.log_trade(f"Momentum intensity details:")
+            self.log_trade(f"Short momentum: {short_momentum.iloc[-1]:.8f}")
+            self.log_trade(f"Long momentum: {long_momentum.iloc[-1]:.8f}")
+            self.log_trade(f"Trend strength: {trend_strength:.8f}")
+            
+            # Normalize to 0-1 range
+            result = min(trend_strength, 1.0)
+            return max(result, 0.0)
+            
+        except Exception as e:
+            self.log_trade(f"Error in momentum intensity calculation: {str(e)}")
+            return 0.0
 
+    def calculate_price_acceleration(self, df):
+        """Calculate price acceleration (Alpha)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate price changes and acceleration
+            price_changes = df['price'].pct_change().fillna(0)
+            acceleration = price_changes.diff().fillna(0)
+            
+            # Use recent acceleration (last 5 periods)
+            recent_acceleration = acceleration.tail(5).mean() * 100
+            
+            self.log_trade(f"Price acceleration details:")
+            self.log_trade(f"Recent price changes: {price_changes.tail()}")
+            self.log_trade(f"Recent acceleration: {recent_acceleration:.8f}")
+            
+            # Normalize
+            result = min(abs(recent_acceleration), 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in acceleration calculation: {str(e)}")
+            return 0.0
+
+    def calculate_momentum_quality(self, df):
+        """Calculate momentum quality (Theta) - Stability of momentum"""
+        try:
+            if df is None or len(df) < 5:
+                self.log_trade("Insufficient data for momentum quality calculation")
+                return 1.0  # Default to high instability if data is insufficient
+
+            df = df.copy()
+            df.sort_index(inplace=True)
+
+            # Calculate 5-period momentum (percentage change over 5 periods)
+            momentum = df['price'].pct_change(periods=5).fillna(0)
+
+            # Calculate stability as the standard deviation of momentum over the last 5 periods
+            momentum_stability = momentum.rolling(window=5).std().iloc[-1] * 100
+
+            # Log calculation details
+            self.log_trade(f"Momentum quality details:")
+            self.log_trade(f"Recent momentum: {momentum.tail()}")
+            self.log_trade(f"Momentum stability: {momentum_stability:.8f}")
+
+            # Normalize to 0-1 range
+            result = min(momentum_stability, 1.0)
+            return max(result, 0.0)
+
+        except Exception as e:
+            self.log_trade(f"Error in momentum quality calculation: {str(e)}")
+            return 1.0  # Default to high instability on error
+
+    def calculate_volatility_sensitivity(self, df):
+        """Calculate volatility sensitivity (Vega)"""
+        try:
+            if df is None or len(df) < 5:
+                return 1.0  # Default to high volatility if insufficient data
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate volatility as standard deviation of returns
+            returns = df['price'].pct_change().fillna(0)
+            volatility = returns.rolling(window=5).std().iloc[-1] * 100
+            
+            self.log_trade(f"Volatility details:")
+            self.log_trade(f"Recent returns: {returns.tail()}")
+            self.log_trade(f"Volatility: {volatility:.8f}")
+            
+            # Normalize
+            result = min(volatility, 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in volatility calculation: {str(e)}")
+            return 1.0  # Default to high volatility on error
+
+    def calculate_volume_impact(self, df, current_volume):
+        """Calculate volume impact (Rho)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.0
+                
+            df = df.copy()
+            df.sort_index(inplace=True)
+            
+            # Calculate average volume
+            avg_volume = df['volume'].rolling(window=5).mean().fillna(0)
+            if avg_volume.iloc[-1] == 0:
+                return 0.0
+                
+            # Calculate volume ratio
+            volume_ratio = current_volume / avg_volume.iloc[-1]
+            
+            # Calculate excess volume
+            excess_volume = max(0, volume_ratio - 1)
+            
+            self.log_trade(f"Volume impact details:")
+            self.log_trade(f"Current volume: {current_volume}")
+            self.log_trade(f"Average volume: {avg_volume.iloc[-1]}")
+            self.log_trade(f"Volume ratio: {volume_ratio:.8f}")
+            
+            # Normalize
+            result = min(excess_volume, 1.0)
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in volume impact calculation: {str(e)}")
+            return 0.0
+        
     def calculate_indicators(self, symbol):
         try:
             if symbol not in self.price_data or len(self.price_data[symbol]) < 15:
@@ -1249,14 +1401,54 @@ class CryptoScalpingBot:
                 self.log_trade("Invalid min volume: must be positive")
                 return False
             
-            self.log_trade("All conditions validated successfully")
+            # Validate Greek parameters
+            momentum_beta = float(self.momentum_beta.get())
+            if momentum_beta < 0 or momentum_beta > 1:
+                self.log_trade("Invalid momentum beta: must be between 0 and 1")
+                return False
+            
+            price_alpha = float(self.price_alpha.get())
+            if price_alpha < 0 or price_alpha > 1:
+                self.log_trade("Invalid price alpha: must be between 0 and 1")
+                return False
+            
+            momentum_theta = float(self.momentum_theta.get())
+            if momentum_theta < 0 or momentum_theta > 1:
+                self.log_trade("Invalid momentum theta: must be between 0 and 1")
+                return False
+            
+            vol_vega = float(self.vol_vega.get())
+            if vol_vega < 0 or vol_vega > 1:
+                self.log_trade("Invalid vol vega: must be between 0 and 1")
+                return False
+            
+            volume_rho = float(self.volume_rho.get())
+            if volume_rho < 0 or volume_rho > 1:
+                self.log_trade("Invalid volume rho: must be between 0 and 1")
+                return False
+            
+            # Validate RSI parameters
+            rsi_period = float(self.rsi_period.get())
+            if rsi_period < 2 or rsi_period > 30:
+                self.log_trade("Invalid RSI period: must be between 2 and 30")
+                return False
+            
+            rsi_overbought = float(self.rsi_overbought.get())
+            if rsi_overbought < 50 or rsi_overbought > 90:
+                self.log_trade("Invalid RSI overbought: must be between 50 and 90")
+                return False
+            
+            rsi_oversold = float(self.rsi_oversold.get())
+            if rsi_oversold < 10 or rsi_oversold > 50:
+                self.log_trade("Invalid RSI oversold: must be between 10 and 50")
+                return False
+            
+            # All checks passed
+            self.log_trade("All trading conditions validated successfully")
             return True
         
-        except ValueError as e:
-            self.log_trade(f"Validation error: {str(e)}")
-            return False
         except Exception as e:
-            self.log_trade(f"Unexpected error during validation: {str(e)}")
+            self.log_trade(f"Error validating conditions: {str(e)}")
             return False
     def process_gui_updates(self):
         """Process GUI updates from the queue on the main thread"""
@@ -1431,7 +1623,38 @@ class CryptoScalpingBot:
                 if price_change < float(self.min_price_rise.get()):
                     continue
                 
-                # Advanced checks
+                # Apply Greek parameters for advanced filtering
+                # 1. Trend Strength (Beta)
+                trend_strength = self.calculate_momentum_intensity(df)
+                if trend_strength < float(self.momentum_beta.get()):
+                    self.log_trade(f"Rejected {symbol}: Trend strength below threshold ({trend_strength:.2f} < {self.momentum_beta.get()})")
+                    continue
+                    
+                # 2. Price Momentum (Alpha)
+                price_acceleration = self.calculate_price_acceleration(df)
+                if price_acceleration < float(self.price_alpha.get()):
+                    self.log_trade(f"Rejected {symbol}: Price acceleration below threshold ({price_acceleration:.2f} < {self.price_alpha.get()})")
+                    continue
+                    
+                # 3. Momentum Quality (Theta)
+                momentum_quality = self.calculate_momentum_quality(df)
+                if momentum_quality > float(self.momentum_theta.get()):
+                    self.log_trade(f"Rejected {symbol}: Momentum quality too unstable ({momentum_quality:.2f} > {self.momentum_theta.get()})")
+                    continue
+                    
+                # 4. Volatility Filter (Vega)
+                volatility = self.calculate_volatility_sensitivity(df)
+                if volatility > float(self.vol_vega.get()):
+                    self.log_trade(f"Rejected {symbol}: Volatility too high ({volatility:.2f} > {self.vol_vega.get()})")
+                    continue
+                    
+                # 5. Volume Quality (Rho)
+                volume_impact = self.calculate_volume_impact(df, df['volume'].iloc[-1])
+                if volume_impact < float(self.volume_rho.get()):
+                    self.log_trade(f"Rejected {symbol}: Volume impact below threshold ({volume_impact:.2f} < {self.volume_rho.get()})")
+                    continue
+                
+                # Advanced checks (RSI, EMA, etc.)
                 if not self.advanced_checks(symbol, df):
                     continue
                 
@@ -1491,18 +1714,33 @@ class CryptoScalpingBot:
             # Check if RSI is available
             if rsi_col in df.columns and not df[rsi_col].isna().all():
                 rsi = df[rsi_col].iloc[-1]
-                # Check RSI conditions
-                rsi_condition = rsi < rsi_overbought  # Not overbought
+                # Check RSI conditions - not overbought and preferably oversold
+                rsi_condition = rsi < rsi_overbought and rsi > 20  # Not extremely overbought and not extremely oversold
             else:
                 rsi = 50  # Default neutral value
-                rsi_condition = True  # Pass by default
+                rsi_condition = False  # Fail if RSI not available
             
+            # 3. Volume Check
+            volume_change = df['volume_change'].iloc[-1] if 'volume_change' in df.columns else 0
+            volume_condition = volume_change >= float(self.volume_change_threshold.get())
+            
+            # Log the checks
             self.log_trade(f"Advanced checks for {symbol}:")
             self.log_trade(f"- EMA Cross: {ema_cross}")
             self.log_trade(f"- RSI: {rsi:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
+            self.log_trade(f"- Volume Change: {volume_change:.2f}% (Threshold: {self.volume_change_threshold.get()}%)")
             
-            # For paper trading demo, we'll consider checks passed
-            return True
+            # Return true only if conditions are met
+            conditions_met = [
+                ema_cross,
+                rsi_condition,
+                volume_condition
+            ]
+            
+            # Require at least 2 of 3 conditions to be met
+            result = sum(conditions_met) >= 2
+            self.log_trade(f"Advanced checks result: {result} ({sum(conditions_met)}/3 conditions met)")
+            return result
             
         except Exception as e:
             self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
