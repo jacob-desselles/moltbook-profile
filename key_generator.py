@@ -21,9 +21,9 @@ class KeyGenerator:
             appdata = os.path.expanduser('~')
             logging.warning("APPDATA not set, falling back to user home directory")
         
-        self.base_dir = os.path.join(appdata, 'KairosTrading')
+        self.base_dir = os.path.join(appdata, 'Vantrex')
         self.key_file = os.path.join(self.base_dir, 'valid_keys.json')
-        self.key_prefix = "KT"
+        self.key_prefix = "VT"
         self.private_key, self.public_key = self._load_or_generate_rsa_keys()
 
     def _load_or_generate_rsa_keys(self):
@@ -153,7 +153,7 @@ def generate_multiple_keys(num_keys):
     return keys
 
 if __name__ == "__main__":
-    print("Kairos Trading - License Key Generator")
+    print("Vantrex - License Key Generator")
     print("=====================================")
     
     try:

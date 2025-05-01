@@ -1443,23 +1443,22 @@ class CryptoScalpingBot:
             self.log_trade(f"Error adding tooltip: {str(e)}")
 
     def calculate_momentum_intensity(self, df):
-        """Calculate momentum intensity (Beta) - Market sensitivity"""
+        """Calculate momentum intensity (Beta) - Trend strength"""
         try:
             if df is None or len(df) < 5:
                 return 0.0
-                
-            # Ensure DataFrame is properly sorted
+            
             df = df.copy()
             df.sort_index(inplace=True)
             
-            # Calculate returns using pct_change
+            # Calculate returns
             returns = df['price'].pct_change().fillna(0)
             
-            # Calculate short and long momentum using standard periods
+            # Calculate short and long momentum
             short_momentum = returns.rolling(window=5).mean()
             long_momentum = returns.rolling(window=15).mean()
             
-            # Calculate trend strength using the difference between short and long momentum
+            # Calculate trend strength
             trend_strength = abs(short_momentum.iloc[-1] - long_momentum.iloc[-1]) * 100
             
             # Log calculation details
@@ -1609,6 +1608,95 @@ class CryptoScalpingBot:
             self.log_trade(f"Error calculating momentum: {str(e)}")
             return 0
 
+    def advanced_checks(self, symbol, df):
+        """Advanced market checks including order book analysis and RSI"""
+        try:
+            # 1. EMA Cross (5/15)
+            short_period = int(self.ema_short.get()) if hasattr(self, 'ema_short') else 5
+            long_period = int(self.ema_long.get()) if hasattr(self, 'ema_long') else 15
+            
+            ema_short_col = f'ema_{short_period}'
+            ema_long_col = f'ema_{long_period}'
+            
+            # Use default columns if specific ones not available
+            if ema_short_col not in df.columns:
+                ema_short_col = 'ema_5'
+            if ema_long_col not in df.columns:
+                ema_long_col = 'ema_15'
+                
+            # Check for bullish EMA cross
+            if len(df) >= 2 and ema_short_col in df.columns and ema_long_col in df.columns:
+                ema_cross = (df[ema_short_col].iloc[-2] < df[ema_long_col].iloc[-2]) and \
+                            (df[ema_short_col].iloc[-1] > df[ema_long_col].iloc[-1])
+            else:
+                ema_cross = False
+            
+            # 2. Volume-Weighted Momentum
+            if 'price' in df.columns and 'volume' in df.columns and len(df) >= 5:
+                vwap = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
+                vwm = (vwap.iloc[-1] - vwap.iloc[-5]) / vwap.iloc[-5] * 100
+            else:
+                vwm = 0
+            
+            # 3. Order Book Imbalance
+            try:
+                ob = self.exchange.fetch_order_book(symbol)
+                bid_vol = sum(x[1] for x in ob['bids'][:3])
+                ask_vol = sum(x[1] for x in ob['asks'][:3])
+                ob_ratio = bid_vol / (ask_vol + 0.0001)  # Avoid division by zero
+            except Exception as e:
+                self.log_trade(f"Order book fetch error: {str(e)}")
+                ob_ratio = 1.0  # Neutral value on error
+            
+            # 4. RSI Check
+            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
+            rsi_column = f'rsi_{rsi_period}'
+            
+            if rsi_column in df.columns and not pd.isna(df[rsi_column].iloc[-1]):
+                rsi_value = df[rsi_column].iloc[-1]
+                
+                rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
+                rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
+                
+                # Avoid overbought conditions
+                if rsi_value > rsi_overbought:
+                    self.log_trade(f"Rejected {symbol}: RSI indicates overbought condition ({rsi_value:.2f} > {rsi_overbought})")
+                    return False
+                
+                rsi_condition = True
+            else:
+                self.log_trade(f"RSI data not available for {symbol}")
+                rsi_value = 50  # Neutral value
+                rsi_condition = False
+            
+            self.log_trade(f"Advanced checks for {symbol}:")
+            self.log_trade(f"- EMA Cross: {ema_cross}")
+            self.log_trade(f"- VWAP Momentum: {vwm:.2f}%")
+            self.log_trade(f"- Order Book Ratio: {ob_ratio:.2f}")
+            self.log_trade(f"- RSI: {rsi_value:.2f}")
+            
+            # Determine result based on multiple conditions
+            conditions_met = [
+                ema_cross,          # EMA crossover
+                vwm > 0.2,          # Min 0.2% VWAP rise
+                ob_ratio > 1.5,     # Bids > Asks by 50%
+                rsi_condition       # RSI not overbought
+            ]
+            
+            # Require at least 3 of 4 conditions to be met
+            result = sum(conditions_met) >= 3
+            self.log_trade(f"Advanced checks result: {result} ({sum(conditions_met)}/4 conditions met)")
+            return result
+            
+        except Exception as e:
+            self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
+            return False
+            self.log_trade(f"Calculated momentum: {momentum}")
+            return momentum
+        except Exception as e:
+            self.log_trade(f"Error calculating momentum: {str(e)}")
+            return 0
+
     def calculate_volume_increase(self, df):
         """Calculate volume increase percentage"""
         try:
@@ -1643,6 +1731,12 @@ class CryptoScalpingBot:
                     'value': float(self.trailing_stop.get()),
                     'name': 'Trailing Stop'
                 },
+                'trailing_activation': {
+                    'min': 0.3,
+                    'max': 2.0,
+                    'value': float(self.trailing_activation.get()),
+                    'name': 'Trailing Activation'
+                },
                 'rsi_period': {
                     'min': 5,
                     'max': 30,
@@ -1660,40 +1754,92 @@ class CryptoScalpingBot:
                     'max': 5,
                     'value': float(self.scale_in_levels.get()),
                     'name': 'Scale-in Levels'
+                },
+                # Greek parameters
+                'momentum_beta': {
+                    'min': 0.1,
+                    'max': 1.0,
+                    'value': float(self.momentum_beta.get()),
+                    'name': 'Momentum Beta'
+                },
+                'price_alpha': {
+                    'min': 0.1,
+                    'max': 1.0,
+                    'value': float(self.price_alpha.get()),
+                    'name': 'Price Alpha'
+                },
+                'time_theta': {
+                    'min': 0.1,
+                    'max': 1.0,
+                    'value': float(self.time_theta.get()),
+                    'name': 'Time Theta'
+                },
+                'vol_vega': {
+                    'min': 0.1,
+                    'max': 1.0,
+                    'value': float(self.vol_vega.get()),
+                    'name': 'Volatility Vega'
+                },
+                'volume_rho': {
+                    'min': 0.1,
+                    'max': 1.0,
+                    'value': float(self.volume_rho.get()),
+                    'name': 'Volume Rho'
+                },
+                # RSI thresholds
+                'rsi_overbought': {
+                    'min': 60,
+                    'max': 90,
+                    'value': float(self.rsi_overbought.get()),
+                    'name': 'RSI Overbought'
+                },
+                'rsi_oversold': {
+                    'min': 10,
+                    'max': 40,
+                    'value': float(self.rsi_oversold.get()),
+                    'name': 'RSI Oversold'
                 }
             }
 
-            errors = []
+            # Validate each parameter
             for param, rules in validation_rules.items():
                 if rules['value'] < rules['min'] or rules['value'] > rules['max']:
-                    errors.append(
-                        f"{rules['name']} must be between {rules['min']} and {rules['max']}"
-                    )
+                    error_msg = f"{rules['name']} must be between {rules['min']} and {rules['max']}"
+                    self.log_trade(error_msg)
+                    raise ValueError(error_msg)
 
-            # Cross-parameter validation
-            if float(self.stop_loss.get()) >= float(self.profit_target.get()):
-                errors.append("Stop Loss must be less than Profit Target")
-                
-            if float(self.trailing_stop.get()) >= float(self.profit_target.get()):
-                errors.append("Trailing Stop must be less than Profit Target")
-                
-            if float(self.trailing_activation.get()) >= float(self.profit_target.get()):
-                errors.append("Trailing Activation must be less than Profit Target")
+            # Cross-Parameter Validation
+            if validation_rules['stop_loss']['value'] >= validation_rules['profit_target']['value']:
+                raise ValueError("Stop loss must be less than profit target")
+            
+            if validation_rules['trailing_stop']['value'] >= validation_rules['profit_target']['value']:
+                raise ValueError("Trailing stop must be less than profit target")
+            
+            if validation_rules['trailing_activation']['value'] >= validation_rules['profit_target']['value']:
+                raise ValueError("Trailing activation must be less than profit target")
+            
+            if validation_rules['rsi_oversold']['value'] >= validation_rules['rsi_overbought']['value']:
+                raise ValueError("RSI oversold must be less than RSI overbought")
 
-            if errors:
-                error_message = "\n".join(errors)
-                messagebox.showerror("Parameter Validation Error", error_message)
-                return False
+            # Balance Check
+            if self.is_paper_trading:
+                available_balance = self.paper_balance
+            else:
+                available_balance = float(self.exchange.fetch_balance()['USD']['free'])
+            
+            position_size = float(self.position_size.get())
+            max_position_percent = float(self.max_position_percent.get()) / 100
+            max_position = available_balance * max_position_percent
+            
+            if position_size > max_position:
+                raise ValueError(f"Position size exceeds maximum allowed ({max_position:.2f} USD)")
 
             self.log_trade("All parameters validated successfully")
             return True
-
+                
         except ValueError as e:
-            messagebox.showerror("Input Error", "Please ensure all values are numbers")
-            return False
-        except Exception as e:
-            self.log_trade(f"Parameter validation error: {str(e)}")
-            return False
+            self.log_trade(f"Settings validation failed: {str(e)}")
+            raise ValueError(f"Invalid settings: {str(e)}")
 
     def save_parameters(self):
         """Save current parameters to config file"""
@@ -2215,22 +2361,65 @@ class CryptoScalpingBot:
         """Enhanced version with dynamic condition checking"""
         while self.running:
             try:
+                # Get current parameter values
                 current_conditions = {
                     'max_spread': float(self.max_spread.get()) / 100,
-                    'volume_increase': float(self.volume_increase.get()) / 100
+                    'volume_increase': float(self.volume_increase.get()) / 100,
+                    'profit_target': float(self.profit_target.get()) / 100,
+                    'stop_loss': float(self.stop_loss.get()) / 100,
+                    'trailing_stop': float(self.trailing_stop.get()) / 100,
+                    'trailing_activation': float(self.trailing_activation.get()) / 100
                 }
                 
                 for trade_id, trade in list(self.active_trades.items()):
-                    ticker = self.exchange.fetch_ticker(trade['symbol'])
-                    
-                    # Check if current market violates our updated conditions
-                    spread = (ticker['ask'] - ticker['bid']) / ticker['bid']
-                    if spread > current_conditions['max_spread'] * 1.5:  # 50% buffer
-                        self.close_trade(trade_id, trade, ticker['last'], "spread violation")
-                        continue
+                    try:
+                        ticker = self.exchange.fetch_ticker(trade['symbol'])
+                        current_price = ticker['last']
                         
-                    # Add other dynamic checks here...
-                    
+                        # Calculate profit percentage
+                        entry_price = trade['entry_price']
+                        profit_pct = (current_price - entry_price) / entry_price
+                        
+                        # Update highest profit if needed
+                        highest_profit = trade.get('highest_profit', 0)
+                        if profit_pct > highest_profit:
+                            self.active_trades[trade_id]['highest_profit'] = profit_pct
+                            highest_profit = profit_pct
+                        
+                        # Check if current market violates our updated conditions
+                        spread = (ticker['ask'] - ticker['bid']) / ticker['bid']
+                        if spread > current_conditions['max_spread'] * 1.5:  # 50% buffer
+                            self.close_trade(trade_id, trade, ticker['last'], "spread violation")
+                            continue
+                        
+                        # Check stop loss (dynamic)
+                        if profit_pct <= -current_conditions['stop_loss']:
+                            self.close_trade(trade_id, trade, current_price, "stop loss")
+                            continue
+                        
+                        # Check profit target (dynamic)
+                        if profit_pct >= current_conditions['profit_target']:
+                            self.close_trade(trade_id, trade, current_price, "profit target")
+                            continue
+                        
+                        # Check trailing stop (dynamic)
+                        if highest_profit >= current_conditions['trailing_activation']:
+                            drop = highest_profit - profit_pct
+                            if drop >= current_conditions['trailing_stop']:
+                                self.close_trade(trade_id, trade, current_price, "trailing stop")
+                                continue
+                        
+                        # Update trade data for analysis
+                        self.active_trades[trade_id]['current_price'] = current_price
+                        self.active_trades[trade_id]['profit_pct'] = profit_pct * 100  # Store as percentage
+                        
+                    except Exception as e:
+                        self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
+                
+                # Check memory usage periodically
+                self.check_memory_usage()
+                
+                # Sleep to avoid excessive API calls
                 time.sleep(0.1)  # Faster monitoring interval
                 
             except Exception as e:
@@ -2675,20 +2864,10 @@ class CryptoScalpingBot:
                 self.log_trade(f"Error updating price data: {str(e)}")
                 return False
 
-            # Check data freshness with longer timeout
-            df = self.data_manager.price_data.get(pair_data['symbol'])
-            if df is not None and len(df) > 0:
-                latest_time = df.index[-1]
-                current_time = pd.Timestamp.now()
-                data_age = (current_time - latest_time).total_seconds()
-                if data_age > 120:  
-                    self.log_trade(f"Skipping {pair_data['symbol']}: Data too old ({data_age:.1f} seconds)")
-                    fresh_ticker = self.exchange.fetch_ticker(pair_data['symbol'])
-                    self.data_manager.update_price_data(pair_data['symbol'], fresh_ticker)
-                    return False
-
-            if df is None or len(df) < 20:
-                self.log_trade(f"Insufficient data for {pair_data['symbol']}")
+            # Get price data for analysis
+            df = self.data_manager.get_price_data(pair_data['symbol'])
+            if df is None or len(df) < self.min_data_points:
+                self.log_trade(f"Insufficient data for {pair_data['symbol']}: {len(df) if df is not None else 0}/{self.min_data_points} points")
                 return False
 
             # Calculate basic metrics for existing checks
@@ -2700,65 +2879,72 @@ class CryptoScalpingBot:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Static data detected")
                 return False
 
-            if momentum < float(self.momentum_threshold.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}% < {self.momentum_threshold.get()}%)")
+            # Get user-defined thresholds
+            momentum_threshold = float(self.momentum_threshold.get())
+            volume_increase_threshold = float(self.volume_increase.get())
+            
+            if momentum < momentum_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}% < {momentum_threshold}%)")
                 return False
 
-            if volume_increase < float(self.volume_increase.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}% < {self.volume_increase.get()}%)")
+            if volume_increase < volume_increase_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}% < {volume_increase_threshold}%)")
                 return False
 
-            # Apply Validation Criteria (from previous implementation)
+            # Apply Validation Criteria (Greek parameters)
             # 1. Trend Strength (Beta)
             trend_strength = self.calculate_momentum_intensity(df)
-            if trend_strength < float(self.momentum_beta.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Trend strength below threshold ({trend_strength:.2f} < {self.momentum_beta.get()})")
+            momentum_beta_threshold = float(self.momentum_beta.get())
+            if trend_strength < momentum_beta_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Trend strength below threshold ({trend_strength:.2f} < {momentum_beta_threshold})")
                 return False
-            self.log_trade(f"✓ Trend Strength (Beta) passed: {trend_strength:.2f} >= {self.momentum_beta.get()}")
+            self.log_trade(f"✓ Trend Strength (Beta) passed: {trend_strength:.2f} >= {momentum_beta_threshold}")
 
             # 2. Price Momentum (Alpha)
             price_acceleration = self.calculate_price_acceleration(df)
-            if price_acceleration < float(self.price_alpha.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Price acceleration below threshold ({price_acceleration:.2f} < {self.price_alpha.get()})")
+            price_alpha_threshold = float(self.price_alpha.get())
+            if price_acceleration < price_alpha_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Price acceleration below threshold ({price_acceleration:.2f} < {price_alpha_threshold})")
                 return False
-            self.log_trade(f"✓ Price Momentum (Alpha) passed: {price_acceleration:.2f} >= {self.price_alpha.get()}")
+            self.log_trade(f"✓ Price Momentum (Alpha) passed: {price_acceleration:.2f} >= {price_alpha_threshold}")
 
             # 3. Momentum Quality (Theta)
             momentum_quality = self.calculate_momentum_quality(df)
-            if momentum_quality > float(self.time_theta.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum quality too unstable ({momentum_quality:.2f} > {self.time_theta.get()})")
+            momentum_theta_threshold = float(self.time_theta.get())
+            if momentum_quality > momentum_theta_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum quality too unstable ({momentum_quality:.2f} > {momentum_theta_threshold})")
                 return False
-            self.log_trade(f"✓ Momentum Quality (Theta) passed: {momentum_quality:.2f} <= {self.time_theta.get()}")
+            self.log_trade(f"✓ Momentum Quality (Theta) passed: {momentum_quality:.2f} <= {momentum_theta_threshold}")
 
             # 4. Volatility Filter (Vega)
             volatility = self.calculate_volatility_sensitivity(df)
-            if volatility > float(self.vol_vega.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Volatility too high ({volatility:.2f} > {self.vol_vega.get()})")
+            vol_vega_threshold = float(self.vol_vega.get())
+            if volatility > vol_vega_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volatility too high ({volatility:.2f} > {vol_vega_threshold})")
                 return False
-            self.log_trade(f"✓ Volatility Filter (Vega) passed: {volatility:.2f} <= {self.vol_vega.get()}")
+            self.log_trade(f"✓ Volatility Filter (Vega) passed: {volatility:.2f} <= {vol_vega_threshold}")
 
             # 5. Volume Quality (Rho)
             current_volume = df['volume'].iloc[-1]
             volume_impact = self.calculate_volume_impact(df, current_volume)
-            if volume_impact < float(self.volume_rho.get()):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Volume impact below threshold ({volume_impact:.2f} < {self.volume_rho.get()})")
+            volume_rho_threshold = float(self.volume_rho.get())
+            if volume_impact < volume_rho_threshold:
+                self.log_trade(f"Rejected {pair_data['symbol']}: Volume impact below threshold ({volume_impact:.2f} < {volume_rho_threshold})")
                 return False
-            self.log_trade(f"✓ Volume Quality (Rho) passed: {volume_impact:.2f} >= {self.vol_vega.get()}")
+            self.log_trade(f"✓ Volume Quality (Rho) passed: {volume_impact:.2f} >= {volume_rho_threshold}")
 
             # Apply Advanced Parameters via advanced_checks
             if not self.advanced_checks(pair_data['symbol'], df):
                 self.log_trade(f"Rejected {pair_data['symbol']}: Failed advanced checks")
                 return False
             self.log_trade(f"✓ Advanced checks passed for {pair_data['symbol']}")
-
-            # Opportunity found
-            self.log_trade(f"Opportunity found for {pair_data['symbol']}")
+            
+            # All checks passed
+            self.log_trade(f"All criteria passed for {pair_data['symbol']} - OPPORTUNITY DETECTED")
             return True
 
         except Exception as e:
-            self.log_trade(f"Critical error analyzing {pair_data['symbol']}: {str(e)}")
-            import traceback
-            self.log_trade(f"Traceback: {traceback.format_exc()}")
+            self.log_trade(f"Error analyzing opportunity for {pair_data['symbol']}: {str(e)}")
             return False
 
     def analyze_pairs(self, valid_pairs):
@@ -3102,6 +3288,37 @@ class CryptoScalpingBot:
         """Advanced market checks including order book analysis and RSI"""
         try:
             # 1. EMA Cross (5/15)
+            ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
+                        (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+            if ema_cross:
+                self.log_trade(f"EMA Cross detected for {symbol}: Short-term trend is bullish")
+            else:
+                self.log_trade(f"No EMA Cross detected for {symbol}")
+            
+            # 2. Volume-Weighted Momentum
+            if 'price' in df.columns and 'volume' in df.columns and len(df) >= 5:
+                vwap = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
+                vwm = (vwap.iloc[-1] - vwap.iloc[-5]) / vwap.iloc[-5] * 100
+                self.log_trade(f"Volume-Weighted Momentum for {symbol}: {vwm:.2f}%")
+            else:
+                self.log_trade(f"Insufficient data for Volume-Weighted Momentum calculation for {symbol}")
+                vwm = 0
+            
+            # 3. Order Book Imbalance
+            try:
+                ob = self.exchange.fetch_order_book(symbol)
+                bid_vol = sum(x[1] for x in ob['bids'][:3])
+                ask_vol = sum(x[1] for x in ob['asks'][:3])
+                ob_ratio = bid_vol / (ask_vol + 0.0001)  # Avoid division by zero
+                self.log_trade(f"Order Book Imbalance for {symbol}: {ob_ratio:.2f}")
+            except Exception as e:
+                self.log_trade(f"Order book fetch error: {str(e)}")
+                ob_ratio = 1.0  # Neutral value on error
+            
+            # 4. RSI Check
+            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
+            rsi_column = f'rsi_{rsi_period}'
+            
             ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
                         (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
             

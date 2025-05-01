@@ -175,7 +175,7 @@ class DataManager:
                 self.log(f"Skipping empty data update for {symbol}")
         except Exception as e:
             self.log_trade(f"Error updating price_data for {symbol}: {str(e)}")
-            
+
     def calculate_momentum_intensity(self, df):
         """Calculate momentum intensity (Beta) - Trend strength"""
         try:
@@ -192,10 +192,10 @@ class DataManager:
             short_momentum = returns.rolling(window=3).mean().fillna(0)
             long_momentum = returns.rolling(window=10).mean().fillna(0)
             
-            # Calculate trend strength as correlation between short and long momentum
+            # Calculate trend strength with a MUCH larger multiplier (10000 instead of 1000)
             if len(short_momentum) >= 5 and len(long_momentum) >= 5:
                 # Use the sign of the product of short and long momentum
-                trend_strength = abs(short_momentum.iloc[-1] * long_momentum.iloc[-1]) * 10
+                trend_strength = abs(short_momentum.iloc[-1] * long_momentum.iloc[-1]) * 10000
             else:
                 trend_strength = 0.0
             
@@ -218,25 +218,21 @@ class DataManager:
         try:
             if df is None or len(df) < 5:
                 return 0.0
-                
-            df = df.copy()
-            df.sort_index(inplace=True)
             
-            # Calculate price changes and acceleration
-            price_changes = df['price'].pct_change().fillna(0)
-            acceleration = price_changes.diff().fillna(0)
+            # Get the last 5 price points
+            recent_prices = df['price'].tail(5)
             
-            # Use recent acceleration (last 5 periods)
-            recent_acceleration = acceleration.tail(5).mean() * 100
+            # Calculate first differences (velocity)
+            velocity = recent_prices.pct_change().fillna(0)
             
-            self.log_trade(f"Price acceleration details:")
-            self.log_trade(f"Recent price changes: {price_changes.tail()}")
-            self.log_trade(f"Recent acceleration: {recent_acceleration:.8f}")
+            # Calculate second differences (acceleration)
+            acceleration = velocity.diff().fillna(0)
             
-            # Normalize
-            result = min(abs(recent_acceleration), 1.0)
-            return result
+            # Use the mean of recent acceleration
+            mean_acceleration = abs(acceleration.mean() * 100)
             
+            return mean_acceleration
+        
         except Exception as e:
             self.log_trade(f"Error in acceleration calculation: {str(e)}")
             return 0.0
@@ -352,7 +348,13 @@ class DataManager:
         except Exception as e:
             self.log(f"Error in calculate_indicators for {symbol}: {str(e)}")
             return None
-
+        
+    def log_trade(self, message):
+        """Log a message using the bot's logging method if available"""
+        if self.bot and hasattr(self.bot, 'log_trade'):
+            self.bot.log_trade(message)
+        else:
+            print(f"DataManager Log: {message}")
 
 class CryptoScalpingBot:
     def __init__(self):
@@ -431,13 +433,16 @@ class CryptoScalpingBot:
         self.max_trades = tk.StringVar(value="5")
         self.min_volume = tk.StringVar(value="100000")
         self.volume_change_threshold = tk.StringVar(value="1.0")
+        self.required_conditions = tk.StringVar(value="2")  # Number of conditions required to trade
 
         # Advanced parameters (Greeks)
-        self.momentum_beta = tk.StringVar(value="0.8")  # Trend strength
-        self.price_alpha = tk.StringVar(value="0.6")    # Price momentum
-        self.momentum_theta = tk.StringVar(value="0.5") # Momentum quality
-        self.vol_vega = tk.StringVar(value="0.4")       # Volatility filter
-        self.volume_rho = tk.StringVar(value="0.7")     # Volume quality
+        self.momentum_beta = tk.StringVar(value="0.0001")  # Much lower trend strength requirement
+        self.price_alpha = tk.StringVar(value="0.001")     # Much lower price movement requirement
+        self.momentum_theta = tk.StringVar(value="0.5")    # Lower momentum quality tolerance
+        self.vol_vega = tk.StringVar(value="10.0")         # Higher volatility tolerance
+        self.volume_rho = tk.StringVar(value="0.001")      # Lower volume quality requirement
+        self.min_volume = tk.StringVar(value="100")        # Lower volume requirement
+        self.min_price_rise = tk.StringVar(value="0.001")  # Lower price rise requirement
 
         # Technical indicators
         self.rsi_period = tk.StringVar(value="14")
@@ -844,52 +849,56 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in display update: {str(e)}")
 
-    def setup_market_filters(self, parent):
-        """Setup market filter controls"""
-        # Create a grid layout for filters
-        row = 0
-        
-        # Min Volume
-        ttk.Label(parent, text="Min Volume (USD):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.min_volume_entry = ttk.Entry(parent, width=10)
-        self.min_volume_entry.insert(0, "100")
-        self.min_volume_entry.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
-        
-        # Min Active Trades
-        ttk.Label(parent, text="Min Active Trades:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.min_active_trades = ttk.Entry(parent, width=10)
-        self.min_active_trades.insert(0, "0")
-        self.min_active_trades.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
-        
-        # Top Rank Pairs
-        ttk.Label(parent, text="Top Rank Pairs:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.top_rank_pairs = ttk.Entry(parent, width=10)
-        self.top_rank_pairs.insert(0, "25")
-        self.top_rank_pairs.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
-        
-        # Required Conditions
-        ttk.Label(parent, text="Required Conditions:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.required_conditions = ttk.Entry(parent, width=10)
-        self.required_conditions.insert(0, "1")
-        self.required_conditions.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
-        
-        # Scan Interval
-        ttk.Label(parent, text="Scan Interval (s):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.scan_interval = ttk.Entry(parent, width=10)
-        self.scan_interval.insert(0, "5")
-        self.scan_interval.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
-        
-        # Min Spread
-        ttk.Label(parent, text="Min Spread (%):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.min_spread = ttk.Entry(parent, width=10)
-        self.min_spread.insert(0, "0.1")
-        self.min_spread.grid(row=row, column=1, sticky="w", padx=5, pady=2)
-        row += 1
+    def setup_filter_parameters(self, parent):
+        """Setup filter parameter controls"""
+        try:
+            # Create a grid layout for filters
+            row = 0
+            
+            # Min Volume
+            ttk.Label(parent, text="Min Volume (USD):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.min_volume_entry = ttk.Entry(parent, width=10)
+            self.min_volume_entry.insert(0, "100")
+            self.min_volume_entry.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            # Min Active Trades
+            ttk.Label(parent, text="Min Active Trades:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.min_active_trades = ttk.Entry(parent, width=10)
+            self.min_active_trades.insert(0, "0")
+            self.min_active_trades.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            # Top Rank Pairs
+            ttk.Label(parent, text="Top Rank Pairs:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.top_rank_pairs = ttk.Entry(parent, width=10)
+            self.top_rank_pairs.insert(0, "25")
+            self.top_rank_pairs.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            # Required Conditions
+            ttk.Label(parent, text="Required Conditions:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.required_conditions = ttk.Entry(parent, width=10)
+            self.required_conditions.insert(0, "1")
+            self.required_conditions.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            # Scan Interval
+            ttk.Label(parent, text="Scan Interval (s):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.scan_interval = ttk.Entry(parent, width=10)
+            self.scan_interval.insert(0, "5")
+            self.scan_interval.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            # Min Spread
+            ttk.Label(parent, text="Min Spread (%):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.min_spread = ttk.Entry(parent, width=10)
+            self.min_spread.insert(0, "0.1")
+            self.min_spread.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up filter parameters: {str(e)}")
 
     def setup_trading_parameters(self, parent):
         """Setup trading parameter controls"""
@@ -1065,7 +1074,8 @@ class CryptoScalpingBot:
             
             if hasattr(self, 'total_profit_label'):
                 self.total_profit_label.config(
-                    text=f"Total Profit: ${self.total_profit:.2f} USD"
+                    text=f"Total Profit: ${self.total_profit:.2f} USD",
+                    foreground="green" if self.total_profit > 0 else "red"
                 )
             
             if hasattr(self, 'total_fees_label'):
@@ -1075,75 +1085,90 @@ class CryptoScalpingBot:
             
             if hasattr(self, 'net_profit_label'):
                 self.net_profit_label.config(
-                    text=f"Net Profit: ${net_profit:.2f} USD"
+                    text=f"Net Profit: ${net_profit:.2f} USD",
+                    foreground="green" if net_profit > 0 else "red"
                 )
             
             if hasattr(self, 'win_loss_label'):
                 self.win_loss_label.config(
                     text=f"Win/Loss: {self.wins}/{self.losses} ({win_rate:.1f}%)"
                 )
-            
+                
             if hasattr(self, 'active_trades_label'):
                 self.active_trades_label.config(
                     text=f"Active Trades: {len(self.active_trades)}"
                 )
             
-            self.log_trade(f"Updated metrics - Win Rate: {win_rate:.1f}%, Net Profit: ${net_profit:.2f}")
+            self.log_trade(f"Metrics Updated: Total Profit=${self.total_profit:.2f}, Net Profit=${net_profit:.2f}, "
+                          f"Paper Balance=${self.paper_balance:.2f}, Wins={self.wins}, Losses={self.losses}")
             
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
 
-    def execute_trade(self, symbol, ticker):
-        """Execute a paper trade without accessing GUI elements"""
+    def execute_trade(self, symbol, price=None):
+        """Execute a paper trade with proper error handling"""
         try:
-            # Get current price
-            current_price = float(ticker['last'])
-            if not current_price or current_price <= 0:
-                self.log_trade(f"Invalid price for {symbol}: {current_price}")
+            # Get current price if not provided
+            if price is None:
+                if symbol in self.mock_ticker_state:
+                    price = float(self.mock_ticker_state[symbol]['last'])
+                else:
+                    self.log_trade(f"No price data available for {symbol}")
+                    return False
+            
+            # Get position size
+            position_size = float(self.position_size.get())
+            
+            # Check if we have enough balance
+            if position_size > self.paper_balance:
+                self.log_trade(f"Insufficient balance: {self.paper_balance:.2f} < {position_size:.2f}")
                 return False
-                
-            # Use fixed position size for paper trading
-            position_size = 100.0  # $100 per trade
             
-            # Generate a unique trade ID
-            trade_id = f"TRADE-{len(self.active_trades) + 1}-{int(time.time())}"
+            # Generate trade ID
+            trade_id = f"trade_{int(time.time())}_{symbol.replace('/', '')}"
             
-            # Create trade record
+            # Create trade object
             trade = {
-                'id': trade_id,
                 'symbol': symbol,
-                'entry_price': current_price,
-                'current_price': current_price,
+                'entry_price': price,
+                'current_price': price,
                 'position_size': position_size,
                 'entry_time': datetime.now(),
-                'highest_price': current_price,
+                'highest_price': price,
                 'highest_profit_percentage': 0.0,
-                'stop_loss_price': current_price * (1 - self.trading_params['stop_loss']),
-                'take_profit_price': current_price * (1 + self.trading_params['profit_target']),
-                'trailing_stop_pct': self.trading_params['trailing_stop']
+                'status': 'open'
             }
             
             # Add to active trades
             self.active_trades[trade_id] = trade
             
+            # Deduct from paper balance
+            self.paper_balance -= position_size
+            
+            # Initialize price history for this symbol
+            if not hasattr(self, 'price_history'):
+                self.price_history = {}
+                
+            if symbol not in self.price_history:
+                self.price_history[symbol] = []
+            self.price_history[symbol].append((datetime.now(), price))
+            
             # Log the trade
             self.log_trade(f"""
             [PAPER TRADE] Executed buy for {symbol}:
-            Price: ${current_price:.8f}
+            Price: ${price:.8f}
             Position Size: ${position_size:.2f}
-            Stop Loss: ${trade['stop_loss_price']:.8f}
-            Take Profit: ${trade['take_profit_price']:.8f}
             """)
             
-            # Update displays safely
-            if hasattr(self, 'root') and self.root:
-                self.root.after(0, self.update_active_trades_display)
-                self.root.after(0, self.update_chart)
+            # Update displays
+            self.update_metrics()
+            self.update_balance_display()
+            self.update_active_trades_display()
             
             return True
             
         except Exception as e:
-            self.log_trade(f"Error executing trade for {symbol}: {str(e)}")
+            self.log_trade(f"Error executing trade: {str(e)}")
             return False
             self.balance_label.config(
                 text=f"{'Paper' if self.is_paper_trading else 'Real'} Balance: ${balance:.2f}")
@@ -1443,6 +1468,12 @@ class CryptoScalpingBot:
                 self.log_trade("Invalid RSI oversold: must be between 10 and 50")
                 return False
             
+            # Validate required conditions
+            required_conditions = int(self.required_conditions.get())
+            if required_conditions <= 0 or required_conditions > 5:
+                self.log_trade("Invalid required conditions: must be between 1 and 5")
+                return False
+            
             # All checks passed
             self.log_trade("All trading conditions validated successfully")
             return True
@@ -1506,10 +1537,27 @@ class CryptoScalpingBot:
         self.update_metrics()
 
     def get_current_price(self, symbol):
-        """Get the current price for a symbol from mock data"""
-        if symbol in self.mock_ticker_state:
-            return self.mock_ticker_state[symbol]['last']
-        return 0
+        """Get current price for a symbol with error handling"""
+        try:
+            # For paper trading, use mock ticker data
+            if hasattr(self, 'mock_ticker_state') and symbol in self.mock_ticker_state:
+                return float(self.mock_ticker_state[symbol]['last'])
+            
+            # For real trading with exchange
+            if hasattr(self, 'exchange'):
+                ticker = self.exchange.fetch_ticker(symbol)
+                return float(ticker['last'])
+                
+            # Fallback to last known price in active trades
+            if symbol in self.active_trades:
+                return float(self.active_trades[symbol].get('current_price', 
+                                                          self.active_trades[symbol]['entry_price']))
+            
+            self.log_trade(f"No price source available for {symbol}")
+            return None
+        except Exception as e:
+            self.log_trade(f"Error getting current price for {symbol}: {str(e)}")
+            return None
 
     def update_mock_prices(self):
         """Update mock prices with realistic movements"""
@@ -1574,109 +1622,207 @@ class CryptoScalpingBot:
 
     def scan_opportunities(self):
         """Scan for trading opportunities"""
-        if len(self.active_trades) >= int(self.max_trades.get()):
-            return
-        
-        self.log_trade(f"Scanning {len(self.mock_ticker_state)} pairs for opportunities...")
-        
-        # Initialize DataManager if not already done
-        if not hasattr(self, 'data_manager'):
-            self.data_manager = DataManager(bot=self)
-            self.log_trade("Created DataManager instance")
-        
-        # Find potential trades
-        potential_trades = []
-        
-        for symbol, ticker in self.mock_ticker_state.items():
-            try:
-                price = ticker['last']
-                volume = ticker['quoteVolume']
-                
-                # Basic filtering
-                if volume < float(self.min_volume.get()):
-                    continue
+        try:
+            if len(self.active_trades) >= int(self.max_trades.get()):
+                return
+            
+            self.log_trade(f"Scanning {len(self.mock_ticker_state)} pairs for opportunities...")
+            
+            # Initialize DataManager if not already done
+            if not hasattr(self, 'data_manager'):
+                self.data_manager = DataManager(bot=self)
+                self.log_trade("Created DataManager instance")
+            
+            # Find potential trades
+            potential_trades = []
+            
+            for symbol, ticker in self.mock_ticker_state.items():
+                try:
+                    price = ticker['last']
+                    volume = ticker['quoteVolume']
                     
-                # Skip if already trading this symbol
-                if symbol in self.active_trades:
-                    continue
-                
-                # Update price data in DataManager
-                new_data = {
-                    'timestamp': datetime.now(),
-                    'price': price,
-                    'volume': volume
-                }
-                self.data_manager.update_price_data(symbol, new_data)
-                
-                # Calculate indicators using DataManager
-                df = self.data_manager.calculate_indicators(symbol)
-                if df is None:
-                    continue
-                
-                # Calculate price change
-                if len(df) >= 2:
-                    price_change = ((df['price'].iloc[-1] - df['price'].iloc[-2]) / df['price'].iloc[-2]) * 100
-                else:
-                    price_change = 0
-                
-                # Check for minimum price rise
-                if price_change < float(self.min_price_rise.get()):
-                    continue
-                
-                # Apply Greek parameters for advanced filtering
-                # 1. Trend Strength (Beta)
-                trend_strength = self.calculate_momentum_intensity(df)
-                if trend_strength < float(self.momentum_beta.get()):
-                    self.log_trade(f"Rejected {symbol}: Trend strength below threshold ({trend_strength:.2f} < {self.momentum_beta.get()})")
-                    continue
+                    # Basic filtering
+                    if volume < float(self.min_volume.get()):
+                        continue
+                        
+                    # Skip if already trading this symbol
+                    if symbol in self.active_trades:
+                        continue
                     
-                # 2. Price Momentum (Alpha)
-                price_acceleration = self.calculate_price_acceleration(df)
-                if price_acceleration < float(self.price_alpha.get()):
-                    self.log_trade(f"Rejected {symbol}: Price acceleration below threshold ({price_acceleration:.2f} < {self.price_alpha.get()})")
-                    continue
+                    # Update price data in DataManager
+                    new_data = {
+                        'timestamp': datetime.now(),
+                        'price': price,
+                        'volume': volume
+                    }
+                    self.data_manager.update_price_data(symbol, new_data)
                     
-                # 3. Momentum Quality (Theta)
-                momentum_quality = self.calculate_momentum_quality(df)
-                if momentum_quality > float(self.momentum_theta.get()):
-                    self.log_trade(f"Rejected {symbol}: Momentum quality too unstable ({momentum_quality:.2f} > {self.momentum_theta.get()})")
-                    continue
+                    # Calculate indicators using DataManager
+                    df = self.data_manager.calculate_indicators(symbol)
+                    if df is None or len(df) < 5:
+                        continue
                     
-                # 4. Volatility Filter (Vega)
-                volatility = self.calculate_volatility_sensitivity(df)
-                if volatility > float(self.vol_vega.get()):
-                    self.log_trade(f"Rejected {symbol}: Volatility too high ({volatility:.2f} > {self.vol_vega.get()})")
-                    continue
+                    # Calculate price change
+                    if len(df) >= 2:
+                        price_change = ((df['price'].iloc[-1] - df['price'].iloc[-2]) / df['price'].iloc[-2]) * 100
+                    else:
+                        price_change = 0
                     
-                # 5. Volume Quality (Rho)
-                volume_impact = self.calculate_volume_impact(df, df['volume'].iloc[-1])
-                if volume_impact < float(self.volume_rho.get()):
-                    self.log_trade(f"Rejected {symbol}: Volume impact below threshold ({volume_impact:.2f} < {self.volume_rho.get()})")
+                    # Check for minimum price rise
+                    if price_change < float(self.min_price_rise.get()):
+                        self.log_trade(f"Rejected {symbol}: Price change too low ({price_change:.2f}%)")
+                        continue
+                    
+                    # Apply Greek parameters for advanced filtering
+                    # 1. Trend Strength (Beta)
+                    trend_strength = self.data_manager.calculate_momentum_intensity(df)
+                    if trend_strength < float(self.momentum_beta.get()):
+                        self.log_trade(f"Rejected {symbol}: Trend strength below threshold ({trend_strength:.2f} < {self.momentum_beta.get()})")
+                        continue
+                        
+                    # 2. Price Momentum (Alpha)
+                    price_acceleration = self.data_manager.calculate_price_acceleration(df)
+                    if price_acceleration < float(self.price_alpha.get()):
+                        self.log_trade(f"Rejected {symbol}: Price acceleration below threshold ({price_acceleration:.2f} < {self.price_alpha.get()})")
+                        continue
+                        
+                    # 3. Momentum Quality (Theta)
+                    momentum_quality = self.data_manager.calculate_momentum_quality(df)
+                    if momentum_quality > float(self.momentum_theta.get()):
+                        self.log_trade(f"Rejected {symbol}: Momentum quality too unstable ({momentum_quality:.2f} > {self.momentum_theta.get()})")
+                        continue
+                        
+                    # 4. Volatility Filter (Vega)
+                    volatility = self.data_manager.calculate_volatility_sensitivity(df)
+                    if volatility > float(self.vol_vega.get()):
+                        self.log_trade(f"Rejected {symbol}: Volatility too high ({volatility:.2f} > {self.vol_vega.get()})")
+                        continue
+                        
+                    # 5. Volume Quality (Rho)
+                    volume_impact = self.data_manager.calculate_volume_impact(df, df['volume'].iloc[-1])
+                    if volume_impact < float(self.volume_rho.get()):
+                        self.log_trade(f"Rejected {symbol}: Volume impact below threshold ({volume_impact:.2f} < {self.volume_rho.get()})")
+                        continue
+                    
+                    # Check RSI conditions if RSI is available in the dataframe
+                    if 'rsi_14' in df.columns:
+                        rsi_value = df['rsi_14'].iloc[-1]
+                        rsi_overbought = float(self.rsi_overbought.get())
+                        rsi_oversold = float(self.rsi_oversold.get())
+                        
+                        if rsi_value > rsi_overbought:
+                            self.log_trade(f"Rejected {symbol}: RSI overbought ({rsi_value:.2f} > {rsi_overbought})")
+                            continue
+                            
+                        if rsi_value < rsi_oversold:
+                            self.log_trade(f"Rejected {symbol}: RSI oversold ({rsi_value:.2f} < {rsi_oversold})")
+                            continue
+                    
+                    # Check EMA crossover if EMAs are available
+                    ema_short_col = 'ema_5'
+                    ema_long_col = 'ema_15'
+                    
+                    if ema_short_col in df.columns and ema_long_col in df.columns:
+                        if df[ema_short_col].iloc[-1] < df[ema_long_col].iloc[-1]:
+                            self.log_trade(f"Rejected {symbol}: EMA crossover condition not met")
+                            continue
+                    
+                    # Check volume change if available
+                    if 'volume_change' in df.columns:
+                        volume_change = df['volume_change'].iloc[-1]
+                        min_volume_change = float(self.volume_change_threshold.get())
+                        
+                        if volume_change < min_volume_change:
+                            self.log_trade(f"Rejected {symbol}: Volume change too low ({volume_change:.2f}% < {min_volume_change}%)")
+                            continue
+                    
+                    # Count conditions met for required conditions check
+                    conditions_met = 0
+                    required_conditions = int(self.required_conditions.get())
+                    
+                    # Track which conditions were met
+                    met_conditions = []
+                    
+                    # 1. Price change
+                    if price_change >= float(self.min_price_rise.get()):
+                        conditions_met += 1
+                        met_conditions.append("Price rise")
+                        
+                    # 2. Momentum (Beta)
+                    if trend_strength >= float(self.momentum_beta.get()):
+                        conditions_met += 1
+                        met_conditions.append("Momentum")
+                        
+                    # 3. Price acceleration (Alpha)
+                    if price_acceleration >= float(self.price_alpha.get()):
+                        conditions_met += 1
+                        met_conditions.append("Acceleration")
+                        
+                    # 4. Momentum quality (Theta)
+                    if momentum_quality <= float(self.momentum_theta.get()):
+                        conditions_met += 1
+                        met_conditions.append("Momentum quality")
+                        
+                    # 5. Volume impact (Rho)
+                    if volume_impact >= float(self.volume_rho.get()):
+                        conditions_met += 1
+                        met_conditions.append("Volume impact")
+                        
+                    # 6. Volatility (Vega)
+                    if volatility <= float(self.vol_vega.get()):
+                        conditions_met += 1
+                        met_conditions.append("Volatility")
+                        
+                    # 7. RSI
+                    if 'rsi_14' in df.columns:
+                        rsi_value = df['rsi_14'].iloc[-1]
+                        if rsi_value <= float(self.rsi_overbought.get()) and rsi_value >= float(self.rsi_oversold.get()):
+                            conditions_met += 1
+                            met_conditions.append("RSI")
+                            
+                    # 8. EMA crossover
+                    if ema_short_col in df.columns and ema_long_col in df.columns:
+                        if df[ema_short_col].iloc[-1] > df[ema_long_col].iloc[-1]:
+                            conditions_met += 1
+                            met_conditions.append("EMA cross")
+                    
+                    # Check if enough conditions are met
+                    if conditions_met < required_conditions:
+                        self.log_trade(f"Rejected {symbol}: Not enough conditions met ({conditions_met}/{required_conditions})")
+                        continue
+                        
+                    # Advanced checks (additional custom checks)
+                    if not self.advanced_checks(symbol, df):
+                        self.log_trade(f"Rejected {symbol}: Failed advanced checks")
+                        continue
+                    
+                    # If all checks pass, add to potential trades
+                    self.log_trade(f"Potential trade found: {symbol} - Conditions met: {', '.join(met_conditions)}")
+                    potential_trades.append((symbol, price, df))
+                    
+                except Exception as e:
+                    self.log_trade(f"Error processing symbol {symbol}: {str(e)}")
                     continue
+            
+            # Sort potential trades by price change (descending)
+            if potential_trades:
+                self.log_trade(f"Found {len(potential_trades)} potential trades")
+                potential_trades.sort(key=lambda x: x[1], reverse=True)
                 
-                # Advanced checks (RSI, EMA, etc.)
-                if not self.advanced_checks(symbol, df):
-                    continue
-                
-                # If all checks pass, add to potential trades
-                potential_trades.append((symbol, price, df))
-                
-            except Exception as e:
-                self.log_trade(f"Error processing symbol {symbol}: {str(e)}")
-                continue
-        
-        # Sort potential trades by price change (descending)
-        potential_trades.sort(key=lambda x: x[1], reverse=True)
-        
-        # Execute trades up to the maximum allowed
-        max_new_trades = int(self.max_trades.get()) - len(self.active_trades)
-        for symbol, price, df in potential_trades[:max_new_trades]:
-            try:
-                ticker = self.mock_ticker_state[symbol]
-                self.execute_trade(symbol, price)
-            except Exception as e:
-                self.log_trade(f"Error executing trade for {symbol}: {str(e)}")
-                continue
+                # Execute trades up to the maximum allowed
+                max_new_trades = int(self.max_trades.get()) - len(self.active_trades)
+                for symbol, price, df in potential_trades[:max_new_trades]:
+                    try:
+                        ticker = self.mock_ticker_state[symbol]
+                        self.execute_trade(symbol, price)
+                    except Exception as e:
+                        self.log_trade(f"Error executing trade for {symbol}: {str(e)}")
+                        continue
+            else:
+                self.log_trade("No potential trades found")
+            
+        except Exception as e:
+            self.log_trade(f"Error in scan_opportunities: {str(e)}")
     def advanced_checks(self, symbol, df):
         """Advanced market checks including RSI and EMA analysis"""
         try:
@@ -1953,7 +2099,13 @@ class CryptoScalpingBot:
             ttk.Entry(parent, textvariable=self.min_volume, width=10).grid(row=row, column=1, padx=5, pady=2)
             row += 1
             
-            # Volume Change Threshold (moved from Indicators to Basic)
+            # Required Conditions
+            ttk.Label(parent, text="Required Conditions").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            self.required_conditions = tk.StringVar(value="2")
+            ttk.Entry(parent, textvariable=self.required_conditions, width=10).grid(row=row, column=1, padx=5, pady=2)
+            row += 1
+            
+            # Volume Change Threshold
             ttk.Label(parent, text="Volume Change Threshold (%)").grid(row=row, column=0, sticky="w", padx=5, pady=2)
             ttk.Entry(parent, textvariable=self.volume_change_threshold, width=10).grid(row=row, column=1, padx=5, pady=2)
             row += 1
@@ -2138,24 +2290,63 @@ class CryptoScalpingBot:
             self.trades_text.delete(1.0, tk.END)
             
             if not self.active_trades:
-                self.trades_text.insert(tk.END, "No active trades")
+                self.trades_text.insert(tk.END, "No active trades\n")
             else:
+                self.trades_text.insert(tk.END, f"Active Trades: {len(self.active_trades)}\n\n")
+                
                 for trade_id, trade in self.active_trades.items():
-                    symbol = trade['symbol']
-                    entry_price = trade['entry_price']
-                    current_price = trade['current_price']
-                    profit_percentage = (current_price - entry_price) / entry_price * 100
+                    try:
+                        symbol = trade['symbol']
+                        entry_price = trade['entry_price']
+                        
+                        # Get current price safely
+                        current_price = None
+                        try:
+                            current_price = self.get_current_price(symbol)
+                        except Exception as e:
+                            self.log_trade(f"Error getting price for {symbol}: {str(e)}")
+                        
+                        # Use fallback price if needed
+                        if current_price is None:
+                            current_price = trade.get('current_price', entry_price)
+                            self.log_trade(f"Using fallback price for {symbol}: {current_price}")
+                        
+                        # Calculate profit safely
+                        if current_price is not None and entry_price is not None:
+                            profit_percentage = ((current_price - entry_price) / entry_price) * 100
+                        else:
+                            profit_percentage = 0.0
+                        
+                        # Calculate time in trade
+                        try:
+                            time_in_trade = (datetime.now() - trade.get('entry_time', datetime.now())).total_seconds()
+                        except:
+                            time_in_trade = 0.0
                     
-                    trade_info = (
-                        f"{symbol}:\n"
-                        f"  Entry: ${entry_price:.6f}\n"
-                        f"  Current: ${current_price:.6f}\n"
-                        f"  P/L: {profit_percentage:.2f}%\n"
-                        f"  Size: ${trade['position_size']:.2f}\n"
-                        f"  Highest: {trade['highest_profit_percentage']:.2f}%\n\n"
-                    )
-                    
-                    self.trades_text.insert(tk.END, trade_info)
+                        trade_info = (
+                            f"Symbol: {symbol}\n"
+                            f"Entry: {entry_price:.8f}\n"
+                            f"Current: {current_price:.8f}\n"
+                            f"P/L: {profit_percentage:.2f}%\n"
+                            f"Time: {time_in_trade:.1f}s\n"
+                            f"-----------------\n"
+                        )
+                        
+                        self.trades_text.insert(tk.END, trade_info)
+                        
+                        # Color coding
+                        start_idx = self.trades_text.index("end-8c linestart")
+                        end_idx = self.trades_text.index("end-1c")
+                        
+                        if profit_percentage > 0:
+                            self.trades_text.tag_add("profit", start_idx, end_idx)
+                            self.trades_text.tag_config("profit", foreground="green")
+                        else:
+                            self.trades_text.tag_add("loss", start_idx, end_idx)
+                            self.trades_text.tag_config("loss", foreground="red")
+                            
+                    except Exception as e:
+                        self.log_trade(f"Error updating display for {trade_id}: {str(e)}")
             
             self.trades_text.config(state=tk.DISABLED)
             
@@ -2222,6 +2413,92 @@ class CryptoScalpingBot:
             
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
+
+    def analyze_opportunity(self, symbol, ticker_data):
+        """Analyze if a trading opportunity meets criteria"""
+        try:
+            # Log all conditions being checked
+            self.log_trade(f"\nDetailed analysis for {symbol}:")
+            
+            # Get price data
+            df = self.data_manager.get_price_data(symbol)
+            if df is None or len(df) < 15:
+                self.log_trade(f"Insufficient data: {len(df) if df is not None else 0}/15 points")
+                return False
+                    
+            # Initialize conditions tracking
+            conditions_met = []
+            conditions_failed = []
+            
+            # Check trend strength
+            trend_strength = self.data_manager.calculate_momentum_intensity(df)
+            momentum_threshold = float(self.momentum_beta.get())
+            self.log_trade(f"Trend strength: {trend_strength:.4f}, Threshold: {momentum_threshold:.4f}")
+            
+            if trend_strength >= momentum_threshold:
+                conditions_met.append("Trend Strength")
+            else:
+                conditions_failed.append(f"Trend Strength ({trend_strength:.2f} < {momentum_threshold:.2f})")
+                    
+            # Check RSI
+            rsi = df['rsi_14'].iloc[-1] if 'rsi_14' in df.columns else 50
+            rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
+            rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
+            self.log_trade(f"RSI: {rsi:.2f}, Overbought: {rsi_overbought}, Oversold: {rsi_oversold}")
+            
+            # RSI condition: not overbought
+            if rsi < rsi_overbought:
+                conditions_met.append("RSI Not Overbought")
+            else:
+                conditions_failed.append(f"RSI Overbought ({rsi:.2f} >= {rsi_overbought})")
+            
+            # Volume check
+            volume = float(ticker_data.get('quoteVolume', 0))
+            min_volume = float(self.min_volume.get())
+            self.log_trade(f"Volume: ${volume:.2f}, Min Volume: ${min_volume:.2f}")
+            
+            if volume >= min_volume:
+                conditions_met.append("Minimum Volume")
+            else:
+                conditions_failed.append(f"Insufficient Volume ({volume:.2f} < {min_volume:.2f})")
+            
+            # EMA crossover check
+            if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
+                ema_cross = (df['ema_5'].iloc[-2] <= df['ema_15'].iloc[-2] and 
+                            df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+                self.log_trade(f"EMA Cross: {ema_cross}")
+                
+                if ema_cross:
+                    conditions_met.append("EMA Crossover")
+                else:
+                    conditions_failed.append("No EMA Crossover")
+            
+            # Price acceleration check
+            price_acceleration = self.data_manager.calculate_price_acceleration(df)
+            price_alpha_threshold = float(self.price_alpha.get())
+            self.log_trade(f"Price Acceleration: {price_acceleration:.4f}, Threshold: {price_alpha_threshold:.4f}")
+            
+            if price_acceleration >= price_alpha_threshold:
+                conditions_met.append("Price Acceleration")
+            else:
+                conditions_failed.append(f"Price Acceleration ({price_acceleration:.2f} < {price_alpha_threshold:.2f})")
+            
+            # Make final decision based on required conditions parameter
+            required_conditions = int(self.required_conditions.get())
+            all_conditions_met = len(conditions_met) >= required_conditions
+            
+            # Log final decision with details
+            self.log_trade(f"Conditions met ({len(conditions_met)}/{required_conditions}): {', '.join(conditions_met)}")
+            if conditions_failed:
+                self.log_trade(f"Conditions failed: {', '.join(conditions_failed)}")
+            
+            self.log_trade(f"TRADE DECISION: {'EXECUTING' if all_conditions_met else 'REJECTED'} for {symbol}")
+            
+            return all_conditions_met
+                
+        except Exception as e:
+            self.log_trade(f"Error analyzing opportunity for {symbol}: {str(e)}")
+            return False
 
     def update_trade_history(self, symbol, percentage, profit, is_win=True):
         """Update the trade history display"""
