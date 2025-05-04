@@ -183,7 +183,6 @@ class DataManager:
             self.log_function(f"Error updating price data for {symbol}: {str(e)}")
 class CryptoScalpingBot:
     def __init__(self):
-        super().__init__()
         # Create root window FIRST
         self.root = tk.Tk()
         self.night_mode = False # Track night mode state
@@ -233,6 +232,13 @@ class CryptoScalpingBot:
         self.trailing_activation = tk.StringVar(self.root, value="0.5")
         self.max_position_percent = tk.StringVar(self.root, value="10")
         self.daily_loss_limit = tk.StringVar(self.root, value="5")
+        # Add fee structure variables
+        #self.maker_fee = tk.StringVar(self.root, value="0.25")  # 0.25% for maker orders
+        #self.taker_fee = tk.StringVar(self.root, value="0.40")  # 0.40% for taker orders
+
+        # Add fee structure variables as StringVars (with different names)
+        self.maker_fee_var = tk.StringVar(self.root, value="0.25")  # 0.25% for maker orders
+        self.taker_fee_var = tk.StringVar(self.root, value="0.40")  # 0.40% for taker orders
 
         # Fee Structure (Kraken)
         self.maker_fee = 0.0025  # 0.25% for maker orders
@@ -965,6 +971,27 @@ class CryptoScalpingBot:
             
         except Exception as e:
             self.log_trade(f"Error logging current settings: {str(e)}")
+
+    def initialize_fees(self):
+        """Initialize fee values from StringVar objects"""
+        try:
+            # Parse fee values from GUI
+            maker_fee = float(self.maker_fee_var.get()) / 100  # Convert from percentage to decimal
+            taker_fee = float(self.taker_fee_var.get()) / 100  # Convert from percentage to decimal
+            
+            # Update instance variables
+            self.maker_fee = maker_fee
+            self.taker_fee = taker_fee
+            self.total_fee_percentage = taker_fee * 2  # Assuming both entry and exit are taker orders
+            
+            # Update the total fees label
+            total_fee_pct = self.total_fee_percentage * 100
+            self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
+            
+            self.log_trade(f"Fee structure initialized: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, Total {total_fee_pct:.2f}%")
+        except Exception as e:
+            self.log_trade(f"Error initializing fees: {str(e)}")
+
     def update_status(self, status):
         """Update status display with proper GUI handling"""
         try:
@@ -1214,6 +1241,28 @@ class CryptoScalpingBot:
             self.rsi_oversold.insert(0, "30")
             self.rsi_oversold.grid(row=2, column=1, padx=5, pady=2)
 
+            # Add Fee Structure Frame
+            fee_frame = ttk.LabelFrame(advanced_frame, text="Fee Structure")
+            fee_frame.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+
+            ttk.Label(fee_frame, text="Maker Fee (%):").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+            ttk.Entry(fee_frame, textvariable=self.maker_fee_var, width=8).grid(row=0, column=1, padx=5, pady=2)
+
+            ttk.Label(fee_frame, text="Taker Fee (%):").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+            ttk.Entry(fee_frame, textvariable=self.taker_fee_var, width=8).grid(row=1, column=1, padx=5, pady=2)
+
+            initial_maker_fee = float(self.maker_fee_var.get()) / 100
+            initial_taker_fee = float(self.taker_fee_var.get()) / 100
+            initial_total_fee = (initial_maker_fee + initial_taker_fee) * 100 
+
+            # Total fees display
+            self.total_fees_label = ttk.Label(fee_frame, text=f"Total Round-Trip Fee: {initial_total_fee:.2f}%")
+            self.total_fees_label.grid(row=2, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+
+            # Update button for fees
+            ttk.Button(fee_frame, text="Update Fees", command=self.update_fees).grid(row=3, column=0, columnspan=2, padx=5, pady=5)
+
+
             # Add tooltips for Advanced Parameters
             self.add_tooltip(self.rsi_period, 
                 "Period length for RSI calculation")
@@ -1308,10 +1357,57 @@ class CryptoScalpingBot:
 
             # Initialize chart
             self.setup_chart()
+            self.initialize_fees()
             
         except Exception as e:
             self.log_trade(f"Error setting up GUI: {str(e)}")
             raise
+
+    def update_fees(self):
+        """Update fee structure based on user input"""
+        try:
+            # Use the StringVar objects directly
+            maker_fee_str = self.maker_fee_var.get()
+            taker_fee_str = self.taker_fee_var.get()
+            
+            # Debug: Print the raw values from the StringVar objects
+            self.log_trade(f"DEBUG: maker_fee_str = '{maker_fee_str}'")
+            self.log_trade(f"DEBUG: taker_fee_str = '{taker_fee_str}'")
+            
+            # Parse fee values
+            maker_fee = float(maker_fee_str) / 100  # Convert from percentage to decimal
+            taker_fee = float(taker_fee_str) / 100  # Convert from percentage to decimal
+            
+            # Debug: Print the converted values
+            self.log_trade(f"DEBUG: maker_fee (converted) = {maker_fee}")
+            self.log_trade(f"DEBUG: taker_fee (converted) = {taker_fee}")
+            
+            # Update instance variables
+            self.maker_fee = maker_fee
+            self.taker_fee = taker_fee
+            self.total_fee_percentage = taker_fee * 2  # Assuming both entry and exit are taker orders
+            
+            # Debug: Print the updated instance variables
+            self.log_trade(f"DEBUG: self.maker_fee = {self.maker_fee}")
+            self.log_trade(f"DEBUG: self.taker_fee = {self.taker_fee}")
+            self.log_trade(f"DEBUG: self.total_fee_percentage = {self.total_fee_percentage}")
+            
+            # Update the total fees label
+            total_fee_pct = self.total_fee_percentage * 100
+            self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
+            
+            # Log the update
+            self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, Total {total_fee_pct:.2f}%")
+            
+            # Update tooltips
+            self.add_tooltip(self.profit_target, 
+                f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
+            
+            # Validate parameters to ensure profit target is above fees
+            self.validate_parameters()
+            
+        except ValueError as e:
+            self.log_trade(f"Error updating fees: {str(e)}")
 
     def setup_tooltips(self):
         """Setup tooltips for all parameters"""
@@ -1385,6 +1481,14 @@ class CryptoScalpingBot:
                 "Ratio to identify significant buy walls (>1.0 indicates strong support)")
             self.add_tooltip(self.sell_wall_ratio, 
                 "Ratio to identify significant sell walls (>1.0 indicates strong resistance)")
+            
+            # Fee Structure Tooltips
+            self.add_tooltip(self.maker_fee,
+                "Fee percentage for maker orders (limit orders that add liquidity)")
+            self.add_tooltip(self.taker_fee,
+                "Fee percentage for taker orders (market orders that remove liquidity)")
+            self.add_tooltip(self.total_fees_label,
+                "Total fees for a complete trade (entry + exit)")
             
             # Position Sizing Tooltips
             self.add_tooltip(self.scale_in_levels, 
@@ -1712,9 +1816,10 @@ class CryptoScalpingBot:
     def validate_parameters(self):
         """Validate all trading parameters"""
         try:
+            # Create a dictionary of parameters to validate
             validation_rules = {
                 'profit_target': {
-                    'min': 0.8,  # Minimum to cover fees
+                    'min': self.total_fee_percentage * 100,  # Minimum to cover fees
                     'max': 5.0,
                     'value': float(self.profit_target.get()),
                     'name': 'Profit Target'
@@ -1736,70 +1841,59 @@ class CryptoScalpingBot:
                     'max': 2.0,
                     'value': float(self.trailing_activation.get()),
                     'name': 'Trailing Activation'
-                },
-                'rsi_period': {
+                }
+            }
+            
+            # Add optional parameters only if they exist
+            if hasattr(self, 'rsi_period'):
+                validation_rules['rsi_period'] = {
                     'min': 5,
                     'max': 30,
                     'value': float(self.rsi_period.get()),
                     'name': 'RSI Period'
-                },
-                'book_depth': {
+                }
+                
+            if hasattr(self, 'book_depth'):
+                validation_rules['book_depth'] = {
                     'min': 5,
                     'max': 50,
                     'value': float(self.book_depth.get()),
                     'name': 'Order Book Depth'
-                },
-                'scale_in_levels': {
+                }
+                
+            if hasattr(self, 'scale_in_levels'):
+                validation_rules['scale_in_levels'] = {
                     'min': 1,
                     'max': 5,
                     'value': float(self.scale_in_levels.get()),
                     'name': 'Scale-in Levels'
-                },
-                # Greek parameters
-                'momentum_beta': {
-                    'min': 0.1,
-                    'max': 1.0,
-                    'value': float(self.momentum_beta.get()),
-                    'name': 'Momentum Beta'
-                },
-                'price_alpha': {
-                    'min': 0.1,
-                    'max': 1.0,
-                    'value': float(self.price_alpha.get()),
-                    'name': 'Price Alpha'
-                },
-                'time_theta': {
-                    'min': 0.1,
-                    'max': 1.0,
-                    'value': float(self.time_theta.get()),
-                    'name': 'Time Theta'
-                },
-                'vol_vega': {
-                    'min': 0.1,
-                    'max': 1.0,
-                    'value': float(self.vol_vega.get()),
-                    'name': 'Volatility Vega'
-                },
-                'volume_rho': {
-                    'min': 0.1,
-                    'max': 1.0,
-                    'value': float(self.volume_rho.get()),
-                    'name': 'Volume Rho'
-                },
-                # RSI thresholds
-                'rsi_overbought': {
-                    'min': 60,
+                }
+                
+            # Greek parameters - only add if they exist
+            greek_params = ['momentum_beta', 'price_alpha', 'time_theta', 'vol_vega', 'volume_rho']
+            for param in greek_params:
+                if hasattr(self, param):
+                    validation_rules[param] = {
+                        'min': 0.001,
+                        'max': 1.0,
+                        'value': float(getattr(self, param).get()),
+                        'name': param.replace('_', ' ').title()
+                    }
+                    
+            # RSI thresholds - only add if they exist
+            if hasattr(self, 'rsi_overbought') and hasattr(self, 'rsi_oversold'):
+                validation_rules['rsi_overbought'] = {
+                    'min': 1,
                     'max': 90,
                     'value': float(self.rsi_overbought.get()),
                     'name': 'RSI Overbought'
-                },
-                'rsi_oversold': {
-                    'min': 10,
-                    'max': 40,
+                }
+                validation_rules['rsi_oversold'] = {
+                    'min': 1,
+                    'max': 90,
                     'value': float(self.rsi_oversold.get()),
                     'name': 'RSI Oversold'
                 }
-            }
 
             # Validate each parameter
             for param, rules in validation_rules.items():
@@ -1808,18 +1902,22 @@ class CryptoScalpingBot:
                     self.log_trade(error_msg)
                     raise ValueError(error_msg)
 
-            # Cross-Parameter Validation
-            if validation_rules['stop_loss']['value'] >= validation_rules['profit_target']['value']:
-                raise ValueError("Stop loss must be less than profit target")
+            # Cross-Parameter Validation - only if all required parameters exist
+            if all(param in validation_rules for param in ['profit_target', 'stop_loss']):
+                if validation_rules['stop_loss']['value'] >= validation_rules['profit_target']['value']:
+                    raise ValueError("Stop loss must be less than profit target")
             
-            if validation_rules['trailing_stop']['value'] >= validation_rules['profit_target']['value']:
-                raise ValueError("Trailing stop must be less than profit target")
+            if all(param in validation_rules for param in ['profit_target', 'trailing_stop']):
+                if validation_rules['trailing_stop']['value'] >= validation_rules['profit_target']['value']:
+                    raise ValueError("Trailing stop must be less than profit target")
             
-            if validation_rules['trailing_activation']['value'] >= validation_rules['profit_target']['value']:
-                raise ValueError("Trailing activation must be less than profit target")
+            if all(param in validation_rules for param in ['profit_target', 'trailing_activation']):
+                if validation_rules['trailing_activation']['value'] >= validation_rules['profit_target']['value']:
+                    raise ValueError("Trailing activation must be less than profit target")
             
-            if validation_rules['rsi_oversold']['value'] >= validation_rules['rsi_overbought']['value']:
-                raise ValueError("RSI oversold must be less than RSI overbought")
+            if all(param in validation_rules for param in ['rsi_oversold', 'rsi_overbought']):
+                if validation_rules['rsi_oversold']['value'] >= validation_rules['rsi_overbought']['value']:
+                    raise ValueError("RSI oversold must be less than RSI overbought")
 
             # Balance Check
             if self.is_paper_trading:
@@ -1828,11 +1926,14 @@ class CryptoScalpingBot:
                 available_balance = float(self.exchange.fetch_balance()['USD']['free'])
             
             position_size = float(self.position_size.get())
-            max_position_percent = float(self.max_position_percent.get()) / 100
-            max_position = available_balance * max_position_percent
             
-            if position_size > max_position:
-                raise ValueError(f"Position size exceeds maximum allowed ({max_position:.2f} USD)")
+            # Only check max position percent if it exists
+            if hasattr(self, 'max_position_percent'):
+                max_position_percent = float(self.max_position_percent.get()) / 100
+                max_position = available_balance * max_position_percent
+                
+                if position_size > max_position:
+                    raise ValueError(f"Position size exceeds maximum allowed ({max_position:.2f} USD)")
 
             self.log_trade("All parameters validated successfully")
             return True
@@ -3028,7 +3129,7 @@ class CryptoScalpingBot:
     def calculate_trade_parameters(self, entry_price):
         """Calculate optimal trade parameters considering fees"""
         try:
-            total_fees = self.taker_fee * 2  # 0.8%
+            total_fees = self._total_fee_percentage  # Use the instance variable
             
             # Minimum profit needed to break even
             min_profit = total_fees * 1.2  # Add 20% buffer over fees
@@ -3050,10 +3151,14 @@ class CryptoScalpingBot:
                 'stop_loss': stop_loss,
                 'min_profit': min_profit
             }
-            
         except Exception as e:
             self.log_trade(f"Error calculating trade parameters: {str(e)}")
-            return None
+            return {
+                'profit_target': float(self.profit_target.get()) / 100,
+                'stop_loss': float(self.stop_loss.get()) / 100,
+                'min_profit': 0.01  # Default 1%
+            }
+                
     def validate_trade(self, pair_data, current_price):
         try:
             # Check if price has moved too much since analysis
