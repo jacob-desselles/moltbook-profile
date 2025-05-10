@@ -6,7 +6,7 @@ from tkinter import ttk, scrolledtext, messagebox
 import ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import logging
 from typing import Dict
@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.dates import DateFormatter
+import matplotlib.dates as mdates
 class DataManager:
     def __init__(self, exchange=None, log_function=None):
         self.price_data = {}
@@ -32,16 +33,49 @@ class DataManager:
         self.log_function = log_function if log_function else print
         self.min_data_points = 20
         self.initialization_complete = {}
-    def log_trade(self, message):
-        """Internal logging method"""
+
+    def get_price_data(self, symbol):
+        """Get price data for a symbol"""
         try:
-            if self.log_function:
-                self.log_function(message)
-            else:
-                print(message)
+            if symbol not in self.price_data:
+                self.log_trade(f"No price data available for {symbol}")
+                return None
+                
+            # Return a copy to prevent modification
+            return self.price_data[symbol].copy()
+            
+        except Exception as e:
+            self.log_trade(f"Error getting price data for {symbol}: {str(e)}")
+            return None
+
+    def log_trade(self, message):
+        """Log trade information with proper encoding handling"""
+        try:
+            # Replace Unicode characters with ASCII alternatives
+            message = message.replace('✅', '+')
+            message = message.replace('❌', 'X')
+            
+            # Format with timestamp
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_message = f"{timestamp} - {str(message)}"
+            
+            # Console output
+            print(log_message)
+            
+            # File logging with encoding specification
+            if hasattr(self, 'logger'):
+                self.logger.info(message)
+            
+            # GUI logging
+            if hasattr(self, 'log_text'):
+                self.root.after(0, lambda: self.log_text.insert(tk.END, f"{log_message}\n"))
+                self.root.after(0, lambda: self.log_text.see(tk.END))
+                    
         except Exception as e:
             print(f"Logging error: {str(e)}")
-
+            # Fallback logging with just ASCII
+            print(f"{timestamp} - {message.encode('ascii', 'replace').decode()}")
+    
     def _calculate_indicators(self, symbol: str):
         """Calculate technical indicators using pandas, including RSI"""
         try:
@@ -72,7 +106,7 @@ class DataManager:
                 # Spread
                 df['spread'] = (df['ask'] - df['bid']) / df['price'] * 100
                 
-                # RSI Calculation
+                # RSI Calculation - Improved version with better error handling
                 rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14  # Default to 14 if not set
                 if len(df) >= rsi_period + 1:  # Need enough data points for RSI
                     # Calculate price changes
@@ -86,15 +120,30 @@ class DataManager:
                     avg_gain = gains.rolling(window=rsi_period, min_periods=rsi_period).mean()
                     avg_loss = losses.rolling(window=rsi_period, min_periods=rsi_period).mean()
                     
+                    # Avoid division by zero - replace zeros with small value
+                    avg_loss = avg_loss.replace(0, 0.0001)
+                    
                     # Calculate RS and RSI
                     rs = avg_gain / avg_loss
-                    rs = rs.replace([np.inf, -np.inf], np.nan)  # Avoid division by zero
+                    rs = rs.replace([np.inf, -np.inf], np.nan)  # Handle infinity
+                    
+                    # Calculate RSI
                     rsi = 100 - (100 / (1 + rs))
+                    
+                    # Handle edge cases
+                    # If price hasn't changed at all, RSI should be 50 (neutral)
+                    if delta.abs().sum() == 0:
+                        rsi = pd.Series(50, index=rsi.index)
+                    
+                    # Fill any remaining NaN values with previous values or 50
+                    rsi = rsi.ffill().fillna(50)
                     
                     # Store RSI in DataFrame
                     df[f'rsi_{rsi_period}'] = rsi
                     
-                    self.log_trade(f"RSI calculated for {symbol} with period {rsi_period}: {rsi.iloc[-1]:.2f}")
+                    # Log the last RSI value
+                    last_rsi = rsi.iloc[-1]
+                    self.log_trade(f"RSI calculated for {symbol} with period {rsi_period}: {last_rsi:.2f}")
                 
                 # Store updated DataFrame
                 self.price_data[symbol] = df
@@ -193,7 +242,7 @@ class CryptoScalpingBot:
         self.style.configure('Dark.TButton',
             background='#1a1a1a',
             foreground='white')
-        self.root.title("Vantrex v1.06") 
+        self.root.title("Vantrex v1.15") 
         self.root.geometry("1200x1000")
 
         # Initialize basic variables
@@ -363,6 +412,15 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error setting up chart: {str(e)}")
 
+    def toggle_market_override(self):
+        """Toggle market condition override"""
+        override = self.market_override_var.get()
+        if override:
+            self.log_trade("MARKET OVERRIDE ENABLED: Bot will ignore bearish market conditions")
+            messagebox.showinfo("Market Override", "Market condition checks are now disabled. The bot will trade normally regardless of market conditions.")
+        else:
+            self.log_trade("MARKET OVERRIDE DISABLED: Bot will respect market conditions")
+        
     def toggle_night_mode(self):
         """Toggle between light and dark theme"""
         try:
@@ -534,6 +592,62 @@ class CryptoScalpingBot:
         
         return self.config
 
+    def initialize_btc_data(self):
+        """Initialize BTC/USD market data for market analysis"""
+        try:
+            self.log_trade("Initializing BTC/USD market data...")
+            
+            # Fetch BTC/USD ticker
+            try:
+                btc_ticker = self.exchange.fetch_ticker('BTC/USD')
+                if btc_ticker:
+                    self.data_manager.update_price_data('BTC/USD', btc_ticker)
+                    self.log_trade(f"Initial BTC/USD data point collected: ${float(btc_ticker['last'])}")
+                else:
+                    self.log_trade("Warning: Could not fetch BTC/USD ticker")
+                    return False
+            except Exception as e:
+                self.log_trade(f"Error fetching BTC/USD ticker: {str(e)}")
+                return False
+            
+            # Try to fetch historical data
+            try:
+                # Fetch OHLCV data for the past day (24 hourly candles)
+                since = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+                ohlcv = self.exchange.fetch_ohlcv('BTC/USD', timeframe='1h', since=since, limit=24)
+                
+                # Convert to DataFrame and update price data
+                for candle in ohlcv:
+                    timestamp, open_price, high, low, close, volume = candle
+                    
+                    # Create synthetic ticker data
+                    synthetic_ticker = {
+                        'timestamp': pd.Timestamp(timestamp, unit='ms'),
+                        'last': close,
+                        'quoteVolume': volume,
+                        'bid': close * 0.999,  # Approximate bid
+                        'ask': close * 1.001   # Approximate ask
+                    }
+                    
+                    # Update price data
+                    self.data_manager.update_price_data('BTC/USD', synthetic_ticker)
+                
+                # Log success
+                df = self.data_manager.get_price_data('BTC/USD')
+                if df is not None:
+                    self.log_trade(f"Successfully loaded {len(df)} historical data points for BTC/USD")
+                
+                return True
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching historical BTC/USD data: {str(e)}")
+                # Continue with just the single data point
+                return True
+            
+        except Exception as e:
+            self.log_trade(f"Error initializing BTC/USD data: {str(e)}")
+            return False
+
     def init_exchange(self):
         """Initialize exchange with retry mechanism"""
         max_retries = 3
@@ -567,6 +681,9 @@ class CryptoScalpingBot:
                         exchange=self.exchange,
                         log_function=self.log_trade
                     )
+                    
+                    # Initialize BTC/USD market data
+                    self.initialize_btc_data()
                     
                     self.log_trade("Exchange initialization successful")
                     return True
@@ -623,60 +740,123 @@ class CryptoScalpingBot:
         return {}
 
     def show_api_config(self):
-        """Show API configuration window with proper config handling"""
+        """Show API configuration window with improved error handling"""
         try:
             config_window = tk.Toplevel(self.root)
             config_window.title("API Configuration")
-            config_window.resizable(False, False)
+            config_window.geometry("500x300")
+            config_window.transient(self.root)
+            config_window.grab_set()
             
-            # Center the window
-            window_width = 400
-            window_height = 250
-            screen_width = self.root.winfo_screenwidth()
-            screen_height = self.root.winfo_screenheight()
-            x = (screen_width - window_width) // 2
-            y = (screen_height - window_height) // 2
-            config_window.geometry(f"{window_width}x{window_height}+{x}+{y}")
-
-            ttk.Label(config_window, text="Kraken API Configuration", font=('Arial', 12)).pack(pady=10)
-
-            frame = ttk.Frame(config_window)
-            frame.pack(padx=20, pady=10, fill='both', expand=True)
-
-            # API Key
-            ttk.Label(frame, text="API Key:").grid(row=0, column=0, sticky='w', pady=5)
-            api_key_entry = ttk.Entry(frame, width=40)
-            api_key_entry.grid(row=0, column=1, padx=5)
-            if self.config.has_option('API_KEYS', 'api_key'):
-                api_key_entry.insert(0, self.config.get('API_KEYS', 'api_key'))
-
-            # Secret Key
-            ttk.Label(frame, text="Secret Key:").grid(row=1, column=0, sticky='w', pady=5)
-            secret_key_entry = ttk.Entry(frame, width=40, show="*")
-            secret_key_entry.grid(row=1, column=1, padx=5)
-            if self.config.has_option('API_KEYS', 'secret'):
-                secret_key_entry.insert(0, self.config.get('API_KEYS', 'secret'))
-
+            # Get current values if they exist
+            current_api_key = ""
+            current_secret = ""
+            
+            if self.config.has_section('API_KEYS'):
+                current_api_key = self.config.get('API_KEYS', 'api_key', fallback='')
+                current_secret = self.config.get('API_KEYS', 'secret', fallback='')
+            
+            # Create form
+            frame = ttk.Frame(config_window, padding=20)
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            ttk.Label(frame, text="Kraken API Key:").grid(row=0, column=0, sticky="w", pady=5)
+            api_key_entry = ttk.Entry(frame, width=50)
+            api_key_entry.insert(0, current_api_key)
+            api_key_entry.grid(row=0, column=1, pady=5, padx=5)
+            
+            ttk.Label(frame, text="Kraken API Secret:").grid(row=1, column=0, sticky="w", pady=5)
+            secret_entry = ttk.Entry(frame, width=50, show="*")
+            secret_entry.insert(0, current_secret)
+            secret_entry.grid(row=1, column=1, pady=5, padx=5)
+            
+            # Show/hide secret toggle
+            show_secret = tk.BooleanVar(value=False)
+            
+            def toggle_secret_visibility():
+                if show_secret.get():
+                    secret_entry.config(show="")
+                else:
+                    secret_entry.config(show="*")
+            
+            ttk.Checkbutton(frame, text="Show Secret", variable=show_secret, 
+                        command=toggle_secret_visibility).grid(row=2, column=1, sticky="w")
+            
+            # Status label
+            status_label = ttk.Label(frame, text="")
+            status_label.grid(row=3, column=0, columnspan=2, pady=10)
+            
+            # Test connection function
+            def test_connection():
+                api_key = api_key_entry.get().strip()
+                secret = secret_entry.get().strip()
+                
+                if not api_key or not secret:
+                    status_label.config(text="Error: API Key and Secret are required", foreground="red")
+                    return
+                
+                status_label.config(text="Testing connection...", foreground="blue")
+                config_window.update()
+                
+                try:
+                    test_exchange = ccxt.kraken({
+                        'apiKey': api_key,
+                        'secret': secret,
+                        'enableRateLimit': True
+                    })
+                    
+                    # Test with a lightweight API call
+                    test_exchange.fetch_balance()
+                    status_label.config(text="Connection successful!", foreground="green")
+                    return True
+                except ccxt.AuthenticationError:
+                    status_label.config(text="Error: Invalid API keys", foreground="red")
+                    return False
+                except ccxt.NetworkError:
+                    status_label.config(text="Error: Network error - check your connection", foreground="red")
+                    return False
+                except Exception as e:
+                    status_label.config(text=f"Error: {str(e)}", foreground="red")
+                    return False
+            
+            # Save function
             def save_config():
-                self.config['API_KEYS'] = {
-                    'api_key': api_key_entry.get(),
-                    'secret': secret_key_entry.get()  # Note: using 'secret' to match ccxt
-                }
-                with open('config.ini', 'w') as f:
-                    self.config.write(f)
-                messagebox.showinfo("Success", "API configuration saved")
-                config_window.destroy()
-                self.init_exchange()
-
-            # Button frame
+                api_key = api_key_entry.get().strip()
+                secret = secret_entry.get().strip()
+                
+                if not api_key or not secret:
+                    status_label.config(text="Error: API Key and Secret are required", foreground="red")
+                    return
+                
+                # Test connection before saving
+                status_label.config(text="Testing connection before saving...", foreground="blue")
+                config_window.update()
+                
+                if test_connection():
+                    # Save to config
+                    if not self.config.has_section('API_KEYS'):
+                        self.config.add_section('API_KEYS')
+                    
+                    self.config.set('API_KEYS', 'api_key', api_key)
+                    self.config.set('API_KEYS', 'secret', secret)
+                    
+                    with open('config.ini', 'w') as f:
+                        self.config.write(f)
+                    
+                    status_label.config(text="API keys saved successfully!", foreground="green")
+                    self.log_trade("API keys configured and saved")
+                    
+                    # Close window after short delay
+                    config_window.after(1500, config_window.destroy)
+            
+            # Buttons
             button_frame = ttk.Frame(frame)
-            button_frame.grid(row=3, column=0, columnspan=2, pady=15)
-
-            ttk.Button(button_frame, text="Test Connection", 
-                    command=lambda: self.test_api_connection(api_key_entry.get(), secret_key_entry.get())).pack(side=tk.LEFT, padx=5)
+            button_frame.grid(row=4, column=0, columnspan=2, pady=20)
+            
+            ttk.Button(button_frame, text="Test Connection", command=test_connection).pack(side=tk.LEFT, padx=5)
             ttk.Button(button_frame, text="Save", command=save_config).pack(side=tk.LEFT, padx=5)
             ttk.Button(button_frame, text="Cancel", command=config_window.destroy).pack(side=tk.LEFT, padx=5)
-
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create config window: {str(e)}")
 
@@ -723,6 +903,7 @@ class CryptoScalpingBot:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save config: {str(e)}")
             return False
+        
     def toggle_trading_mode(self):
         """Switch between paper and real trading with proper config handling"""
         try:
@@ -740,6 +921,7 @@ class CryptoScalpingBot:
 
             # Switching to real trading
             if not self.config.has_section('API_KEYS'):
+                self.log_trade("API_KEYS section missing in config.ini")
                 self.show_api_config()
                 return
 
@@ -747,23 +929,33 @@ class CryptoScalpingBot:
             secret = self.config.get('API_KEYS', 'secret', fallback='')
 
             if not api_key or not secret:
+                self.log_trade("API keys missing or empty in config.ini")
                 if messagebox.askyesno("API Keys Required", 
                                     "Real trading requires API keys. Configure now?"):
                     self.show_api_config()
                 return
 
-            # Test the connection
+            # Test the connection with proper error handling
             try:
+                self.log_trade("Testing API connection...")
                 test_exchange = ccxt.kraken({
                     'apiKey': api_key,
                     'secret': secret,
                     'enableRateLimit': True
                 })
                 test_exchange.fetch_balance()  # Test API call
+                self.log_trade("API connection successful")
             except Exception as e:
-                self.log_trade(f"API test failed: {str(e)}")
-                if messagebox.askyesno("Connection Failed", 
-                                    f"API test failed: {str(e)}\nReconfigure keys?"):
+                error_msg = str(e)
+                self.log_trade(f"API test failed: {error_msg}")
+                
+                if "apiKey" in error_msg:
+                    messagebox.showerror("API Error", 
+                                    "API key error. Please check your API keys are correctly formatted.")
+                else:
+                    messagebox.showerror("Connection Failed", f"API test failed: {error_msg}")
+                    
+                if messagebox.askyesno("Reconfigure Keys", "Would you like to reconfigure your API keys?"):
                     self.show_api_config()
                 return
 
@@ -771,12 +963,24 @@ class CryptoScalpingBot:
             self.is_paper_trading = False
             self.mode_var.set("Real Trading")
             self.update_status("Real Trading")
-            self.init_exchange()  # Reinitialize with verified keys
+            
+            # Reinitialize exchange with verified keys
+            self.exchange = ccxt.kraken({
+                'apiKey': api_key,
+                'secret': secret,
+                'enableRateLimit': True,
+                'options': {
+                    'adjustForTimeDifference': True,
+                },
+                'timeout': 30000,
+                'rateLimit': 1000,
+            })
             
             # Update balance display
             try:
                 balance = float(self.exchange.fetch_balance()['USD']['free'])
                 self.balance_label.config(text=f"Real Balance: ${balance:.2f}")
+                self.log_trade(f"Real balance: ${balance:.2f}")
             except Exception as e:
                 self.balance_label.config(text="Real Balance: Unavailable")
                 self.log_trade(f"Balance fetch error: {str(e)}")
@@ -804,6 +1008,9 @@ class CryptoScalpingBot:
                     # Test order endpoints with a dummy order (without actually placing it)
                     self.exchange.fetch_open_orders()
                     
+                    # Verify active trades against exchange data
+                    self.verify_active_trades()
+                    
                     self.log_trade("API keys verified successfully")
                     return True
                     
@@ -819,24 +1026,16 @@ class CryptoScalpingBot:
             messagebox.showerror("API Error", f"API key verification failed: {str(e)}")
             self.is_paper_trading = True  # Revert to paper trading
             self.mode_var.set("Paper Trading")
-            return False    
-    def toggle_bot(self):
-        """Start/stop the bot with full condition validation"""
+            return False   
+        
+    def start_bot(self):
+        """Start or stop the bot"""
         try:
             if not self.running:
                 # START SEQUENCE
-                if not self.validate_conditions():
-                    self.log_trade("Start aborted - invalid conditions")
+                if not self.validate_settings():
                     return
-
-                # Verify exchange connection
-                try:
-                    if not self.is_paper_trading:
-                        self.exchange.fetch_balance()  # Test connection
-                except Exception as e:
-                    messagebox.showerror("Connection Error", f"Exchange error: {str(e)}")
-                    return
-
+                
                 # Initialize tracking
                 self.start_time = datetime.now()
                 self.running = True
@@ -851,6 +1050,7 @@ class CryptoScalpingBot:
                 self.trading_thread = threading.Thread(target=self.run_bot, daemon=True)
                 self.trading_thread.start()
                 
+                # Use the comprehensive version at line 2735
                 self.price_monitor_thread = threading.Thread(
                     target=self.monitor_prices_continuously, 
                     daemon=True
@@ -858,7 +1058,7 @@ class CryptoScalpingBot:
                 self.price_monitor_thread.start()
                 
                 self.log_trade("=== BOT STARTED ===")
-
+                
             else:
                 # STOP SEQUENCE
                 self.running = False
@@ -982,7 +1182,7 @@ class CryptoScalpingBot:
             # Update instance variables
             self.maker_fee = maker_fee
             self.taker_fee = taker_fee
-            self.total_fee_percentage = taker_fee * 2  # Assuming both entry and exit are taker orders
+            self.total_fee_percentage = maker_fee + taker_fee  # Assuming both entry and exit are taker orders
             
             # Update the total fees label
             total_fee_pct = self.total_fee_percentage * 100
@@ -1016,6 +1216,17 @@ class CryptoScalpingBot:
                 
         except Exception as e:
             self.log_trade(f"Error updating status: {str(e)}")
+
+    def reset_paper_balance(self):
+        """Reset paper balance to initial value"""
+        self.paper_balance = 1000.0
+        self.total_profit = 0.0
+        self.total_fees = 0.0
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.update_balance_display()
+        self.log_trade("Paper balance reset to $1000.00")
 
     def setup_gui(self):
         """Setup the GUI with all parameters and dark mode support"""
@@ -1057,7 +1268,7 @@ class CryptoScalpingBot:
                 text=f"{'Paper' if self.is_paper_trading else 'Real'} Balance: ${self.paper_balance:.2f}")
             self.balance_label.grid(row=0, column=2, padx=20)
 
-            self.start_button = ttk.Button(mode_frame, text="Start", command=self.toggle_bot)
+            self.start_button = ttk.Button(mode_frame, text="Start", command=self.start_bot)
             self.start_button.grid(row=0, column=3, padx=5)
 
             self.status_label = ttk.Label(mode_frame, 
@@ -1069,10 +1280,30 @@ class CryptoScalpingBot:
 
             ttk.Button(mode_frame, text="API Config", 
                     command=self.show_api_config).grid(row=0, column=6, padx=5)
+            
+    # Add market override checkbox
+            self.market_override_var = tk.BooleanVar(value=False)
+            self.market_override_check = ttk.Checkbutton(
+                mode_frame, 
+                text="Ignore Market Conditions",
+                variable=self.market_override_var,
+                command=self.toggle_market_override
+            )
+            self.market_override_check.grid(row=1, column=0, columnspan=3, padx=5, pady=2, sticky="w")
 
             # Create notebook for parameter organization
             param_notebook = ttk.Notebook(control_frame)
             param_notebook.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+    
+            # Reset paper balance button
+            self.reset_balance_button = ttk.Button(
+                mode_frame,  # Use mode_frame instead of self.control_frame
+                text="Reset Balance",
+                command=self.reset_paper_balance
+            )
+            self.reset_balance_button.grid(row=0, column=7, padx=5)
+        
 
             # === BASIC PARAMETERS TAB ===
             basic_frame = ttk.Frame(param_notebook)
@@ -1296,6 +1527,13 @@ class CryptoScalpingBot:
                 command=self.close_all_positions)
             self.close_all_button.grid(row=0, column=3, padx=5)
 
+            self.verify_trades_button = ttk.Button(
+                control_frame, 
+                text="Verify Trades", 
+                command=self.verify_active_trades
+            )
+            self.verify_trades_button.grid(row=0, column=8, padx=5)
+
             # Chart Frame
             self.chart_frame = ttk.LabelFrame(left_column, text="Price Charts")
             self.chart_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
@@ -1385,7 +1623,7 @@ class CryptoScalpingBot:
             # Update instance variables
             self.maker_fee = maker_fee
             self.taker_fee = taker_fee
-            self.total_fee_percentage = taker_fee * 2  # Assuming both entry and exit are taker orders
+            self.total_fee_percentage = taker_fee + maker_fee  # Assuming both entry and exit are taker orders
             
             # Debug: Print the updated instance variables
             self.log_trade(f"DEBUG: self.maker_fee = {self.maker_fee}")
@@ -1547,67 +1785,57 @@ class CryptoScalpingBot:
             self.log_trade(f"Error adding tooltip: {str(e)}")
 
     def calculate_momentum_intensity(self, df):
-        """Calculate momentum intensity (Beta) - Trend strength"""
+        """Calculate momentum intensity (Beta)"""
         try:
             if df is None or len(df) < 5:
                 return 0.0
+                
+            # Calculate momentum over last 5 periods
+            price_changes = df['price'].pct_change().dropna()
+            if len(price_changes) < 5:
+                return 0.0
+                
+            # Get last 5 price changes
+            recent_changes = price_changes.tail(5)
             
-            df = df.copy()
-            df.sort_index(inplace=True)
+            # Calculate average absolute change
+            avg_abs_change = recent_changes.abs().mean() * 100
             
-            # Calculate returns
-            returns = df['price'].pct_change().fillna(0)
+            # Calculate direction consistency (all same direction)
+            direction_consistency = (recent_changes > 0).all() or (recent_changes < 0).all()
             
-            # Calculate short and long momentum
-            short_momentum = returns.rolling(window=5).mean()
-            long_momentum = returns.rolling(window=15).mean()
-            
-            # Calculate trend strength
-            trend_strength = abs(short_momentum.iloc[-1] - long_momentum.iloc[-1]) * 100
-            
-            # Log calculation details
-            self.log_trade(f"Momentum calculation details:")
-            self.log_trade(f"Recent returns: {returns.tail()}")
-            self.log_trade(f"Short momentum: {short_momentum.iloc[-1]:.8f}")
-            self.log_trade(f"Long momentum: {long_momentum.iloc[-1]:.8f}")
-            self.log_trade(f"Trend strength: {trend_strength:.8f}")
-            
-            # Normalize to 0-1 range
-            result = min(trend_strength, 1.0)
-            return max(result, 0.0)
+            # Boost if consistent direction
+            if direction_consistency:
+                avg_abs_change *= 1.5
+                
+            return min(avg_abs_change, 1.0)  # Cap at 1.0
             
         except Exception as e:
-            self.log_trade(f"Error in momentum calculation: {str(e)}")
+            self.log_trade(f"Error calculating momentum intensity: {str(e)}")
             return 0.0
         
     def calculate_momentum_quality(self, df):
-        """Calculate momentum quality (Theta) - Stability of momentum"""
+        """Calculate momentum quality (Theta)"""
         try:
             if df is None or len(df) < 5:
-                self.log_trade("Insufficient data for momentum quality calculation")
-                return 1.0  # Default to high instability if data is insufficient
-
-            df = df.copy()
-            df.sort_index(inplace=True)
-
-            # Calculate 5-period momentum (percentage change over 5 periods)
-            momentum = df['price'].pct_change(periods=5).fillna(0)
-
-            # Calculate stability as the standard deviation of momentum over the last 5 periods
-            momentum_stability = momentum.rolling(window=5).std().iloc[-1] * 100
-
-            # Log calculation details
-            self.log_trade(f"Momentum quality details:")
-            self.log_trade(f"Recent momentum: {momentum.tail()}")
-            self.log_trade(f"Momentum stability: {momentum_stability:.8f}")
-
-            # Normalize to 0-1 range
-            result = min(momentum_stability, 1.0)
-            return max(result, 0.0)
-
+                return 1.0  # Default to high instability
+                
+            # Calculate momentum
+            momentum = df['price'].pct_change().dropna()
+            if len(momentum) < 5:
+                return 1.0
+                
+            # Calculate stability as standard deviation
+            stability = momentum.rolling(window=5).std().iloc[-1] * 100
+            
+            # Normalize to 0-1 range (lower is better)
+            normalized_stability = min(stability, 1.0)
+            
+            return normalized_stability
+            
         except Exception as e:
-            self.log_trade(f"Error in momentum quality calculation: {str(e)}")
-            return 1.0  # Default to high instability on error
+            self.log_trade(f"Error calculating momentum quality: {str(e)}")
+            return 1.0  # Default to high instability
     
     def calculate_price_acceleration(self, df):
         """Calculate price acceleration (Alpha)"""
@@ -1615,56 +1843,102 @@ class CryptoScalpingBot:
             if df is None or len(df) < 5:
                 return 0.0
                 
-            df = df.copy()
-            df.sort_index(inplace=True)
+            # Get price changes
+            price_changes = df['price'].pct_change().dropna()
+            if len(price_changes) < 5:
+                return 0.0
+                
+            # Calculate acceleration as change in momentum
+            momentum_changes = price_changes.diff().dropna()
+            if len(momentum_changes) < 3:
+                return 0.0
+                
+            # Get recent momentum changes
+            recent_accel = momentum_changes.tail(3)
             
-            # Calculate price changes and acceleration
-            price_changes = df['price'].pct_change().fillna(0)
-            acceleration = price_changes.diff().fillna(0)
+            # Calculate average acceleration
+            avg_accel = recent_accel.mean() * 100
             
-            # Use recent acceleration (last 5 periods)
-            recent_acceleration = acceleration.tail(5).mean() * 100
+            # Normalize to 0-1 range
+            normalized_accel = min(abs(avg_accel) * 10, 1.0)
             
-            self.log_trade(f"Price acceleration details:")
-            self.log_trade(f"Recent price changes: {price_changes.tail()}")
-            self.log_trade(f"Recent acceleration: {recent_acceleration:.8f}")
-            
-            # Normalize
-            result = min(abs(recent_acceleration), 1.0)
-            return result
+            return normalized_accel
             
         except Exception as e:
-            self.log_trade(f"Error in acceleration calculation: {str(e)}")
+            self.log_trade(f"Error calculating price acceleration: {str(e)}")
             return 0.0
+
+    def calculate_volatility(self, df):
+        """Calculate price volatility as percentage"""
+        try:
+            if df is None or len(df) < 10:
+                return 0
+                
+            # Use close or price column
+            price_col = 'close' if 'close' in df.columns else 'price'
+            
+            if price_col not in df.columns:
+                return 0
+                
+            # Calculate standard deviation of returns
+            returns = df[price_col].pct_change().dropna()
+            
+            # Return annualized volatility
+            return returns.std() * 100
+                
+        except Exception as e:
+            self.log_trade(f"Error calculating volatility: {str(e)}")
+            return 0
+
+    def update_market_condition_display(self):
+        """Update the UI with current market condition information"""
+        try:
+            # Get current market conditions
+            market = self.analyze_market_conditions()
+            
+            # Format the display text
+            if market['state'] == 'bearish':
+                condition_text = f"BEARISH (Strength: {market['strength']:.2f})"
+                color = "red"
+            elif market['state'] == 'bullish':
+                condition_text = f"BULLISH (Strength: {market['strength']:.2f})"
+                color = "green"
+            else:
+                condition_text = f"NEUTRAL (Strength: {market['strength']:.2f})"
+                color = "yellow"
+                
+            # Update the label if it exists
+            if hasattr(self, 'market_condition_label'):
+                self.market_condition_label.config(text=f"Market: {condition_text}", fg=color)
+            
+            # Log the update
+            self.log_trade(f"Market condition updated: {condition_text}")
+            
+        except Exception as e:
+            self.log_trade(f"Error updating market condition display: {str(e)}")
 
     def calculate_volatility_sensitivity(self, df):
         """Calculate volatility sensitivity (Vega)"""
         try:
             if df is None or len(df) < 5:
-                return 0.0
+                return 1.0  # Default to high volatility
                 
-            df = df.copy()
-            df.sort_index(inplace=True)
+            # Calculate returns
+            returns = df['price'].pct_change().dropna()
+            if len(returns) < 5:
+                return 1.0
+                
+            # Calculate volatility as standard deviation
+            volatility = returns.rolling(window=5).std().iloc[-1] * 100
             
-            # Calculate rolling volatility using standard deviation
-            returns = df['price'].pct_change().fillna(0)
-            volatility = returns.rolling(window=5).std()
+            # Normalize to 0-1 range
+            normalized_volatility = min(volatility, 1.0)
             
-            # Calculate volatility change
-            vol_change = volatility.pct_change().fillna(0)
-            recent_vol_change = abs(vol_change.tail(5).mean()) * 100
-            
-            self.log_trade(f"Volatility details:")
-            self.log_trade(f"Recent volatility: {volatility.tail()}")
-            self.log_trade(f"Recent vol change: {recent_vol_change:.8f}")
-            
-            # Normalize
-            result = min(recent_vol_change, 1.0)
-            return result
+            return normalized_volatility
             
         except Exception as e:
-            self.log_trade(f"Error in volatility calculation: {str(e)}")
-            return 0.0
+            self.log_trade(f"Error calculating volatility: {str(e)}")
+            return 1.0  # Default to high volatility
 
     def calculate_volume_impact(self, df, current_volume):
         """Calculate volume impact (Rho)"""
@@ -1672,74 +1946,59 @@ class CryptoScalpingBot:
             if df is None or len(df) < 5:
                 return 0.0
                 
-            df = df.copy()
-            df.sort_index(inplace=True)
-            
             # Calculate average volume
-            avg_volume = df['volume'].rolling(window=5).mean().fillna(0)
-            if avg_volume.iloc[-1] == 0:
+            avg_volume = df['volume'].mean()
+            if avg_volume == 0:
                 return 0.0
                 
             # Calculate volume ratio
-            volume_ratio = current_volume / avg_volume.iloc[-1]
+            volume_ratio = current_volume / avg_volume
             
-            # Calculate excess volume
-            excess_volume = max(0, volume_ratio - 1)
+            # Normalize to 0-1 range
+            normalized_ratio = min(volume_ratio, 1.0)
             
-            self.log_trade(f"Volume impact details:")
-            self.log_trade(f"Current volume: {current_volume}")
-            self.log_trade(f"Average volume: {avg_volume.iloc[-1]}")
-            self.log_trade(f"Volume ratio: {volume_ratio:.8f}")
-            
-            # Normalize
-            result = min(excess_volume, 1.0)
-            return result
+            return normalized_ratio
             
         except Exception as e:
-            self.log_trade(f"Error in volume impact calculation: {str(e)}")
+            self.log_trade(f"Error calculating volume impact: {str(e)}")
             return 0.0
 
     def calculate_current_momentum(self, df):
-        """Calculate current momentum percentage"""
+        """Calculate current price momentum"""
         try:
-            # Add debug logging
-            recent_prices = df['price'].tail(5)
-            self.log_trade(f"Recent prices for momentum calc: {recent_prices}")
-            momentum = ((recent_prices.iloc[-1] - recent_prices.iloc[0]) / recent_prices.iloc[0]) * 100
-            self.log_trade(f"Calculated momentum: {momentum}")
+            if df is None or len(df) < 2:
+                return 0.0
+                
+            # Calculate percentage change between last two prices
+            last_price = df['price'].iloc[-1]
+            prev_price = df['price'].iloc[-2]
+            
+            momentum = ((last_price - prev_price) / prev_price) * 100
             return momentum
+            
         except Exception as e:
             self.log_trade(f"Error calculating momentum: {str(e)}")
-            return 0
+            return 0.0
 
     def advanced_checks(self, symbol, df):
         """Advanced market checks including order book analysis and RSI"""
         try:
             # 1. EMA Cross (5/15)
-            short_period = int(self.ema_short.get()) if hasattr(self, 'ema_short') else 5
-            long_period = int(self.ema_long.get()) if hasattr(self, 'ema_long') else 15
-            
-            ema_short_col = f'ema_{short_period}'
-            ema_long_col = f'ema_{long_period}'
-            
-            # Use default columns if specific ones not available
-            if ema_short_col not in df.columns:
-                ema_short_col = 'ema_5'
-            if ema_long_col not in df.columns:
-                ema_long_col = 'ema_15'
-                
-            # Check for bullish EMA cross
-            if len(df) >= 2 and ema_short_col in df.columns and ema_long_col in df.columns:
-                ema_cross = (df[ema_short_col].iloc[-2] < df[ema_long_col].iloc[-2]) and \
-                            (df[ema_short_col].iloc[-1] > df[ema_long_col].iloc[-1])
+            if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
+                ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
+                            (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+                self.log_trade(f"EMA Cross check for {symbol}: {'Bullish' if ema_cross else 'No cross'}")
             else:
+                self.log_trade(f"Insufficient EMA data for {symbol}")
                 ema_cross = False
             
             # 2. Volume-Weighted Momentum
             if 'price' in df.columns and 'volume' in df.columns and len(df) >= 5:
                 vwap = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
                 vwm = (vwap.iloc[-1] - vwap.iloc[-5]) / vwap.iloc[-5] * 100
+                self.log_trade(f"Volume-Weighted Momentum for {symbol}: {vwm:.2f}%")
             else:
+                self.log_trade(f"Insufficient data for VWAP calculation for {symbol}")
                 vwm = 0
             
             # 3. Order Book Imbalance
@@ -1748,6 +2007,7 @@ class CryptoScalpingBot:
                 bid_vol = sum(x[1] for x in ob['bids'][:3])
                 ask_vol = sum(x[1] for x in ob['asks'][:3])
                 ob_ratio = bid_vol / (ask_vol + 0.0001)  # Avoid division by zero
+                self.log_trade(f"Order Book Imbalance for {symbol}: {ob_ratio:.2f}")
             except Exception as e:
                 self.log_trade(f"Order book fetch error: {str(e)}")
                 ob_ratio = 1.0  # Neutral value on error
@@ -1756,63 +2016,90 @@ class CryptoScalpingBot:
             rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
             rsi_column = f'rsi_{rsi_period}'
             
-            if rsi_column in df.columns and not pd.isna(df[rsi_column].iloc[-1]):
+            # Check if RSI column exists and has valid data
+            if rsi_column in df.columns:
                 rsi_value = df[rsi_column].iloc[-1]
+                
+                # Check if RSI is a valid number
+                if pd.isna(rsi_value):
+                    self.log_trade(f"RSI value is NaN for {symbol}, calculating directly")
+                    
+                    # Calculate RSI directly if it's NaN
+                    if len(df) >= rsi_period + 1:
+                        delta = df['price'].diff().dropna()
+                        gains = delta.where(delta > 0, 0)
+                        losses = -delta.where(delta < 0, 0)
+                        
+                        avg_gain = gains.rolling(window=rsi_period).mean().iloc[-1]
+                        avg_loss = losses.rolling(window=rsi_period).mean().iloc[-1]
+                        
+                        # Avoid division by zero
+                        if avg_loss == 0:
+                            rsi_value = 100
+                        else:
+                            rs = avg_gain / avg_loss
+                            rsi_value = 100 - (100 / (1 + rs))
+                        
+                        # Update the DataFrame with the calculated value
+                        df.at[df.index[-1], rsi_column] = rsi_value
+                        self.price_data[symbol] = df
+                        
+                        self.log_trade(f"Directly calculated RSI for {symbol}: {rsi_value:.2f}")
+                    else:
+                        self.log_trade(f"Insufficient data to calculate RSI for {symbol}")
+                        return False
                 
                 rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
                 rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
                 
-                # Avoid overbought conditions
+                # Avoid overbought conditions (RSI > overbought threshold)
                 if rsi_value > rsi_overbought:
                     self.log_trade(f"Rejected {symbol}: RSI indicates overbought condition ({rsi_value:.2f} > {rsi_overbought})")
                     return False
                 
-                rsi_condition = True
+                self.log_trade(f"RSI for {symbol}: {rsi_value:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
             else:
-                self.log_trade(f"RSI data not available for {symbol}")
-                rsi_value = 50  # Neutral value
-                rsi_condition = False
+                self.log_trade(f"RSI column {rsi_column} not found in DataFrame for {symbol}")
+                return False
             
-            self.log_trade(f"Advanced checks for {symbol}:")
+            self.log_trade(f"Advanced checks passed for {symbol}:")
             self.log_trade(f"- EMA Cross: {ema_cross}")
             self.log_trade(f"- VWAP Momentum: {vwm:.2f}%")
             self.log_trade(f"- Order Book Ratio: {ob_ratio:.2f}")
-            self.log_trade(f"- RSI: {rsi_value:.2f}")
+            self.log_trade(f"- RSI: {rsi_value:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
             
-            # Determine result based on multiple conditions
-            conditions_met = [
+            return all([
                 ema_cross,          # EMA crossover
                 vwm > 0.2,          # Min 0.2% VWAP rise
                 ob_ratio > 1.5,     # Bids > Asks by 50%
-                rsi_condition       # RSI not overbought
-            ]
-            
-            # Require at least 3 of 4 conditions to be met
-            result = sum(conditions_met) >= 3
-            self.log_trade(f"Advanced checks result: {result} ({sum(conditions_met)}/4 conditions met)")
-            return result
-            
+                True                # RSI check already handled above
+            ])
+        
         except Exception as e:
             self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
             return False
-            self.log_trade(f"Calculated momentum: {momentum}")
-            return momentum
-        except Exception as e:
-            self.log_trade(f"Error calculating momentum: {str(e)}")
-            return 0
 
     def calculate_volume_increase(self, df):
         """Calculate volume increase percentage"""
         try:
-            # Compare current volume to average
-            current_volume = df['volume'].iloc[-1]
-            avg_volume = df['volume'].tail(10).mean()  # 10-period average
-            volume_increase = ((current_volume - avg_volume) / avg_volume) * 100
+            if df is None or len(df) < 2:
+                return 0.0
+                
+            # Calculate percentage change between last two volumes
+            last_volume = df['volume'].iloc[-1]
+            prev_volume = df['volume'].iloc[-2]
+            
+            if prev_volume == 0:
+                return 0.0
+                
+            volume_increase = ((last_volume - prev_volume) / prev_volume) * 100
             return volume_increase
+            
         except Exception as e:
             self.log_trade(f"Error calculating volume increase: {str(e)}")
-            return 0
-        
+            return 0.0
+
+
     def validate_parameters(self):
         """Validate all trading parameters"""
         try:
@@ -2046,62 +2333,97 @@ class CryptoScalpingBot:
                 self.log_trade(f"Error updating timer: {str(e)}")
 
     def update_chart(self):
-        """Update the chart with current price data"""
+        """Update the price chart with active trades"""
         try:
-            if not hasattr(self, 'fig') or self.fig is None:
-                return
-                    
             self.ax.clear()
             
-            # Theme colors
-            bg_color = '#2d2d2d' if self.night_mode else 'white'
-            fg_color = 'white' if self.night_mode else 'black'
-            grid_color = '#3d3d3d' if self.night_mode else '#cccccc'
-            
-            self.ax.set_facecolor(bg_color)
-            self.ax.tick_params(axis='both', colors=fg_color)
-            self.ax.grid(True, color=grid_color, linestyle='--', alpha=0.5)
-            
-            has_data = False
+            if not self.active_trades:
+                self.ax.set_title("No Active Trades")
+                self.ax.set_xlabel("Time")
+                self.ax.set_ylabel("Price Change (%)")
+                self.ax.grid(True, alpha=0.3)
+                self.canvas.draw()
+                return
             
             # Plot each active trade
             for trade_id, trade in self.active_trades.items():
-                if trade['symbol'] in self.price_history:
-                    history = self.price_history[trade['symbol']]
-                    if len(history) > 1:
-                        times, prices = zip(*history)
-                        
-                        # Calculate percentage change from entry
-                        entry_price = trade['entry_price']
-                        prices_pct = [(p - entry_price) / entry_price * 100 for p in prices]
-                        
-                        # Plot with timestamp x-axis
-                        self.ax.plot(times, prices_pct, 
-                                label=f"{trade['symbol']} ({prices_pct[-1]:.2f}%)",
-                                linewidth=1.5)
-                        
-                        has_data = True
-            
-            if has_data:
-                # Format axes
-                self.ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
-                self.ax.set_xlabel('Time', color=fg_color)
-                self.ax.set_ylabel('Price Change (%)', color=fg_color)
+                symbol = trade['symbol']
                 
-                # Add legend
-                self.ax.legend(loc='upper left')
+                # Ensure we have price history for this symbol
+                if symbol not in self.price_history or len(self.price_history[symbol]) < 2:
+                    # If no history, create a starting point
+                    if symbol not in self.price_history:
+                        self.price_history[symbol] = []
+                    
+                    # Add current point if we have it
+                    if 'current_price' in trade:
+                        current_time = datetime.now()
+                        entry_time = trade.get('entry_time', current_time - timedelta(seconds=10))
+                        
+                        # Add entry point
+                        self.price_history[symbol].append((entry_time, trade['entry_price']))
+                        
+                        # Add current point
+                        self.price_history[symbol].append((current_time, trade['current_price']))
+                        
+                        self.log_trade(f"Created initial price history for {symbol} with {len(self.price_history[symbol])} points")
                 
-                # Draw profit target and stop loss lines
-                self.ax.axhline(y=float(self.profit_target.get()), 
-                            color='green', linestyle=':', alpha=0.5)
-                self.ax.axhline(y=-float(self.stop_loss.get()), 
-                            color='red', linestyle=':', alpha=0.5)
+                # Now plot if we have data
+                if symbol in self.price_history and len(self.price_history[symbol]) >= 2:
+                    # Extract times and prices
+                    times = [p[0] for p in self.price_history[symbol]]
+                    prices = [p[1] for p in self.price_history[symbol]]
+                    
+                    # Calculate percentage change from entry
+                    entry_price = trade['entry_price']
+                    price_changes = [(price - entry_price) / entry_price * 100 for price in prices]
+                    
+                    # Convert times to numeric for plotting
+                    time_nums = mdates.date2num(times)
+                    
+                    # Plot with proper formatting
+                    self.ax.plot(time_nums, price_changes, label=f"{symbol} ({price_changes[-1]:.2f}%)")
+                    
+                    # Format x-axis as times
+                    self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+                    self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
             
-            # Draw
+            # Add horizontal lines for profit target and stop loss
+            try:
+                profit_target = float(self.profit_target.get())
+                stop_loss = float(self.stop_loss.get())
+                
+                self.ax.axhline(y=profit_target, color='g', linestyle='--', alpha=0.5, label=f"Target: {profit_target}%")
+                self.ax.axhline(y=-stop_loss, color='r', linestyle='--', alpha=0.5, label=f"Stop: -{stop_loss}%")
+            except:
+                pass
+            
+            self.ax.set_title("Active Trades (% Change from Entry)")
+            self.ax.set_xlabel("Time")
+            self.ax.set_ylabel("Price Change (%)")
+            self.ax.legend(loc='upper left')
+            self.ax.grid(True, alpha=0.3)
+            
+            # Set reasonable y-axis limits
+            try:
+                profit_target = float(self.profit_target.get())
+                stop_loss = float(self.stop_loss.get())
+                
+                # Set y-axis limits to show a reasonable range around profit target and stop loss
+                self.ax.set_ylim(
+                    min(-stop_loss * 1.5, -1),  # At least show -1%
+                    max(profit_target * 1.5, 1)   # At least show +1%
+                )
+            except:
+                # Default limits if we can't get profit target and stop loss
+                self.ax.set_ylim(-2, 2)  # Default to ±2% range
+            
+            # Format the plot for better readability
+            self.fig.tight_layout()
             self.canvas.draw()
             
         except Exception as e:
-            self.log_trade(f"Chart update error: {str(e)}")
+            self.log_trade(f"Error updating chart: {str(e)}")
 
     def _update_chart_internal(self):
         """Internal chart update method that runs on main thread"""
@@ -2366,23 +2688,59 @@ class CryptoScalpingBot:
     def update_balance_display(self):
         try:
             if self.is_paper_trading:
-                balance = self.paper_balance
-            else:
-                balance = float(self.exchange.fetch_balance()['USD']['free'])
-            
-            self.balance_label.config(
-                text=f"{'Paper' if self.is_paper_trading else 'Real'} Balance: ${balance:.2f}")
-            
-            # Check for low balance
-            if balance < self.min_balance_threshold:
-                self.balance_label.config(foreground='red')
-            elif balance < self.min_balance_threshold * 2:
-                self.balance_label.config(foreground='orange')
-            else:
-                self.balance_label.config(foreground='black')
+                # Calculate allocated balance (sum of position sizes in active trades)
+                allocated_balance = sum(float(trade.get('position_size', 0)) for trade in self.active_trades.values())
                 
+                # Calculate unrealized profit/loss
+                unrealized_pnl = 0
+                for trade in self.active_trades.values():
+                    entry_price = float(trade.get('entry_price', 0))
+                    current_price = float(trade.get('current_price', entry_price))
+                    position_size = float(trade.get('position_size', 0))
+                    
+                    if entry_price > 0:
+                        price_change = (current_price - entry_price) / entry_price
+                        unrealized_pnl += position_size * price_change
+                
+                # Calculate total balance (paper balance + unrealized P/L)
+                total_balance = self.paper_balance
+                
+                # Update the balance label
+                self.balance_label.config(
+                    text=f"Paper Balance: ${total_balance:.2f} (Allocated: ${allocated_balance:.2f})")
+                
+                # Log detailed balance breakdown
+                self.log_trade(f"""
+                Balance Breakdown:
+                Paper Balance: ${self.paper_balance:.2f}
+                Allocated in Trades: ${allocated_balance:.2f}
+                Unrealized P/L: ${unrealized_pnl:.2f}
+                Total Balance: ${total_balance:.2f}
+                """)
+                
+                # Check for low balance
+                if total_balance < self.min_balance_threshold:
+                    self.balance_label.config(foreground='red')
+                elif total_balance < self.min_balance_threshold * 2:
+                    self.balance_label.config(foreground='orange')
+                else:
+                    self.balance_label.config(foreground='black')
+            else:
+                # Real trading balance
+                balance = float(self.exchange.fetch_balance()['USD']['free'])
+                self.balance_label.config(text=f"Real Balance: ${balance:.2f}")
+                
+                # Check for low balance
+                if balance < self.min_balance_threshold:
+                    self.balance_label.config(foreground='red')
+                elif balance < self.min_balance_threshold * 2:
+                    self.balance_label.config(foreground='orange')
+                else:
+                    self.balance_label.config(foreground='black')
+                    
         except Exception as e:
             self.log_trade(f"Error updating balance display: {str(e)}")
+
     def live_update_conditions(self):
         """Apply condition changes without restarting the bot"""
         if not self.validate_conditions():
@@ -2458,71 +2816,22 @@ class CryptoScalpingBot:
         except ValueError as e:
             self.log_trade(f"Settings validation failed: {str(e)}")
             raise ValueError(f"Invalid settings: {str(e)}")
+        
     def monitor_prices_continuously(self):
-        """Enhanced version with dynamic condition checking"""
+        """Monitor active trades and manage trailing stops"""
         while self.running:
             try:
-                # Get current parameter values
-                current_conditions = {
-                    'max_spread': float(self.max_spread.get()) / 100,
-                    'volume_increase': float(self.volume_increase.get()) / 100,
-                    'profit_target': float(self.profit_target.get()) / 100,
-                    'stop_loss': float(self.stop_loss.get()) / 100,
-                    'trailing_stop': float(self.trailing_stop.get()) / 100,
-                    'trailing_activation': float(self.trailing_activation.get()) / 100
-                }
-                
-                for trade_id, trade in list(self.active_trades.items()):
-                    try:
-                        ticker = self.exchange.fetch_ticker(trade['symbol'])
-                        current_price = ticker['last']
-                        
-                        # Calculate profit percentage
-                        entry_price = trade['entry_price']
-                        profit_pct = (current_price - entry_price) / entry_price
-                        
-                        # Update highest profit if needed
-                        highest_profit = trade.get('highest_profit', 0)
-                        if profit_pct > highest_profit:
-                            self.active_trades[trade_id]['highest_profit'] = profit_pct
-                            highest_profit = profit_pct
-                        
-                        # Check if current market violates our updated conditions
-                        spread = (ticker['ask'] - ticker['bid']) / ticker['bid']
-                        if spread > current_conditions['max_spread'] * 1.5:  # 50% buffer
-                            self.close_trade(trade_id, trade, ticker['last'], "spread violation")
-                            continue
-                        
-                        # Check stop loss (dynamic)
-                        if profit_pct <= -current_conditions['stop_loss']:
-                            self.close_trade(trade_id, trade, current_price, "stop loss")
-                            continue
-                        
-                        # Check profit target (dynamic)
-                        if profit_pct >= current_conditions['profit_target']:
-                            self.close_trade(trade_id, trade, current_price, "profit target")
-                            continue
-                        
-                        # Check trailing stop (dynamic)
-                        if highest_profit >= current_conditions['trailing_activation']:
-                            drop = highest_profit - profit_pct
-                            if drop >= current_conditions['trailing_stop']:
-                                self.close_trade(trade_id, trade, current_price, "trailing stop")
-                                continue
-                        
-                        # Update trade data for analysis
-                        self.active_trades[trade_id]['current_price'] = current_price
-                        self.active_trades[trade_id]['profit_pct'] = profit_pct * 100  # Store as percentage
-                        
-                    except Exception as e:
-                        self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
-                
-                # Check memory usage periodically
-                self.check_memory_usage()
+                # Skip if no active trades
+                if not self.active_trades:
+                    time.sleep(1)
+                    continue
+                    
+                # Use the monitor_trades function
+                self.monitor_trades()
                 
                 # Sleep to avoid excessive API calls
-                time.sleep(0.1)  # Faster monitoring interval
-                
+                time.sleep(5)  # Check every 5 seconds
+                    
             except Exception as e:
                 self.log_trade(f"Monitoring error: {str(e)}")
                 time.sleep(1)
@@ -2691,76 +3000,136 @@ class CryptoScalpingBot:
             self.log_trade(f"Error formatting Kraken symbol: {str(e)}")
             return None
 
-    def scan_opportunities(self):
+    def get_market_pairs(self):
+        """Get market pairs with volume filtering"""
         try:
-            self.log_trade("\n=== Starting New Market Scan ===")
-            scan_start_time = time.time()
+            self.log_trade("Fetching market pairs...")
             
-            # Get all tickers with timeout
-            try:
-                self.update_status("Fetching market data...")
-                all_tickers = self.exchange.fetch_tickers()
-                if not all_tickers:
-                    self.log_trade("Error: No tickers returned from exchange")
-                    return False
-                self.log_trade(f"Successfully fetched {len(all_tickers)} total pairs")
-            except Exception as e:
-                self.log_trade(f"Error fetching tickers: {str(e)}")
-                return False
-
-            # Filter USD pairs first
-            usd_pairs = {symbol: ticker for symbol, ticker in all_tickers.items() 
-                        if symbol.endswith('/USD')}
-            self.log_trade(f"Found {len(usd_pairs)} USD pairs")
-
-            # Process valid pairs
+            # Fetch tickers with retry mechanism
+            tickers = self.fetch_tickers_with_retry()
+            if not tickers:
+                self.log_trade("Failed to fetch tickers")
+                return []
+                
+            self.log_trade(f"Fetched {len(tickers)} tickers")
+            
+            # Filter for USD pairs under $5
             valid_pairs = []
-            for symbol, ticker in usd_pairs.items():
+            for symbol, ticker in tickers.items():
                 try:
-                    # Basic price check first
-                    if 'last' not in ticker or ticker['last'] is None:
+                    # Basic filtering
+                    if not symbol.endswith('/USD'):
                         continue
                         
-                    price = float(ticker['last'])
-                    if not (0.00001 <= price <= 5.0):
+                    # Skip pairs with invalid data
+                    if not self.validate_ticker(ticker):
                         continue
-
-                    processed = self.process_ticker(symbol, ticker)
-                    if processed:
-                        valid_pairs.append(processed)
+                        
+                    # Extract price and volume
+                    price = float(ticker['last'])
+                    volume = float(ticker.get('quoteVolume', 0))
+                    
+                    # Apply price and volume filters
+                    if price <= 0 or price > 5.0:
+                        continue
+                        
+                    min_volume = float(self.min_volume_entry.get()) if hasattr(self, 'min_volume_entry') else 50
+                    if volume < min_volume:
+                        continue
+                    
+                    # Process ticker data
+                    pair_data = self.process_ticker(symbol, ticker)
+                    if pair_data:
+                        valid_pairs.append(pair_data)
                         
                 except Exception as e:
-                    self.log_trade(f"Error processing {symbol}: {str(e)}")
                     continue
-
-            # Log results
-            if not valid_pairs:
-                self.log_trade("No valid pairs found matching criteria")
-                return False
-
-            self.log_trade(f"\nFound {len(valid_pairs)} valid pairs under $5")
-
-            # Sort and get top pairs
-            valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
-            top_size = int(self.top_list_size.get())
-            top_pairs = valid_pairs[:top_size]
+                    
+            self.log_trade(f"Found {len(valid_pairs)} valid pairs")
+            return valid_pairs
             
-            self.log_trade("\nTop pairs by volume:")
-            for pair in top_pairs:
-                self.log_trade(
-                    f"{pair['symbol']}: ${pair['price']:.6f}, "
-                    f"Vol: ${pair['volume']:,.2f}, "
-                    f"Spread: {pair['spread']:.2f}%"
-                )
-
-            # Log scan duration
-            scan_duration = time.time() - scan_start_time
-            self.log_trade(f"\nScan completed in {scan_duration:.2f} seconds")
-            
-            return self.analyze_pairs(top_pairs)
-
         except Exception as e:
-            self.log_trade(f"Critical error in market scan: {str(e)}")
+            self.log_trade(f"Error getting market pairs: {str(e)}")
+            return []
+
+    def scan_opportunities(self):
+        """Scan for trading opportunities with improved filtering"""
+        try:
+            self.log_trade("==== SCANNING FOR OPPORTUNITIES ====")
+            trades_executed = False
+            
+            # Get market pairs with volume filtering
+            pairs = self.get_market_pairs()
+            
+            # Skip if no pairs found
+            if not pairs:
+                self.log_trade("No valid pairs found")
+                return False
+                
+            # Limit number of pairs to evaluate to avoid excessive API calls
+            max_pairs_to_evaluate = 20
+            
+            # Sort pairs by volume (descending) and take top N
+            pairs.sort(key=lambda x: x.get('volume', 0), reverse=True)
+            pairs = pairs[:max_pairs_to_evaluate]
+            
+            # Check if market override is active
+            market_override = hasattr(self, 'market_override_var') and self.market_override_var.get()
+            
+            # If we already have max trades, don't bother scanning
+            max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 5
+            if len(self.active_trades) >= max_trades:
+                self.log_trade(f"Maximum trades ({max_trades}) already active, skipping scan")
+                return False
+            
+            # Process each pair
+            for pair_data in pairs:
+                try:
+                    symbol = pair_data['symbol']
+                    
+                    # Skip if already trading this pair
+                    if any(trade['symbol'] == symbol for trade in self.active_trades.values()):
+                        self.log_trade(f"Already trading {symbol}, skipping")
+                        continue
+                    
+                    # Apply market-based filtering unless override is active
+                    if market_override:
+                        self.log_trade(f"[OK] Market override ACTIVE - bypassing market-based filtering for {symbol}")
+                    else:
+                        # Check if market conditions are favorable
+                        market_conditions = self.analyze_market_conditions()
+                        if market_conditions['state'] == 'bearish':
+                            self.log_trade(f"Bearish market detected, skipping {symbol}")
+                            continue
+                    
+                    # Apply smart trade filter (this will be bypassed internally if override is active)
+                    self.log_trade(f"Evaluating {symbol}...")
+                    if not self.smart_trade_filter(pair_data):
+                        self.log_trade(f"Smart filter rejected {symbol}")
+                        continue
+                        
+                    # Execute trade if it passes all filters
+                    self.log_trade(f"[OK] {symbol} passed all filters, executing trade...")
+                    if self.execute_trade(pair_data):
+                        self.log_trade(f"[OK] Successfully executed trade for {symbol}")
+                        trades_executed = True
+                        
+                        # If we've reached max trades, stop scanning
+                        if len(self.active_trades) >= max_trades:
+                            self.log_trade(f"Maximum trades ({max_trades}) reached, stopping scan")
+                            break
+                    else:
+                        self.log_trade(f"[!] Failed to execute trade for {symbol}")
+                
+                except Exception as e:
+                    self.log_trade(f"Error evaluating {symbol}: {str(e)}")
+                    continue
+            
+            self.log_trade("==== SCAN COMPLETE ====")
+            return trades_executed
+            
+        except Exception as e:
+            self.log_trade(f"Error scanning opportunities: {str(e)}")
             return False
 
     def quick_filter(self, ticker: dict) -> bool:
@@ -2768,18 +3137,19 @@ class CryptoScalpingBot:
         try:
             if not self.validate_ticker(ticker):
                 return False
+            
+            # Extract basic values
             price = float(ticker['last'])
-            volume = float(ticker['quoteVolume'])
-            spread = (float(ticker['ask']) - float(ticker['bid'])) / float(ticker['bid'])
-            max_spread = float(self.max_spread.get()) / 100  # Convert percentage to decimal
+            volume = float(ticker['quoteVolume']) if 'quoteVolume' in ticker else 0
+            
+            # Simple, permissive filter that should allow many pairs through
             return (
-                price <= 5.0 and                         # Price under $5
-                price > 0.00001 and                      # Avoid extremely low prices
-                volume >= float(self.min_volume_entry.get()) and  # Minimum volume
-                spread < max_spread and                  # Use user-defined max spread
-                ticker['bid'] > 0 and ticker['ask'] > 0  # Valid bid/ask
+                price > 0 and                # Valid price
+                price <= 5.0 and           # Price under $5
+                volume > 0 and               # Any volume
+                '/USD' in ticker['symbol']   # USD pair
             )
-        except:
+        except Exception as e:
             return False
 
     def get_cached_price(self, symbol: str) -> Dict:
@@ -2803,23 +3173,24 @@ class CryptoScalpingBot:
         try:
             if not self.validate_ticker(ticker, symbol):
                 return None
-                
+                    
             price = float(ticker['last'])
             volume = float(ticker['quoteVolume'])
             bid = float(ticker['bid'])
             ask = float(ticker['ask'])
-            
+                
             # Update price data
             self.data_manager.update_price_data(symbol, ticker)
-            
+                
             # Get current data points
-            df = self.data_manager.price_data.get(symbol)
+            df = self.data_manager.get_price_data(symbol)
             if df is not None:
                 data_points = len(df)
-                self.log_trade(f"Updated {symbol} data: {data_points} points collected")
-            
+                min_required = self.data_manager.min_data_points
+                self.log_trade(f"Updated {symbol} data: {data_points}/{min_required} points collected")
+                
             spread = (ask - bid) / bid * 100
-            
+                
             return {
                 'symbol': symbol,
                 'ticker': ticker,
@@ -2955,20 +3326,25 @@ class CryptoScalpingBot:
     def analyze_opportunity(self, ticker, volume_usd, pair_data):
         """Analyze trading opportunity using advanced metrics, Validation Criteria, and Advanced Parameters"""
         try:
-            self.log_trade(f"\nAnalyzing {pair_data['symbol']}...")
+            symbol = pair_data['symbol']
+            self.log_trade(f"\nAnalyzing {symbol}...")
 
             # Force update price data before analysis
             try:
-                self.data_manager.update_price_data(pair_data['symbol'], ticker)
-                self.log_trade(f"Price data updated for {pair_data['symbol']}")
+                self.data_manager.update_price_data(symbol, ticker)
+                self.log_trade(f"Price data updated for {symbol}")
             except Exception as e:
                 self.log_trade(f"Error updating price data: {str(e)}")
                 return False
 
             # Get price data for analysis
-            df = self.data_manager.get_price_data(pair_data['symbol'])
-            if df is None or len(df) < self.min_data_points:
-                self.log_trade(f"Insufficient data for {pair_data['symbol']}: {len(df) if df is not None else 0}/{self.min_data_points} points")
+            df = self.data_manager.get_price_data(symbol)
+            
+            # Get min_data_points from DataManager
+            min_data_points = self.data_manager.min_data_points
+            
+            if df is None or len(df) < min_data_points:
+                self.log_trade(f"Insufficient data for {symbol}: {len(df) if df is not None else 0}/{min_data_points} points")
                 return False
 
             # Calculate basic metrics for existing checks
@@ -2980,46 +3356,39 @@ class CryptoScalpingBot:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Static data detected")
                 return False
 
-            # Get user-defined thresholds
-            momentum_threshold = float(self.momentum_threshold.get())
-            volume_increase_threshold = float(self.volume_increase.get())
+            # TEMPORARY FIX: Check if market is bearish and log it, but don't let it block trades
+            market = self.analyze_market_conditions()
+            if market['state'] == 'bearish':
+                self.log_trade(f"NOTE: Market is bearish (Strength: {market['strength']:.2f}) but continuing analysis")
             
-            if momentum < momentum_threshold:
-                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum below threshold ({momentum:.2f}% < {momentum_threshold}%)")
-                return False
-
-            if volume_increase < volume_increase_threshold:
-                self.log_trade(f"Rejected {pair_data['symbol']}: Volume increase below threshold ({volume_increase:.2f}% < {volume_increase_threshold}%)")
-                return False
-
-            # Apply Validation Criteria (Greek parameters)
+            # Apply Validation Criteria (Greek parameters) with slightly relaxed thresholds
             # 1. Trend Strength (Beta)
             trend_strength = self.calculate_momentum_intensity(df)
-            momentum_beta_threshold = float(self.momentum_beta.get())
+            momentum_beta_threshold = float(self.momentum_beta.get()) * 0.9  # 10% more lenient
             if trend_strength < momentum_beta_threshold:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Trend strength below threshold ({trend_strength:.2f} < {momentum_beta_threshold})")
                 return False
             self.log_trade(f"✓ Trend Strength (Beta) passed: {trend_strength:.2f} >= {momentum_beta_threshold}")
 
-            # 2. Price Momentum (Alpha)
+            # 2. Price Acceleration (Alpha)
             price_acceleration = self.calculate_price_acceleration(df)
-            price_alpha_threshold = float(self.price_alpha.get())
+            price_alpha_threshold = float(self.price_alpha.get()) * 0.9  # 10% more lenient
             if price_acceleration < price_alpha_threshold:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Price acceleration below threshold ({price_acceleration:.2f} < {price_alpha_threshold})")
                 return False
-            self.log_trade(f"✓ Price Momentum (Alpha) passed: {price_acceleration:.2f} >= {price_alpha_threshold}")
+            self.log_trade(f"✓ Price Acceleration (Alpha) passed: {price_acceleration:.2f} >= {price_alpha_threshold}")
 
             # 3. Momentum Quality (Theta)
             momentum_quality = self.calculate_momentum_quality(df)
-            momentum_theta_threshold = float(self.time_theta.get())
+            momentum_theta_threshold = float(self.momentum_theta.get()) * 1.1  # 10% more lenient
             if momentum_quality > momentum_theta_threshold:
-                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum quality too unstable ({momentum_quality:.2f} > {momentum_theta_threshold})")
+                self.log_trade(f"Rejected {pair_data['symbol']}: Momentum quality above threshold ({momentum_quality:.2f} > {momentum_theta_threshold})")
                 return False
             self.log_trade(f"✓ Momentum Quality (Theta) passed: {momentum_quality:.2f} <= {momentum_theta_threshold}")
 
             # 4. Volatility Filter (Vega)
             volatility = self.calculate_volatility_sensitivity(df)
-            vol_vega_threshold = float(self.vol_vega.get())
+            vol_vega_threshold = float(self.vol_vega.get()) * 1.1  # 10% more lenient
             if volatility > vol_vega_threshold:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Volatility too high ({volatility:.2f} > {vol_vega_threshold})")
                 return False
@@ -3028,18 +3397,12 @@ class CryptoScalpingBot:
             # 5. Volume Quality (Rho)
             current_volume = df['volume'].iloc[-1]
             volume_impact = self.calculate_volume_impact(df, current_volume)
-            volume_rho_threshold = float(self.volume_rho.get())
+            volume_rho_threshold = float(self.volume_rho.get()) * 0.9  # 10% more lenient
             if volume_impact < volume_rho_threshold:
                 self.log_trade(f"Rejected {pair_data['symbol']}: Volume impact below threshold ({volume_impact:.2f} < {volume_rho_threshold})")
                 return False
             self.log_trade(f"✓ Volume Quality (Rho) passed: {volume_impact:.2f} >= {volume_rho_threshold}")
 
-            # Apply Advanced Parameters via advanced_checks
-            if not self.advanced_checks(pair_data['symbol'], df):
-                self.log_trade(f"Rejected {pair_data['symbol']}: Failed advanced checks")
-                return False
-            self.log_trade(f"✓ Advanced checks passed for {pair_data['symbol']}")
-            
             # All checks passed
             self.log_trade(f"All criteria passed for {pair_data['symbol']} - OPPORTUNITY DETECTED")
             return True
@@ -3048,61 +3411,39 @@ class CryptoScalpingBot:
             self.log_trade(f"Error analyzing opportunity for {pair_data['symbol']}: {str(e)}")
             return False
 
-    def analyze_pairs(self, valid_pairs):
-        """Analyze multiple pairs for trading opportunities"""
+    def analyze_pairs(self, pairs):
+        """Analyze pairs for trading opportunities"""
         try:
+            self.log_trade(f"\nAnalyzing {len(pairs)} pairs for trading opportunities...")
             trades_executed = False
-            self.log_trade("\nAnalyzing pairs for trading opportunities...")
             
-            for pair_data in valid_pairs:
+            # Check if we've reached max trades
+            max_trades = int(self.max_trades_entry.get())
+            if len(self.active_trades) >= max_trades:
+                self.log_trade(f"Maximum trades reached ({len(self.active_trades)}/{max_trades})")
+                return False
+            
+            # Process each pair
+            for pair_data in pairs:
                 try:
                     symbol = pair_data['symbol']
                     
-                    # Get DataFrame and ensure we have enough data
-                    df = self.data_manager.price_data.get(symbol)
-                    if df is None or len(df) < 20:  # Need at least 20 points
+                    # Skip if already trading this pair
+                    if any(trade['symbol'] == symbol for trade in self.active_trades.values()):
+                        self.log_trade(f"Already trading {symbol}, skipping")
                         continue
                     
-                    # Calculate metrics
-                    momentum = self.calculate_current_momentum(df)
-                    volume_increase = self.calculate_volume_increase(df)
+                    # Apply smart trade filter
+                    if not self.smart_trade_filter(pair_data):
+                        self.log_trade(f"Smart filter rejected {symbol}")
+                        continue
                     
-                    # Debug logging
-                    self.log_trade(f"""
-                    Detailed Analysis for {symbol}:
-                    Current Price: ${pair_data['price']:.8f}
-                    24h Volume: ${pair_data['volume']:,.2f}
-                    Momentum: {momentum:.2f}%
-                    Volume Change: {volume_increase:.2f}%
-                    Spread: {pair_data['spread']:.2f}%
-                    Data Points: {len(df)}
-                    """)
+                    # Get ticker data
+                    ticker = pair_data['ticker']
+                    volume = pair_data['volume']
                     
                     # Check trading conditions
-                    conditions_met = []
-                    
-                    # 1. Momentum check
-                    if momentum > float(self.momentum_threshold.get()):
-                        conditions_met.append("Momentum")
-                        self.log_trade(f"✓ Momentum condition met: {momentum:.2f}%")
-                    
-                    # 2. Volume check
-                    min_volume = float(self.min_volume_entry.get())
-                    if pair_data['volume'] >= min_volume:
-                        conditions_met.append("Volume")
-                        self.log_trade(f"✓ Volume condition met: ${pair_data['volume']:,.2f}")
-                    
-                    # 3. Spread check
-                    max_spread = float(self.max_spread.get())
-                    if pair_data['spread'] < max_spread:
-                        conditions_met.append("Spread")
-                        self.log_trade(f"✓ Spread condition met: {pair_data['spread']:.2f}%")
-                    
-                    # Check if we have enough conditions met
-                    required_conditions = int(self.required_conditions.get())
-                    self.log_trade(f"Conditions met ({len(conditions_met)}/{required_conditions}): {', '.join(conditions_met)}")
-                    
-                    if len(conditions_met) >= required_conditions:
+                    if self.analyze_opportunity(ticker, volume, pair_data):
                         self.log_trade(f"[TARGET] Trade opportunity found: {symbol}")
                         
                         # Validate and execute trade
@@ -3112,6 +3453,8 @@ class CryptoScalpingBot:
                                 self.log_trade(f"Trade executed successfully for {symbol}")
                             else:
                                 self.log_trade(f"Failed to execute trade for {symbol}")
+                        else:
+                            self.log_trade(f"Trade validation failed for {symbol}")
                     
                 except Exception as e:
                     self.log_trade(f"Error analyzing {pair_data['symbol']}: {str(e)}")
@@ -3121,9 +3464,9 @@ class CryptoScalpingBot:
                 self.log_trade("No trading opportunities found this scan")
             
             return trades_executed
-            
+                
         except Exception as e:
-            self.log_trade(f"Error in analyze_pairs: {str(e)}")
+            self.log_trade(f"Error analyzing pairs: {str(e)}")
             return False
 
     def calculate_trade_parameters(self, entry_price):
@@ -3159,235 +3502,226 @@ class CryptoScalpingBot:
                 'min_profit': 0.01  # Default 1%
             }
                 
-    def validate_trade(self, pair_data, current_price):
+    def execute_trade(self, pair_data):
+        """Execute a trade with smart risk management that respects user parameters"""
         try:
-            # Check if price has moved too much since analysis
-            new_price = self.exchange.fetch_ticker(pair_data['symbol'])['last']
-            price_change = abs((new_price - current_price) / current_price * 100)
+            symbol = pair_data['symbol']
+            self.log_trade(f"\n==== ATTEMPTING TRADE EXECUTION FOR {symbol} ====")
             
-            if price_change > 0.1:  # More than 0.1% price change
-                self.log_trade(f"Price moved too much: {price_change:.2f}%")
+            # Check number of active trades
+            max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 5
+            if len(self.active_trades) >= max_trades:
+                self.log_trade(f"❌ Maximum trades ({max_trades}) already active")
                 return False
-                
-            # Check if we have enough balance
-            position_size = float(self.position_size.get())
-            if self.paper_balance < position_size:
-                self.log_trade(f"Insufficient balance: {self.paper_balance:.2f} < {position_size:.2f}")
+                        
+            # Get current price with error handling
+            try:
+                current_price = float(pair_data['ticker']['last'])
+                if not current_price or current_price <= 0:
+                    self.log_trade(f"❌ Invalid price for {symbol}: {current_price}")
+                    return False
+                self.log_trade(f"Current price: {current_price}")
+            except Exception as e:
+                self.log_trade(f"❌ Error getting price: {str(e)}")
                 return False
-                
-            # Check if symbol already in active trades
-            for trade in self.active_trades.values():
-                if trade['symbol'] == pair_data['symbol']:
-                    self.log_trade(f"Already trading {pair_data['symbol']}")
+
+            # Skip smart filter if override is active
+            if hasattr(self, 'market_override_var') and self.market_override_var.get():
+                self.log_trade(f"✅ Market override ACTIVE - bypassing smart filter")
+            else:
+                # Apply smart filter before executing
+                if not self.smart_trade_filter(pair_data):
+                    self.log_trade(f"❌ Smart filter rejected trade for {symbol}")
                     return False
                     
+            # Calculate position size
+            position_size = float(self.position_size.get())
+            self.log_trade(f"Position size: ${position_size}")
+            
+            # Check if we have enough balance for paper trading
+            if self.is_paper_trading:
+                if position_size > self.paper_balance:
+                    self.log_trade(f"❌ Insufficient paper balance: ${self.paper_balance:.2f} < ${position_size:.2f}")
+                    return False
+                
+                # Deduct position size from paper balance
+                self.paper_balance -= position_size
+                self.log_trade(f"Deducted ${position_size:.2f} from paper balance. New balance: ${self.paper_balance:.2f}")
+            
+            # Calculate quantity based on position size and current price
+            quantity = position_size / current_price
+            self.log_trade(f"Calculated quantity: {quantity}")
+            
+            # Generate a unique trade ID
+            trade_id = f"{symbol.replace('/', '_')}_{int(time.time())}"
+            
+            # Log the trade execution attempt
+            self.log_trade(f"✅ EXECUTING TRADE: {symbol} at ${current_price} for ${position_size}")
+            
+            # Record the trade with proper timestamp
+            current_time = datetime.now()
+            self.active_trades[trade_id] = {
+                'symbol': symbol,
+                'entry_price': current_price,
+                'current_price': current_price,  # Initialize current price
+                'quantity': quantity,
+                'amount': quantity,  # Add amount field (same as quantity)
+                'position_size': position_size,
+                'entry_time': current_time,
+                'timestamp': current_time,  # Ensure timestamp is set
+                'highest_price': current_price,
+                'highest_profit': 0.0,
+                'market_condition': self.analyze_market_conditions()['state'],
+                'is_paper': self.is_paper_trading  # Add paper trading flag
+            }
+            
+            # Update displays
+            self.update_active_trades_display()
+            
+            # Log success
+            self.log_trade(f"✅ Trade executed successfully for {symbol}")
+            self.log_trade(f"==== TRADE EXECUTION COMPLETE FOR {symbol} ====\n")
             return True
             
         except Exception as e:
-            self.log_trade(f"Error validating trade: {str(e)}")
-            return False    
-
-    def execute_trade(self, pair_data):
-        """Execute a trade with proper error handling"""
-        try:
-            # Check number of active trades
-            max_trades = int(self.max_trades_entry.get())
-            if len(self.active_trades) >= max_trades:
-                self.log_trade(f"Maximum trades ({max_trades}) already active")
-                return False
-                    
-            # Get current price with error handling
-            try:
-                current_price = pair_data['ticker']['last']
-                if not current_price:
-                    self.log_trade(f"Invalid price for {pair_data['symbol']}")
-                    return False
-            except Exception as e:
-                self.log_trade(f"Error getting price: {str(e)}")
-                return False
-
-            # Calculate risk
-            position_size = float(self.position_size.get())
-
-            # Calculate trade parameters
-            profit_target = float(self.profit_target.get()) / 100
-            trailing_stop = float(self.trailing_stop.get()) / 100
-            amount = position_size / current_price
-
-            # Round amount to appropriate precision
-            try:
-                amount = self.exchange.amount_to_precision(pair_data['symbol'], amount)
-                amount = float(amount)
-            except:
-                amount = round(amount, 8)
-
-            # Check balance
-            if self.is_paper_trading:
-                available_balance = self.paper_balance
-            else:
-                balance = self.exchange.fetch_balance()
-                available_balance = float(balance['USD']['free'])
-
-            # Calculate entry fee
-            entry_fee = position_size * self.taker_fee
-
-            if available_balance < (position_size + entry_fee):
-                self.log_trade(f"Insufficient balance. Available: {available_balance:.2f} USD, Required: {position_size + entry_fee:.2f} USD")
-                return False
-
-            # Calculate target price
-            target_price = current_price * (1 + profit_target)
-
-            # Execute trade
-            try:
-                if self.is_paper_trading:
-                    order_id = f"paper_trade_{datetime.now().timestamp()}"
-                    self.paper_balance -= (position_size + entry_fee)  # Deduct position size and entry fee
-                else:
-                    order = self.exchange.create_market_buy_order(
-                        pair_data['symbol'],
-                        amount,
-                        {'trading_agreement': 'agree'}
-                    )
-                    order_id = order['id']
-
-                # Create trade info
-                trade_info = {
-                    'symbol': pair_data['symbol'],
-                    'entry_price': current_price,
-                    'target_price': target_price,
-                    'trailing_stop_pct': trailing_stop,
-                    'amount': amount,
-                    'position_size': position_size,
-                    'timestamp': datetime.now(),
-                    'highest_price': current_price,
-                    'last_update': datetime.now(),
-                    'order_ids': {'entry': order_id},
-                    'is_paper': self.is_paper_trading,
-                    'entry_fee': entry_fee  # Store entry fee for reference
-                }
-
-                # Generate unique trade ID
-                trade_id = f"{pair_data['symbol']}-{datetime.now().timestamp()}"
-                
-                # Store trade info
-                self.active_trades[trade_id] = trade_info
-                
-                # Initialize price history for new trade
-                if pair_data['symbol'] not in self.price_history:
-                    self.price_history[pair_data['symbol']] = []
-                
-                # Add initial price point
-                self.price_history[pair_data['symbol']].append(
-                    (datetime.now(), current_price)
-                )
-
-                # Log entry
-                self.log_trade(f"""
-                [TRADE] {'Paper' if self.is_paper_trading else 'Real'} Position opened:
-                Symbol: {pair_data['symbol']}
-                Entry Price: {current_price:.8f}
-                Amount: {amount}
-                Position Size: ${position_size:.2f}
-                Target: {target_price:.8f} (+{profit_target*100:.1f}%)
-                Trailing Stop: {trailing_stop*100:.1f}%
-                Entry Fee: ${entry_fee:.2f}
-                Total Fees Accumulated: ${self.total_fees + entry_fee:.2f}
-                Balance After Entry: ${self.paper_balance:.2f}
-                Order ID: {order_id}
-                """)
-
-                # Update displays
-                self.update_active_trades_display()
-                self.update_balance_display()
-                return True
-
-            except Exception as e:
-                self.log_trade(f"[ERROR] Failed to place {'paper' if self.is_paper_trading else 'real'} orders: {str(e)}")
-                return False
-
-        except Exception as e:
-            self.log_trade(f"Error executing trade: {str(e)}")
+            self.log_trade(f"❌ Error executing trade: {str(e)}")
             return False
 
-
     def close_trade(self, trade_id, trade, current_price, reason):
-        """Close a trade with accurate P/L calculation"""
+        """Close a trade with proper balance updates"""
         try:
-            # Validate inputs
-            if not all([trade_id, trade, current_price]):
-                self.log_trade("Invalid trade closure parameters")
-                return False
-                
-            # Calculate exact values
-            entry_price = trade['entry_price']
-            amount = trade['amount']
-            position_size = trade['position_size']
+            self.log_trade(f"Closing trade {trade_id} ({trade['symbol']}) due to {reason}")
             
-            # Calculate raw P/L
-            gross_profit = (current_price - entry_price) * amount
-            gross_profit_percentage = ((current_price - entry_price) / entry_price) * 100
+            symbol = trade['symbol']
+            entry_price = float(trade['entry_price'])
+            position_size = float(trade['position_size'])
             
-            # Calculate fees
-            entry_fee = trade.get('entry_fee', position_size * self.taker_fee)  # Use stored entry fee if available
-            exit_fee = position_size * self.taker_fee
+            # Calculate profit/loss
+            price_change = (current_price - entry_price) / entry_price
+            gross_profit = position_size * price_change
+            
+            # Apply fees (using instance variables)
+            entry_fee = position_size * self.taker_fee
+            exit_fee = (position_size * (1 + price_change)) * self.taker_fee
             total_fees = entry_fee + exit_fee
             
-            # Calculate net P/L
+            # Calculate net profit
             net_profit = gross_profit - total_fees
-            net_profit_percentage = (net_profit / position_size) * 100
             
-            # Update paper balance
+            # Update paper balance - ONLY add back position size + net profit
             if self.is_paper_trading:
                 self.paper_balance += position_size + net_profit
+                self.log_trade(f"Updated paper balance: ${self.paper_balance:.2f}")
+            
+            # Update trade statistics
+            self.total_profit += gross_profit
+            self.total_fees += total_fees
+            self.total_trades += 1
+            
+            if net_profit > 0:
+                self.winning_trades += 1
+            else:
+                self.losing_trades += 1
+            
+            # Add to trade history
+            trade_record = {
+                'symbol': symbol,
+                'entry_price': entry_price,
+                'exit_price': current_price,
+                'position_size': position_size,
+                'gross_profit': gross_profit,
+                'fees': total_fees,
+                'net_profit': net_profit,
+                'timestamp': datetime.now(),
+                'reason': reason,
+                'duration': (datetime.now() - trade.get('entry_time', datetime.now())).total_seconds()
+            }
+            self.trades.append(trade_record)
+            
+            # Update trade history display
+            self.update_trade_history(symbol, price_change*100, net_profit, net_profit > 0)
+            
+            # Format reason for display
+            trade_reason = reason.replace("_", " ").title()
             
             # Log closure details
             self.log_trade(f"""
-            Trade Closed: {trade['symbol']}
-            Reason: {reason.upper()}
+            Trade Closed: {symbol}
+            Reason: {trade_reason.upper()}
             Entry: ${entry_price:.8f}
             Exit: ${current_price:.8f}
-            Gross P/L: ${gross_profit:.2f} ({gross_profit_percentage:.2f}%)
-            Fees: ${total_fees:.2f}
-            Net P/L: ${net_profit:.2f} ({net_profit_percentage:.2f}%)
+            Gross P/L: ${gross_profit:.2f} ({price_change*100:.2f}%)
+            Fees: ${total_fees:.2f} ({(total_fees/position_size)*100:.2f}%)
+            Net P/L: ${net_profit:.2f} ({(net_profit/position_size)*100:.2f}%)
             Current Balance: ${self.paper_balance:.2f}
             """)
-            
-            # Update trade history
-            self.update_trade_history(
-                symbol=trade['symbol'],
-                percentage=net_profit_percentage,
-                profit=net_profit,
-                is_win=net_profit > 0
-            )
             
             # Remove from active trades
             if trade_id in self.active_trades:
                 del self.active_trades[trade_id]
             
-            # Update performance metrics
-            if net_profit > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
-                
-            self.total_trades += 1
-            self.total_profit += gross_profit  # Store raw profit
-            self.total_fees += total_fees  # Accumulate full fees
-            
-            # Update displays
-            self.update_active_trades_display()
+            # Update displays - force immediate update
             self.update_metrics()
             self.update_balance_display()
+            self.update_active_trades_display()
             
             return True
             
         except Exception as e:
             self.log_trade(f"Error closing trade: {str(e)}")
-            # Emergency cleanup
-            if trade_id in self.active_trades:
-                del self.active_trades[trade_id]
             return False
+    
+    def verify_active_trades(self):
+        """Automatically verify active trades against Kraken's open positions"""
+        if self.is_paper_trading:
+            self.log_trade("Trade verification skipped in paper trading mode")
+            return
+            
+        try:
+            self.log_trade("Verifying active trades with Kraken...")
+            
+            # Get open positions from Kraken
+            try:
+                # Fetch positions
+                positions = self.exchange.fetch_positions()
+                self.log_trade(f"Found {len(positions)} open positions on Kraken")
+                
+                # Create lookup by symbol
+                kraken_positions = {}
+                for position in positions:
+                    if float(position.get('contracts', 0)) > 0:
+                        kraken_positions[position['symbol']] = position
+                        
+                # Also check open orders
+                open_orders = self.exchange.fetch_open_orders()
+                self.log_trade(f"Found {len(open_orders)} open orders on Kraken")
+                
+                # Add symbols from open orders
+                for order in open_orders:
+                    if order['side'] == 'buy' and order['status'] == 'open':
+                        kraken_positions[order['symbol']] = order
+                        
+            except Exception as e:
+                self.log_trade(f"Error fetching positions: {str(e)}")
+                return
+                
+            # Check each active trade
+            for trade_id, trade in list(self.active_trades.items()):
+                symbol = trade['symbol']
+                
+                # Check if position exists on Kraken
+                if symbol not in kraken_positions:
+                    self.log_trade(f"Warning: Trade {trade_id} for {symbol} not found in Kraken positions")
+                    
+                    # Instead of handling it here, use the close_trade method
+                    # This ensures consistent handling and proper history updates
+                    current_price = float(self.exchange.fetch_ticker(symbol)['last'])
+                    self.close_trade(trade_id, trade, current_price, "position_not_found")
+                else:
+                    self.log_trade(f"Verified: {symbol} exists in Kraken positions")
+                    
+        except Exception as e:
+            self.log_trade(f"Error verifying trades: {str(e)}")
         
     def advanced_checks(self, symbol, df):
         """Advanced market checks including order book analysis and RSI"""
@@ -3493,36 +3827,64 @@ class CryptoScalpingBot:
             
             for trade_id, trade in list(self.active_trades.items()):
                 try:
-                    current_price = self.get_cached_price(trade['symbol'])['last']
-                    profit = (current_price - trade['entry_price']) * trade['amount']
-                    profit_percentage = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-                    duration = (datetime.now() - trade['timestamp']).total_seconds()
+                    symbol = trade['symbol']
+                    entry_price = float(trade['entry_price'])
+                    
+                    # Get current price safely
+                    current_price = trade.get('current_price', entry_price)
+                    
+                    # Calculate profit percentage
+                    profit_percentage = ((current_price - entry_price) / entry_price) * 100
+                    
+                    # Get highest profit percentage
+                    highest_profit = trade.get('highest_profit_percentage', profit_percentage)
+                    
+                    # Calculate time in trade
+                    entry_time = trade.get('entry_time', datetime.now())
+                    duration = (datetime.now() - entry_time).total_seconds()
+                    
+                    # Format last update time - ensure it's set
+                    if 'last_update' not in trade:
+                        trade['last_update'] = datetime.now().strftime("%H:%M:%S")
+                    last_update = trade['last_update']
+                    
+                    # Ensure we update price history for charting
+                    if symbol not in self.price_history:
+                        self.price_history[symbol] = []
+                    self.price_history[symbol].append((datetime.now(), current_price))
+                    if len(self.price_history[symbol]) > 50:
+                        self.price_history[symbol] = self.price_history[symbol][-50:]
                     
                     trade_info = (
-                        f"Symbol: {trade['symbol']} | "
-                        f"Entry: {trade['entry_price']:.8f} | "
-                        f"Current: {current_price:.8f} | "
-                        f"P/L: {profit:.2f} USD ({profit_percentage:.3f}%) | "
-                        f"Duration: {duration:.1f}s | "
-                        f"Target: {trade['target_price']:.8f}\n"
+                        f"Symbol: {symbol}\n"
+                        f"Entry: {entry_price:.8f}\n"
+                        f"Current: {current_price:.8f}\n"
+                        f"P/L: {profit_percentage:.2f}%\n"
+                        f"Highest: {highest_profit:.2f}%\n"
+                        f"Time: {duration:.1f}s\n"
+                        f"Last Update: {last_update}\n"
                         f"-----------------\n"
                     )
                     
-                    # Color code based on profit/loss
                     self.trades_text.insert(tk.END, trade_info)
-                    line_start = f"end-{len(trade_info)+1}c linestart"
-                    line_end = "end-1c"
                     
-                    if profit > 0:
-                        self.trades_text.tag_add("profit", line_start, line_end)
+                    # Color coding
+                    start_idx = f"end-{len(trade_info)+1}c linestart"
+                    end_idx = "end-1c"
+                    
+                    if profit_percentage > 0:
+                        self.trades_text.tag_add("profit", start_idx, end_idx)
                         self.trades_text.tag_config("profit", foreground="green")
                     else:
-                        self.trades_text.tag_add("loss", line_start, line_end)
+                        self.trades_text.tag_add("loss", start_idx, end_idx)
                         self.trades_text.tag_config("loss", foreground="red")
                     
                 except Exception as e:
                     self.log_trade(f"Error updating display for trade {trade_id}: {str(e)}")
                     continue
+            
+            # Force chart update after updating trades display
+            self.update_chart()
             
             # Force GUI update
             self.trades_text.see(tk.END)
@@ -3531,8 +3893,59 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error updating trades display: {str(e)}")
 
+    def validate_trade(self, pair_data, entry_price):
+        """Validate a trade before execution"""
+        try:
+            symbol = pair_data['symbol']
+            self.log_trade(f"Validating trade for {symbol} at ${entry_price}")
+            
+            # Check if we're already trading this symbol
+            if any(trade['symbol'] == symbol for trade in self.active_trades.values()):
+                self.log_trade(f"Already trading {symbol}")
+                return False
+            
+            # Check if we've reached max trades
+            max_trades = int(self.max_trades_entry.get())
+            if len(self.active_trades) >= max_trades:
+                self.log_trade(f"Maximum trades reached ({len(self.active_trades)}/{max_trades})")
+                return False
+            
+            # Check position size against balance
+            position_size = float(self.position_size.get())
+            if self.is_paper_trading:
+                available_balance = self.paper_balance
+            else:
+                available_balance = float(self.exchange.fetch_balance()['USD']['free'])
+                
+            if position_size > available_balance:
+                self.log_trade(f"Insufficient balance: ${available_balance:.2f} < ${position_size:.2f}")
+                return False
+            
+            # Check if price is reasonable (not too high)
+            if entry_price > 5.0:  # $5 max for low-priced assets
+                self.log_trade(f"Price too high: ${entry_price} > $5.00")
+                return False
+            
+            # Check if price is reasonable (not too low)
+            if entry_price < 0.00001:  # Minimum price
+                self.log_trade(f"Price too low: ${entry_price} < $0.00001")
+                return False
+            
+            # Check if spread is reasonable
+            if 'spread' in pair_data and pair_data['spread'] > 2.0:  # 2% max spread
+                self.log_trade(f"Spread too high: {pair_data['spread']:.2f}% > 2.00%")
+                return False
+            
+            # All checks passed
+            self.log_trade(f"Trade validation passed for {symbol}")
+            return True
+            
+        except Exception as e:
+            self.log_trade(f"Error validating trade: {str(e)}")
+            return False
+    
     def manage_trades(self):
-        """Manage trades with straightforward exit conditions"""
+        """Manage trades with smart exit conditions that respect user parameters"""
         try:
             for trade_id, trade in list(self.active_trades.items()):
                 try:
@@ -3545,17 +3958,19 @@ class CryptoScalpingBot:
                     if 'highest_profit' not in trade or profit_pct > trade['highest_profit']:
                         trade['highest_profit'] = profit_pct
 
-                    # Get exit thresholds
-                    stop_loss = float(self.stop_loss.get())
-                    trailing_stop = float(self.trailing_stop.get())
+                    # Get exit thresholds from trade (these are the smart parameters)
+                    stop_loss = trade.get('stop_loss_pct', float(self.stop_loss.get()) / 100) * 100
+                    trailing_stop = trade.get('trailing_stop_pct', float(self.trailing_stop.get()) / 100) * 100
+                    profit_target = trade.get('profit_target_pct', float(self.profit_target.get()) / 100) * 100
                     trailing_activation = float(self.trailing_activation.get())
 
                     # Debug log
                     self.log_trade(f"""
                     Trade Check - {trade['symbol']}:
                     Current P/L: {profit_pct:.2f}%
-                    Highest: {trade['highest_profit']:.2f}%
+                    Highest: {trade.get('highest_profit', 0):.2f}%
                     Stop Loss: -{stop_loss:.2f}%
+                    Profit Target: {profit_target:.2f}%
                     Trailing Stop: {trailing_stop:.2f}%
                     Trailing Activation: {trailing_activation:.2f}%
                     """)
@@ -3566,26 +3981,317 @@ class CryptoScalpingBot:
                         self.close_trade(trade_id, trade, current_price, "stop loss")
                         continue
 
-                    # CASE 2: Trailing Stop
-                    if trade['highest_profit'] >= trailing_activation:
-                        drop_from_high = trade['highest_profit'] - profit_pct
-                        
+                    # CASE 2: Take Profit - Exit if profit exceeds target
+                    if profit_pct >= profit_target:
+                        self.log_trade(f"Profit target reached on {trade['symbol']} at {profit_pct:.2f}%")
+                        self.close_trade(trade_id, trade, current_price, "take profit")
+                        continue
+                    
+                    # CASE 3: Trailing Stop - Exit if price drops from highest by trailing stop amount
+                    highest_profit = trade.get('highest_profit', 0)
+                    if highest_profit >= trailing_activation:
+                        drop_from_high = highest_profit - profit_pct
                         if drop_from_high >= trailing_stop:
-                            self.log_trade(f"""
-                            Trailing Stop hit on {trade['symbol']}:
-                            Peak profit: {trade['highest_profit']:.2f}%
-                            Current profit: {profit_pct:.2f}%
-                            Drop from peak: {drop_from_high:.2f}%
-                            """)
+                            self.log_trade(f"Trailing stop triggered on {trade['symbol']} - Drop from {highest_profit:.2f}% to {profit_pct:.2f}%")
                             self.close_trade(trade_id, trade, current_price, "trailing stop")
                             continue
+                    
+                    # CASE 4: Market Condition Change - Consider early exit in deteriorating markets
+                    market_condition = self.analyze_market_conditions()
+                    entry_market = trade.get('market_condition', 'neutral')
+                    
+                    # If market has deteriorated significantly since entry, consider partial exit
+                    if entry_market != 'bearish' and market_condition['state'] == 'bearish' and profit_pct > 0:
+                        # Market turned bearish and we have profit - consider taking partial profit
+                        self.log_trade(f"Market deteriorated to bearish - considering early exit for {trade['symbol']}")
+                        
+                        # If profit is at least 50% of target, take profit
+                        if profit_pct >= (profit_target * 0.5):
+                            self.log_trade(f"Taking early profit due to market deterioration: {profit_pct:.2f}%")
+                            self.close_trade(trade_id, trade, current_price, "market deterioration")
+                            continue
+                    
+                    # CASE 5: Time-based exit - Close trades that have been open too long
+                    max_trade_duration = int(self.max_trade_duration.get()) if hasattr(self, 'max_trade_duration') else 3600  # Default 1 hour
+                    duration = (datetime.now() - trade['timestamp']).total_seconds()
+                    
+                    if duration > max_trade_duration:
+                        self.log_trade(f"Max duration reached for {trade['symbol']} ({duration:.0f}s)")
+                        self.close_trade(trade_id, trade, current_price, "max duration")
+                        continue
+                    
+                    # Update trade data for monitoring
+                    trade['current_price'] = current_price
+                    trade['current_profit_percentage'] = profit_pct
+                    trade['last_update'] = datetime.now()
+                    
+                    # Update price history for charting
+                    if trade['symbol'] in self.price_history:
+                        self.price_history[trade['symbol']].append((datetime.now(), current_price))
+                        # Limit history size
+                        self.price_history[trade['symbol']] = self.price_history[trade['symbol']][-100:]
 
                 except Exception as e:
                     self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
                     continue
-
+                    
         except Exception as e:
             self.log_trade(f"Error in trade management: {str(e)}")
+                
+
+    def analyze_market_conditions(self):
+        """Analyze current market conditions without changing user parameters"""
+        try:
+            # Check for market override
+            if hasattr(self, 'market_override_var') and self.market_override_var.get():
+                self.log_trade("Market override active - reporting neutral market regardless of conditions")
+                return {'state': 'neutral', 'strength': 0}
+            
+            # Try to fetch BTC/USD ticker if we don't have data
+            if not hasattr(self.data_manager, 'price_data') or 'BTC/USD' not in self.data_manager.price_data:
+                self.log_trade("WARNING: No BTC/USD price data available, attempting to fetch...")
+                try:
+                    btc_ticker = self.exchange.fetch_ticker('BTC/USD')
+                    if btc_ticker:
+                        self.data_manager.update_price_data('BTC/USD', btc_ticker)
+                        self.log_trade(f"Fetched BTC/USD price: ${float(btc_ticker['last'])}")
+                    else:
+                        self.log_trade("WARNING: Could not fetch BTC/USD ticker, defaulting to neutral market")
+                        return {'state': 'neutral', 'strength': 0}
+                except Exception as e:
+                    self.log_trade(f"Error fetching BTC/USD data: {str(e)}")
+                    return {'state': 'neutral', 'strength': 0}
+            
+            # Get price data
+            df = self.data_manager.get_price_data('BTC/USD')
+            if df is None or len(df) < 5:  # Need at least 5 data points for basic analysis
+                self.log_trade(f"WARNING: Insufficient BTC/USD data points ({len(df) if df is not None else 0}), defaulting to neutral market")
+                return {'state': 'neutral', 'strength': 0}
+                    
+            # Calculate indicators
+            # Use available data for calculations, adapting to what we have
+            try:
+                # Calculate short EMA (use available data)
+                short_span = min(5, len(df) - 1)
+                short_ema = df['price'].ewm(span=short_span).mean().iloc[-1]
+                
+                # Calculate longer EMA if possible, otherwise use a simple average
+                if len(df) >= 20:
+                    long_ema = df['price'].ewm(span=20).mean().iloc[-1]
+                else:
+                    long_span = max(3, len(df) // 2)
+                    long_ema = df['price'].ewm(span=long_span).mean().iloc[-1]
+                
+                # Calculate recent price change
+                lookback = min(8, len(df) - 1)
+                four_hour_change = (df['price'].iloc[-1] / df['price'].iloc[-lookback] - 1) * 100
+                
+                # Calculate market strength (-10 to +10 scale)
+                ema_diff = ((short_ema / long_ema) - 1) * 100
+                strength = (ema_diff + four_hour_change) / 2
+                
+                # Determine market state - USING MORE NEUTRAL THRESHOLDS
+                if strength < -3:  # Changed from -2 to -3
+                    state = 'bearish'
+                elif strength > 3:  # Changed from 2 to 3
+                    state = 'bullish'
+                else:
+                    state = 'neutral'
+                        
+                # Log market conditions
+                self.log_trade(f"Market conditions: {state.upper()} (Strength: {strength:.2f})")
+                
+                return {
+                    'state': state,
+                    'strength': strength,
+                    'ema_diff': ema_diff,
+                    'price_change': four_hour_change
+                }
+            except Exception as e:
+                self.log_trade(f"Error calculating market indicators: {str(e)}")
+                return {'state': 'neutral', 'strength': 0}
+                        
+        except Exception as e:
+            self.log_trade(f"Error analyzing market conditions: {str(e)}")
+            return {'state': 'neutral', 'strength': 0}
+
+    def initialize_market_data(self):
+        """Initialize market data for BTC/USD to enable market analysis"""
+        try:
+            self.log_trade("Initializing market data for BTC/USD...")
+            
+            # Ensure we have an exchange connection
+            if not hasattr(self, 'exchange') or self.exchange is None:
+                self.log_trade("No exchange connection available for market data")
+                return False
+            
+            # Fetch BTC/USD ticker with retry
+            for attempt in range(3):
+                try:
+                    btc_ticker = self.exchange.fetch_ticker('BTC/USD')
+                    if not btc_ticker:
+                        self.log_trade(f"Failed to fetch BTC/USD ticker (attempt {attempt+1}/3)")
+                        time.sleep(1)
+                        continue
+                    
+                    # Initialize price data for BTC/USD
+                    self.data_manager.update_price_data('BTC/USD', btc_ticker)
+                    self.log_trade(f"Initial BTC/USD data point collected: ${float(btc_ticker['last'])}")
+                    
+                    # Fetch historical data to build up the required data points
+                    self.log_trade("Fetching historical BTC/USD data...")
+                    try:
+                        # Fetch OHLCV data for the past day (24 hourly candles)
+                        since = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+                        ohlcv = self.exchange.fetch_ohlcv('BTC/USD', timeframe='1h', since=since, limit=24)
+                        
+                        # Convert to DataFrame and update price data
+                        for candle in ohlcv:
+                            timestamp, open_price, high, low, close, volume = candle
+                            
+                            # Create synthetic ticker data
+                            synthetic_ticker = {
+                                'timestamp': pd.Timestamp(timestamp, unit='ms'),
+                                'last': close,
+                                'quoteVolume': volume,
+                                'bid': close * 0.999,  # Approximate bid
+                                'ask': close * 1.001   # Approximate ask
+                            }
+                            
+                            # Update price data
+                            self.data_manager.update_price_data('BTC/USD', synthetic_ticker)
+                        
+                        # Log success
+                        df = self.data_manager.get_price_data('BTC/USD')
+                        if df is not None:
+                            self.log_trade(f"Successfully loaded {len(df)} historical data points for BTC/USD")
+                        
+                        return True
+                        
+                    except Exception as e:
+                        self.log_trade(f"Error fetching historical BTC/USD data: {str(e)}")
+                        # Continue with just the single data point
+                        return True
+                    
+                except Exception as e:
+                    self.log_trade(f"Error fetching BTC/USD ticker (attempt {attempt+1}/3): {str(e)}")
+                    time.sleep(1)
+            
+            self.log_trade("Failed to initialize BTC/USD market data after multiple attempts")
+            return False
+            
+        except Exception as e:
+            self.log_trade(f"Error initializing market data: {str(e)}")
+            return False
+
+    def smart_trade_filter(self, pair_data):
+        """Smart trade filter that respects user parameters but adds market intelligence"""
+        try:
+            symbol = pair_data['symbol']
+            
+            # Get symbol data first - needed for all checks
+            df = self.data_manager.get_price_data(symbol)
+            if df is None or len(df) < 3:  # Need at least 3 data points
+                self.log_trade(f"Insufficient data for {symbol}")
+                return False
+                
+            # Check for market override - only bypass market condition check
+            market_override = hasattr(self, 'market_override_var') and self.market_override_var.get()
+            if not market_override:
+                # Only check market conditions if override is not active
+                market = self.analyze_market_conditions()
+                if market['state'] == 'bearish':
+                    self.log_trade(f"Bearish market detected, rejecting {symbol}")
+                    return False
+            else:
+                self.log_trade(f"[OK] Market override ACTIVE - bypassing market condition check for {symbol}")
+            
+            # Always apply basic price filter
+            ticker = pair_data.get('ticker', {})
+            price = float(ticker.get('last', 0))
+            if price <= 0 or price > 5.0:
+                self.log_trade(f"Price filter rejected {symbol}: ${price} (must be >0 and ≤$5)")
+                return False
+            
+            # Always apply volume filter
+            volume = float(ticker.get('quoteVolume', 0))
+            min_volume = float(self.min_volume_entry.get()) if hasattr(self, 'min_volume_entry') else 50
+            if volume < min_volume:
+                self.log_trade(f"Volume filter rejected {symbol}: ${volume} < ${min_volume}")
+                return False
+                
+            # Always apply technical indicators and user parameters
+            # These checks run regardless of market override
+            
+            # Check RSI if available
+            if 'rsi_14' in df.columns:
+                rsi_value = df['rsi_14'].iloc[-1]
+                rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
+                rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
+                
+                if rsi_value > rsi_overbought:
+                    self.log_trade(f"RSI filter rejected {symbol}: {rsi_value:.2f} > {rsi_overbought}")
+                    return False
+                    
+                self.log_trade(f"✓ RSI check passed: {rsi_value:.2f}")
+            
+            # Check EMA crossover if available
+            if 'ema_5' in df.columns and 'ema_15' in df.columns:
+                ema_cross = (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+                if not ema_cross:
+                    self.log_trade(f"EMA filter rejected {symbol}: No bullish crossover")
+                    return False
+                    
+                self.log_trade(f"✓ EMA crossover check passed")
+            
+            # Check momentum
+            momentum = self.calculate_current_momentum(df)
+            min_momentum = 0.2  # Minimum 0.2% price rise
+            if momentum < min_momentum:
+                self.log_trade(f"Momentum filter rejected {symbol}: {momentum:.2f}% < {min_momentum}%")
+                return False
+                
+            self.log_trade(f"✓ Momentum check passed: {momentum:.2f}%")
+            
+            # All filters passed
+            self.log_trade(f"All filters passed for {symbol}")
+            return True
+            
+        except Exception as e:
+            self.log_trade(f"Error in smart filter for {symbol}: {str(e)}")
+            return False
+
+    def check_counter_trend_strength(self, df):
+        """Check for counter-trend strength in bear markets"""
+        try:
+            # Calculate RSI
+            if 'rsi' not in df.columns:
+                delta = df['close'].diff()
+                gain = delta.where(delta > 0, 0)
+                loss = -delta.where(delta < 0, 0)
+                avg_gain = gain.rolling(window=14).mean()
+                avg_loss = loss.rolling(window=14).mean()
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            else:
+                rsi = df['rsi']
+                
+            # Check for oversold conditions (RSI < 30)
+            is_oversold = rsi.iloc[-1] < 30
+            
+            # Check for bullish divergence
+            price_lower = df['close'].iloc[-1] < df['close'].iloc[-3]
+            rsi_higher = rsi.iloc[-1] > rsi.iloc[-3]
+            
+            # Check for volume spike
+            volume_spike = df['volume'].iloc[-1] > df['volume'].rolling(window=10).mean().iloc[-1] * 2
+            
+            # Return True if we have signs of counter-trend strength
+            return is_oversold or (price_lower and rsi_higher) or volume_spike
+            
+        except Exception as e:
+            self.log_trade(f"Error checking counter-trend strength: {str(e)}")
+            return False
 
     def analyze_performance(self):
         """Analyze trading performance using pandas"""
@@ -3708,52 +4414,144 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error initializing trade data collection: {str(e)}")
 
-    def update_trade_history(self, symbol, percentage, profit, is_win=True):
-        """Update the trade history display"""
+    def update_btc_data(self):
+        """Update BTC/USD market data for market analysis"""
         try:
+            self.log_trade("Updating BTC/USD market data...")
+            
+            # Skip if no exchange connection
+            if not hasattr(self, 'exchange') or self.exchange is None:
+                self.log_trade("No exchange connection available for BTC data update")
+                return False
+            
+            # Fetch BTC/USD ticker
+            try:
+                btc_ticker = self.exchange.fetch_ticker('BTC/USD')
+                if not btc_ticker:
+                    self.log_trade("Failed to fetch BTC/USD ticker")
+                    return False
+                
+                # Update price data for BTC/USD
+                self.data_manager.update_price_data('BTC/USD', btc_ticker)
+                
+                # Log success
+                btc_price = float(btc_ticker['last'])
+                self.log_trade(f"Updated BTC/USD price: ${btc_price:.2f}")
+                
+                # Calculate market indicators if we have enough data
+                df = self.data_manager.get_price_data('BTC/USD')
+                if df is not None and len(df) >= 5:
+                    # Calculate indicators
+                    self.data_manager._calculate_indicators('BTC/USD')
+                    self.log_trade("BTC/USD indicators updated")
+                
+                return True
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching BTC/USD data: {str(e)}")
+                return False
+            
+        except Exception as e:
+            self.log_trade(f"Error updating BTC/USD data: {str(e)}")
+            return False
+
+    def update_trade_history(self, symbol, percentage, profit, is_win=True, status="closed"):
+        """Update the trade history with a completed trade"""
+        try:
+            # Ensure percentage is within reasonable bounds
+            if abs(percentage) > 50:  # Sanity check
+                self.log_trade(f"Warning: Unusual percentage detected for {symbol}: {percentage}%")
+                percentage = min(max(percentage, -50), 50)  # Cap at ±50%
+
             # Format timestamp
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Format the trade result with status if not normal close
+            status_text = ""
+            if status != "closed":
+                status_text = f" [{status}]"
             
             # Format the trade result
-            result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}\n"
+            result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}{status_text}\n"
+            
+            # Store trade in history list FIRST (most important)
+            if not hasattr(self, 'trades'):
+                self.trades = []
+                self.log_trade("Initializing trades list")
+                
+            trade_record = {
+                'timestamp': datetime.now(),
+                'symbol': symbol,
+                'percentage': percentage,
+                'profit': profit,
+                'is_win': is_win,
+                'status': status,
+                'is_paper': self.is_paper_trading
+            }
+            
+            # Add to trades list
+            self.trades.append(trade_record)
+            self.log_trade(f"Added trade to history list: {symbol} {percentage:.2f}% ${profit:.2f}")
+            
+            # Keep only last 100 trades
+            if len(self.trades) > 100:
+                self.trades = self.trades[-100:]
             
             # Update GUI trade history if available
             if hasattr(self, 'history_text'):
                 try:
-                    # Get current number of lines
-                    current_lines = int(self.history_text.index('end-1c').split('.')[0])
+                    # Make sure the history window exists and is initialized
+                    if not hasattr(self, 'history_window') or not self.history_window:
+                        self.setup_trade_history_display()
                     
-                    # If more than 100 lines, remove oldest entries
-                    if current_lines > 100:
-                        self.history_text.delete('1.0', f'{current_lines-100}.0')
-                    
-                    # Add new trade result
-                    self.history_text.insert(tk.END, result)
-                    
-                    # Color code based on profit/loss
-                    line_start = f"{float(self.history_text.index('end-2c'))-1:.1f}"
-                    
-                    if profit > 0:
-                        self.history_text.tag_add("profit", f"{line_start} linestart", f"{line_start} lineend")
-                        self.history_text.tag_config("profit", foreground="green")
+                    # Ensure the history text widget exists
+                    if hasattr(self, 'history_text'):
+                        self.history_text.config(state=tk.NORMAL)
+                        self.history_text.insert(tk.END, result)
+                        
+                        # Color code based on profit/loss
+                        line_start = f"{float(self.history_text.index('end-2c').split('.')[0])-1}.0"
+                        line_end = f"{float(self.history_text.index('end-1c').split('.')[0])-1}.end"
+                        
+                        color = "green" if is_win else "red"
+                        self.history_text.tag_add(color, line_start, line_end)
+                        self.history_text.tag_config("green", foreground="green")
+                        self.history_text.tag_config("red", foreground="red")
+                        
+                        self.history_text.see(tk.END)
+                        self.history_text.config(state=tk.DISABLED)
+                        
+                        # Force GUI update
+                        self.history_text.update_idletasks()
+                        
+                        self.log_trade(f"Updated history text widget with trade: {symbol}")
                     else:
-                        self.history_text.tag_add("loss", f"{line_start} linestart", f"{line_start} lineend")
-                        self.history_text.tag_config("loss", foreground="red")
-                    
-                    # Scroll to show latest entry
-                    self.history_text.see(tk.END)
-                    
-                    # Force GUI update
-                    self.history_text.update_idletasks()
-                    
+                        self.log_trade("History text widget not available")
                 except Exception as e:
                     self.log_trade(f"Error updating trade history display: {str(e)}")
-            
-            # Log the trade
-            self.log_trade(f"Trade History Updated - {result.strip()}")
-            
+            else:
+                self.log_trade("History text widget not found")
+                
+            # Also save to file for persistence
+            try:
+                history_file = "trade_history.json"
+                with open(history_file, 'w') as f:
+                    # Convert datetime objects to strings for JSON serialization
+                    serializable_trades = []
+                    for t in self.trades:
+                        t_copy = t.copy()
+                        t_copy['timestamp'] = t_copy['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+                        serializable_trades.append(t_copy)
+                        
+                    json.dump(serializable_trades, f)
+                self.log_trade(f"Trade history saved to {history_file}")
+            except Exception as e:
+                self.log_trade(f"Error saving trade history to file: {str(e)}")
+                
         except Exception as e:
-            self.log_trade(f"Error in update_trade_history: {str(e)}")
+            self.log_trade(f"Critical error in update_trade_history: {str(e)}")
+            # Attempt to log basic trade info even if display fails
+            self.log_trade(f"Trade completed - {symbol}: {percentage:.2f}% (${profit:.2f})")
 
     def analyze_patterns(self):
         """Analyze collected trade data for patterns"""
@@ -3858,116 +4656,146 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error updating trading parameters: {str(e)}")    
 
-    def update_trade_history(self, symbol, percentage, profit, is_win=True):
-        """
-        Update the trade history display with new trade results
-        
-        Args:
-            symbol (str): Trading pair symbol
-            percentage (float): Profit/loss percentage
-            profit (float): Actual profit/loss amount in USD
-            is_win (bool): Whether trade was profitable
-        """
+    def update_trade_history(self, symbol, percentage, profit, is_win=True, status="closed"):
+        """Update the trade history with a completed trade"""
         try:
-            # Sanity check on percentage values
-            if abs(percentage) > 50:  # Cap at ±50%
+            # Ensure percentage is within reasonable bounds
+            if abs(percentage) > 50:  # Sanity check
                 self.log_trade(f"Warning: Unusual percentage detected for {symbol}: {percentage}%")
-                percentage = max(min(percentage, 50), -50)
-            
-            # Format timestamp
+                percentage = min(max(percentage, -50), 50)  # Cap at ±50%
+
+            # Format timestamp - use a shorter format for display
             timestamp = datetime.now().strftime("%H:%M:%S")
             
+            # Format the trade result with status if not normal close
+            status_text = ""
+            if status != "closed":
+                status_text = f" [{status}]"
+            
             # Format the trade result
-            result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}\n"
+            result = f"[{timestamp}] {symbol}: {percentage:.2f}%, ${profit:.2f}{status_text}\n"
             
-            # Update GUI trade history if available
-            if hasattr(self, 'history_text'):
-                try:
-                    # Get current number of lines
-                    current_lines = int(self.history_text.index('end-1c').split('.')[0])
-                    
-                    # If more than 100 lines, remove oldest entries
-                    if current_lines > 100:
-                        self.history_text.delete('1.0', f'{current_lines-100}.0')
-                    
-                    # Add new trade result
-                    self.history_text.insert(tk.END, result)
-                    
-                    # Color code based on actual profit
-                    line_start = f"{float(self.history_text.index('end-2c'))-1:.1f}"
-                    
-                    # Determine color based on actual profit
-                    if profit > 0:
-                        color = "profit"
-                        self.history_text.tag_config("profit", foreground="green")
-                    else:
-                        color = "loss"
-                        self.history_text.tag_config("loss", foreground="red")
-                    
-                    # Apply color tag
-                    self.history_text.tag_add(color, f"{line_start} linestart", f"{line_start} lineend")
-                    
-                    # Scroll to show latest entry
-                    self.history_text.see(tk.END)
-                    
-                    # Force GUI update
-                    self.history_text.update_idletasks()
-                    
-                except tk.TclError as e:
-                    self.log_trade(f"GUI update error in trade history: {str(e)}")
-                except Exception as e:
-                    self.log_trade(f"Error updating trade history display: {str(e)}")
-            
-            # Store trade in history list (with cleanup)
+            # Store trade in history list FIRST (most important)
+            if not hasattr(self, 'trades'):
+                self.trades = []
+                self.log_trade("Initializing trades list")
+                
             trade_record = {
                 'timestamp': datetime.now(),
                 'symbol': symbol,
                 'percentage': percentage,
                 'profit': profit,
-                'is_win': is_win
+                'is_win': is_win,
+                'status': status,
+                'is_paper': self.is_paper_trading
             }
             
             # Add to trades list
             self.trades.append(trade_record)
+            self.log_trade(f"Added trade to history list: {symbol} {percentage:.2f}% ${profit:.2f}")
             
             # Keep only last 100 trades
             if len(self.trades) > 100:
                 self.trades = self.trades[-100:]
             
-            # Log the trade
-            self.log_trade(f"Trade History Updated - {symbol}: {percentage:.2f}% (${profit:.2f})")
-            
+            # Update GUI trade history if available
+            if hasattr(self, 'trades_text'):
+                try:
+                    # Use trades_text instead of history_text
+                    self.trades_text.config(state=tk.NORMAL)
+                    self.trades_text.insert(tk.END, result)
+                    
+                    # Color code based on profit/loss
+                    line_start = f"{float(self.trades_text.index('end-2c').split('.')[0])-1}.0"
+                    line_end = f"{float(self.trades_text.index('end-1c').split('.')[0])-1}.end"
+                    
+                    color = "green" if is_win else "red"
+                    self.trades_text.tag_add(color, line_start, line_end)
+                    self.trades_text.tag_config("green", foreground="green")
+                    self.trades_text.tag_config("red", foreground="red")
+                    
+                    self.trades_text.see(tk.END)
+                    self.trades_text.config(state=tk.DISABLED)
+                    
+                    # Force GUI update
+                    self.trades_text.update_idletasks()
+                    
+                    self.log_trade(f"Updated trades text widget with trade: {symbol}")
+                except Exception as e:
+                    self.log_trade(f"Error updating trades text display: {str(e)}")
+            else:
+                self.log_trade("Trades text widget not found")
+                    
+            # Also save to file for persistence
+            try:
+                history_file = "trade_history.json"
+                with open(history_file, 'w') as f:
+                    # Convert datetime objects to strings for JSON serialization
+                    serializable_trades = []
+                    for t in self.trades:
+                        t_copy = t.copy()
+                        t_copy['timestamp'] = t_copy['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+                        serializable_trades.append(t_copy)
+                        
+                    json.dump(serializable_trades, f)
+                self.log_trade(f"Trade history saved to {history_file}")
+            except Exception as e:
+                self.log_trade(f"Error saving trade history to file: {str(e)}")
+                
         except Exception as e:
             self.log_trade(f"Critical error in update_trade_history: {str(e)}")
             # Attempt to log basic trade info even if display fails
             self.log_trade(f"Trade completed - {symbol}: {percentage:.2f}% (${profit:.2f})")
 
     def log_trade(self, message):
-        """Log trade information with proper encoding handling"""
+        """Log a trade message to both the GUI and the log file with proper encoding"""
         try:
-            # Replace Unicode checkmark with ASCII alternative
-            message = message.replace('✓', '+')
+            # Replace Unicode characters with ASCII alternatives
+            message = str(message)  # Ensure message is a string
+            message = message.replace("✓", "√").replace("√", "v")  # Replace checkmark and square root with ASCII
+            message = message.replace("✅", "[OK]")
+            message = message.replace("❌", "[X]")
+            message = message.replace("⚠️", "[!]")
+            message = message.replace("📈", "[UP]")
+            message = message.replace("📉", "[DOWN]")
+            message = message.replace("\u221a", "v")  # Replace square root symbol
             
-            # Format with timestamp
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_message = f"{timestamp} - {str(message)}"
+            # Get timestamp
+            timestamp = datetime.now().strftime("%H:%M:%S")
             
-            # Console output
-            print(log_message)
-            
-            # File logging with encoding specification
+            # Log to console and file
+            print(f"{timestamp} - {message}")
             if hasattr(self, 'logger'):
-                self.logger.info(message)
+                # Ensure ASCII-only for file logging
+                ascii_message = message.encode('ascii', 'replace').decode()
+                self.logger.info(ascii_message)
             
-            # GUI logging
-            if hasattr(self, 'log_text'):
-                self.root.after(0, lambda: self.log_text.insert(tk.END, f"{log_message}\n"))
-                self.root.after(0, lambda: self.log_text.see(tk.END))
+            # Log to GUI if available
+            if hasattr(self, 'log_text') and self.log_text:
+                # Add to log text widget
+                self.log_text.insert(tk.END, f"{timestamp} - {message}\n")
+                self.log_text.see(tk.END)
                 
+                # Apply tag for important messages
+                if "[OK]" in message:
+                    self.log_text.tag_add("success", f"end-{len(message)+12}c", "end-1c")
+                    self.log_text.tag_config("success", foreground="green")
+                elif "[X]" in message:
+                    self.log_text.tag_add("error", f"end-{len(message)+12}c", "end-1c")
+                    self.log_text.tag_config("error", foreground="red")
+                elif "[!]" in message:
+                    self.log_text.tag_add("warning", f"end-{len(message)+12}c", "end-1c")
+                    self.log_text.tag_config("warning", foreground="orange")
+                
+                # Force GUI update
+                if hasattr(self, 'root'):
+                    self.root.update_idletasks()
+                    
         except Exception as e:
             print(f"Logging error: {str(e)}")
             # Fallback logging with just ASCII
-            print(f"{timestamp} - {message.encode('ascii', 'replace').decode()}")
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"{timestamp} - {str(message).encode('ascii', 'replace').decode()}")
 
     def update_trade_history(self, symbol, percentage, profit, is_win=True):
         try:
@@ -4006,111 +4834,33 @@ class CryptoScalpingBot:
         return 1 if (df['close'][-1] > df['upper_bb'][-1]) else \
             -1 if (df['close'][-1] < df['lower_bb'][-1]) else 0
 
-    def validate_ticker(self, ticker, symbol):
-        """Validate ticker data safely"""
+      
+    def validate_ticker(self, ticker, symbol=None):
+        """Validate ticker data has required fields"""
         try:
-            # Log the validation process
-            self.log_trade(f"Validating {symbol}")
-            
-            # Check if required fields exist
-            required_fields = ['last', 'quoteVolume', 'bid', 'ask']
-            if not all(field in ticker for field in required_fields):
-                self.log_trade(f"Missing required fields for {symbol}")
+            # If symbol is provided, check it matches
+            if symbol and ticker.get('symbol') != symbol:
                 return False
-
-            # Convert values safely
-            try:
-                price = float(ticker['last'])
-                volume = float(ticker['quoteVolume'])
-                bid = float(ticker['bid'])
-                ask = float(ticker['ask'])
-            except (TypeError, ValueError):
-                self.log_trade(f"Invalid numeric values for {symbol}")
-                return False
-
-            # Check minimum volume
-            min_volume = float(self.min_volume_entry.get())
-            if volume < min_volume:
-                return False
-
-            # Check price range (0.00001 to 5.0)
-            if not (0.00001 <= price <= 5.0):
-                return False
-
-            # Check for valid bid/ask
-            if bid <= 0 or ask <= 0:
-                return False
-
-            # Calculate spread
-            spread = (ask - bid) / bid * 100
-            if spread > 2.0:  # 2% max spread
-                return False
-
-            self.log_trade(f"Valid pair found: {symbol} at ${price:.6f}")
-            return True
-
-        except Exception as e:
-            self.log_trade(f"Error validating {symbol}: {str(e)}")
-            return False
-
-    def monitor_prices_continuously(self):
-        """Monitor active trades with real-time updates"""
-        while self.running:
-            try:
-                if self.active_trades:
-                    for trade_id, trade in list(self.active_trades.items()):
-                        try:
-                            # Get fresh price data (force fetch, don't use cache)
-                            ticker = self.exchange.fetch_ticker(trade['symbol'])
-                            current_price = float(ticker['last'])
-                            
-                            # Update trade data
-                            entry_price = trade['entry_price']
-                            profit_percentage = ((current_price - entry_price) / entry_price) * 100
-                            
-                            # Update trade info
-                            trade['current_price'] = current_price
-                            trade['current_profit_percentage'] = profit_percentage
-                            trade['last_update'] = datetime.now()
-                            
-                            # Update highest price if applicable
-                            if current_price > trade.get('highest_price', entry_price):
-                                trade['highest_price'] = current_price
-                                trade['highest_profit_percentage'] = profit_percentage
-                            
-                            # Update price history
-                            if trade['symbol'] not in self.price_history:
-                                self.price_history[trade['symbol']] = []
-                            
-                            self.price_history[trade['symbol']].append(
-                                (datetime.now(), current_price)
-                            )
-                            
-                            # Keep only recent history
-                            self.price_history[trade['symbol']] = self.price_history[trade['symbol']][-50:]
-                            
-                            # Log updates
-                            self.log_trade(f"""
-                            Trade Update - {trade['symbol']}:
-                            Current Price: {current_price:.8f}
-                            Entry Price: {entry_price:.8f}
-                            P/L: {profit_percentage:.2f}%
-                            Highest: {trade.get('highest_profit_percentage', 0):.2f}%
-                            """)
-                            
-                            # Update displays
-                            self.safe_execute(self.update_active_trades_display)
-                            self.safe_execute(self.update_chart)
-                            
-                        except Exception as e:
-                            self.log_trade(f"Error monitoring {trade['symbol']}: {str(e)}")
-                            continue
-                            
-                time.sleep(1)  # Update every second
+                
+            # Check required fields
+            required_fields = ['last', 'bid', 'ask']
+            for field in required_fields:
+                if field not in ticker or ticker[field] is None:
+                    return False
                     
-            except Exception as e:
-                self.log_trade(f"Price monitoring error: {str(e)}")
-                time.sleep(1)
+            # Check values are numeric and positive
+            for field in required_fields:
+                try:
+                    value = float(ticker[field])
+                    if value <= 0:
+                        return False
+                except:
+                    return False
+                    
+            return True
+            
+        except Exception:
+            return False
 
     def update_active_trades_display(self):
         """Update the active trades display in the GUI"""
@@ -4165,51 +4915,134 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error updating trades display: {str(e)}")
 
-    def run_bot(self):
-        """Main trading loop with straightforward logic"""
+    def monitor_trades(self):
+        """Monitor active trades with proper trailing stop implementation"""
         try:
-            # Initial startup checks
-            self.log_trade("\n=== BOT STARTED ===")
-            self.update_status(f"Running ({'Paper' if self.is_paper_trading else 'Real'})")
+            # Skip if no active trades
+            if not self.active_trades:
+                return
+                    
+            self.log_trade(f"Monitoring {len(self.active_trades)} active trades...")
+            
+            # Get current trading conditions
+            current_conditions = {
+                'profit_target': float(self.profit_target.get()) / 100,  # Convert to decimal
+                'stop_loss': float(self.stop_loss.get()) / 100,  # Convert to decimal
+                'trailing_stop': float(self.trailing_stop.get()) / 100,  # Convert to decimal
+                'trailing_activation': float(self.trailing_activation.get()) / 100  # Convert to decimal
+            }
+            
+            # For logging frequency control
+            current_time = time.time()
+            log_interval = 30  # Log status every 30 seconds
+            
+            # Monitor each trade
+            for trade_id, trade in list(self.active_trades.items()):
+                try:
+                    symbol = trade['symbol']
+                    entry_price = float(trade['entry_price'])
+                    entry_time = trade.get('entry_time', datetime.now())
+                    time_in_trade = (datetime.now() - entry_time).total_seconds()
+                    last_log_time = trade.get('last_log_time', 0)
+                    
+                    # Skip very new trades (give them at least 10 seconds to develop)
+                    if time_in_trade < 10:
+                        self.log_trade(f"Trade {symbol} is too new ({time_in_trade:.1f}s), skipping checks")
+                        continue
+                    
+                    # Get current price with error handling
+                    try:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                        current_price = float(ticker['last'])
+                        
+                        # Update trade with current price
+                        self.active_trades[trade_id]['current_price'] = current_price
+                        self.active_trades[trade_id]['last_update'] = datetime.now().strftime("%H:%M:%S")
+                        
+                        # Calculate profit percentage
+                        profit_pct = ((current_price - entry_price) / entry_price)  # Decimal form
+                        profit_pct_display = profit_pct * 100  # For display
+                        
+                        # Update trade with current profit percentage
+                        self.active_trades[trade_id]['current_profit_percentage'] = profit_pct_display
+                        
+                        # Update highest price and profit if applicable
+                        if current_price > trade.get('highest_price', 0):
+                            self.active_trades[trade_id]['highest_price'] = current_price
+                            
+                        if profit_pct > trade.get('highest_profit', -1):
+                            self.active_trades[trade_id]['highest_profit'] = profit_pct
+                            self.active_trades[trade_id]['highest_profit_percentage'] = profit_pct_display
+                        
+                        # Check for take profit
+                        if profit_pct >= current_conditions['profit_target']:
+                            self.log_trade(f"Take profit triggered for {symbol}: {profit_pct_display:.2f}% >= {current_conditions['profit_target']*100:.2f}%")
+                            self.close_trade(trade_id, trade, current_price, "take_profit")
+                            continue
+                        
+                        # Check for stop loss
+                        if profit_pct <= -current_conditions['stop_loss']:
+                            self.log_trade(f"Stop loss triggered for {symbol}: {profit_pct_display:.2f}% <= -{current_conditions['stop_loss']*100:.2f}%")
+                            self.close_trade(trade_id, trade, current_price, "stop_loss")
+                            continue
+                        
+                        # Check for trailing stop
+                        highest_profit = trade.get('highest_profit', 0)
+                        if highest_profit >= current_conditions['trailing_activation']:
+                            # Calculate drop from highest profit
+                            drop = highest_profit - profit_pct
+                            if drop >= current_conditions['trailing_stop']:
+                                self.log_trade(f"Trailing stop triggered for {symbol}: Drop from {highest_profit*100:.2f}% to {profit_pct_display:.2f}% (>{current_conditions['trailing_stop']*100:.2f}%)")
+                                self.close_trade(trade_id, trade, current_price, "trailing_stop")
+                                continue
+                        
+                        # Update price history for charting
+                        if symbol in self.price_history:
+                            self.price_history[symbol].append((datetime.now(), current_price))
+                            # Limit history size
+                            self.price_history[symbol] = self.price_history[symbol][-100:]
+                        
+                        # Log status periodically
+                        if current_time - last_log_time > log_interval:
+                            self.log_trade(f"Trade {symbol}: Entry=${entry_price:.8f}, Current=${current_price:.8f}, P/L={profit_pct_display:.2f}%, Highest={trade.get('highest_profit_percentage', 0):.2f}%")
+                            self.active_trades[trade_id]['last_log_time'] = current_time
+                    
+                    except Exception as e:
+                        self.log_trade(f"Error getting price for {symbol}: {str(e)}")
+                        continue
+                
+                except Exception as e:
+                    self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
+                    continue
+            
+            # Update displays after monitoring
+            self.update_active_trades_display()
+            self.update_balance_display()
+            
+        except Exception as e:
+            self.log_trade(f"Error in trade monitoring: {str(e)}")
 
+    def run_bot(self):
+        """Main bot loop with improved trade monitoring"""
+        try:
+            self.log_trade("=== BOT STARTED ===")
+            self.update_status("Running (Paper)" if self.is_paper_trading else "Running (Real)")
+            self.running = True
+            
+            # Main loop
             while self.running:
                 try:
-                    # 1. SCAN MARKET
+                    # 1. UPDATE MARKET DATA
                     self.update_status("Fetching market data...")
-                    tickers = self.fetch_tickers_with_retry()  # Get fresh data
+                    self.update_btc_data()  # Always update BTC as market indicator
                     
-                    # 2. MANAGE ACTIVE TRADES FIRST (Exit conditions)
+                    # 2. MONITOR EXISTING TRADES
                     if self.active_trades:
-                        for trade_id, trade in list(self.active_trades.items()):
-                            try:
-                                current_price = float(self.exchange.fetch_ticker(trade['symbol'])['last'])
-                                entry_price = float(trade['entry_price'])
-                                profit_pct = ((current_price - entry_price) / entry_price) * 100
-                                
-                                # Update highest profit if new high
-                                if profit_pct > trade.get('highest_profit', -999):
-                                    trade['highest_profit'] = profit_pct
-                                
-                                # Get thresholds
-                                stop_loss = float(self.stop_loss.get())
-                                trailing_stop = float(self.trailing_stop.get())
-                                trailing_activation = float(self.trailing_activation.get())
-                                highest_profit = trade.get('highest_profit', 0)
-
-                                # Exit conditions in order of priority
-                                if profit_pct <= -stop_loss:  # Stop loss hit
-                                    self.close_trade(trade_id, trade, current_price, "stop loss")
-                                    continue
-                                    
-                                if highest_profit >= trailing_activation:  # Check trailing stop
-                                    drop = highest_profit - profit_pct
-                                    if drop >= trailing_stop:
-                                        self.close_trade(trade_id, trade, current_price, "trailing stop")
-                                        continue
-
-                            except Exception as e:
-                                self.log_trade(f"Error managing trade {trade_id}: {str(e)}")
-
+                        self.monitor_trades()
+                        
+                        # Give trades time to develop before scanning for new ones
+                        time.sleep(3)
+                    
                     # 3. LOOK FOR NEW TRADES (Entry conditions)
                     self.update_status("Scanning for opportunities...")
                     scan_success = self.scan_opportunities()
@@ -4220,7 +5053,9 @@ class CryptoScalpingBot:
                     self.update_metrics()
                     
                     # 5. WAIT BEFORE NEXT SCAN
-                    time.sleep(2)  # Pause between cycles
+                    # Longer wait if we have active trades to give them time to develop
+                    wait_time = 5 if self.active_trades else 2
+                    time.sleep(wait_time)
 
                 except Exception as e:
                     self.log_trade(f"Error in main loop: {str(e)}")
