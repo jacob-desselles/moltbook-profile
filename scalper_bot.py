@@ -13,6 +13,7 @@ from typing import Dict
 import json
 import time
 import gc
+import traceback
 import psutil
 import configparser
 import uuid
@@ -264,7 +265,7 @@ class CryptoScalpingBot:
         self.style.configure('Dark.TButton',
             background='#1a1a1a',
             foreground='white')
-        self.root.title("Vantrex v1.45") 
+        self.root.title("Vantrex v1.70") 
         self.root.geometry("1200x1000")
         
         # Initialize metrics
@@ -273,6 +274,10 @@ class CryptoScalpingBot:
         self.losing_trades = 0
         self.total_profit = 0.0
         self.total_fees = 0.0
+
+        # Add trend strength parameters
+        self.use_trend_filter = tk.BooleanVar(self.root, value=True)
+        self.trend_strength_min = tk.StringVar(self.root, value="15")
         
         # Initialize state variables
         self.running = False
@@ -325,6 +330,9 @@ class CryptoScalpingBot:
         self.taker_fee = 0.004   # 0.40% for taker orders
         self.total_fee_percentage = self.taker_fee * 2  # 0.80% total for entry and exit
 
+        # Add a flag to track if we're using limit orders
+        self.using_limit_orders = False
+
         # Initialize technical indicator StringVars
         self.rsi_period = tk.StringVar(self.root, value="14")
         self.rsi_overbought = tk.StringVar(self.root, value="75")
@@ -347,6 +355,7 @@ class CryptoScalpingBot:
         self.chart_timeframe = 50  # number of points to show
         self.price_precision = 8
         self.amount_precision = 8
+        self.gross_profit = 0.0
 
 
         # Initialize DataManager
@@ -1435,6 +1444,9 @@ class CryptoScalpingBot:
             self.update_status("Starting...")
             self.log_trade("=== BOT STARTED ===")
                 
+            # Force update fee calculations before starting
+            self.force_update_fee_calculations()
+                
             # Start the trading thread
             self.trading_thread = threading.Thread(target=self.run_bot)
             self.trading_thread.daemon = True
@@ -1589,30 +1601,41 @@ class CryptoScalpingBot:
             self.maker_fee = maker_fee
             self.taker_fee = taker_fee
             
-            # Calculate total round-trip fee (assuming taker for both entry and exit)
-            self.total_fee_percentage = self.taker_fee * 2  # Total round-trip fee for market orders
+            # Calculate total round-trip fee based on order type
+            use_limit_orders = self.use_limit_orders_var.get() if hasattr(self, 'use_limit_orders_var') else False
+            
+            if use_limit_orders:
+                # Using limit orders (maker fees)
+                self.total_fee_percentage = self.maker_fee * 2  # Entry and exit
+            else:
+                # Using market orders (taker fees)
+                self.total_fee_percentage = self.taker_fee * 2  # Entry and exit
             
             # Debug: Print the updated instance variables
             self.log_trade(f"DEBUG: self.maker_fee = {self.maker_fee}")
             self.log_trade(f"DEBUG: self.taker_fee = {self.taker_fee}")
             self.log_trade(f"DEBUG: self.total_fee_percentage = {self.total_fee_percentage}")
+            self.log_trade(f"DEBUG: using limit orders = {use_limit_orders}")
             
             # Update the total fees label
             total_fee_pct = self.total_fee_percentage * 100
-            self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
+            fee_type = "maker" if use_limit_orders else "taker"
+            if hasattr(self, 'total_fees_label'):
+                self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
             
             # Log the update
-            self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, Total (taker*2) {total_fee_pct:.2f}%")
+            self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, " +
+                        f"Total ({fee_type}*2) {total_fee_pct:.2f}%")
             
             # Update tooltips
-            self.add_tooltip(self.profit_target, 
-                f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
+            if hasattr(self, 'profit_target'):
+                self.add_tooltip(self.profit_target, 
+                    f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
             
-            # Validate parameters to ensure profit target is above fees
-            self.validate_parameters()
-            
-        except ValueError as e:
-            self.log_trade(f"Error updating fees: {str(e)}")
+            return True
+        except Exception as e:
+            self.log_trade(f"Error initializing fees: {str(e)}")
+            return False
 
     def update_status(self, status):
         """Update status display with proper GUI handling"""
@@ -2075,6 +2098,19 @@ class CryptoScalpingBot:
             ttk.Label(momentum_row, text="Momentum Min (%)").pack(side=tk.LEFT, padx=5)
             ttk.Entry(momentum_row, textvariable=self.momentum_threshold).pack(side=tk.RIGHT, padx=5)
 
+            # Add Trend Filter checkbox
+            trend_filter_row = ttk.Frame(filters_frame)
+            trend_filter_row.pack(fill=tk.X, pady=2)
+            ttk.Label(trend_filter_row, text="Use Trend Filter").pack(side=tk.LEFT, padx=5)
+            trend_filter_check = ttk.Checkbutton(trend_filter_row, variable=self.use_trend_filter)
+            trend_filter_check.pack(side=tk.RIGHT, padx=5)
+
+            # Add Trend Strength parameter
+            trend_strength_row = ttk.Frame(filters_frame)
+            trend_strength_row.pack(fill=tk.X, pady=2)
+            ttk.Label(trend_strength_row, text="Min Trend Strength").pack(side=tk.LEFT, padx=5)
+            ttk.Entry(trend_strength_row, textvariable=self.trend_strength_min).pack(side=tk.RIGHT, padx=5)
+
             # === TECHNICAL INDICATORS (Right Column) ===
             indicators_frame = ttk.LabelFrame(right_params, text="Technical Indicators")
             indicators_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -2330,30 +2366,46 @@ class CryptoScalpingBot:
             self.maker_fee = maker_fee
             self.taker_fee = taker_fee
             
-            # Calculate total round-trip fee (assuming taker for both entry and exit)
-            self.total_fee_percentage = self.taker_fee * 2  # Total round-trip fee for market orders
+            # Check if we're using limit orders
+            use_limit_orders = self.use_limit_orders_var.get() if hasattr(self, 'use_limit_orders_var') else False
+            
+            # Calculate total round-trip fee based on order type
+            if use_limit_orders:
+                # Using limit orders (maker fees)
+                self.total_fee_percentage = self.maker_fee * 2  # Entry and exit
+                fee_type = "maker"
+            else:
+                # Using market orders (taker fees)
+                self.total_fee_percentage = self.taker_fee * 2  # Entry and exit
+                fee_type = "taker"
             
             # Debug: Print the updated instance variables
             self.log_trade(f"DEBUG: self.maker_fee = {self.maker_fee}")
             self.log_trade(f"DEBUG: self.taker_fee = {self.taker_fee}")
             self.log_trade(f"DEBUG: self.total_fee_percentage = {self.total_fee_percentage}")
+            self.log_trade(f"DEBUG: using limit orders = {use_limit_orders}")
             
             # Update the total fees label
             total_fee_pct = self.total_fee_percentage * 100
-            self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
+            if hasattr(self, 'total_fees_label'):
+                self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
             
             # Log the update
-            self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, Total (taker×2) {total_fee_pct:.2f}%")
+            self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, " +
+                        f"Total ({fee_type}*2) {total_fee_pct:.2f}%")
             
             # Update tooltips
-            self.add_tooltip(self.profit_target, 
-                f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
+            if hasattr(self, 'profit_target'):
+                self.add_tooltip(self.profit_target, 
+                    f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
             
             # Validate parameters to ensure profit target is above fees
             self.validate_parameters()
             
+            return True
         except ValueError as e:
             self.log_trade(f"Error updating fees: {str(e)}")
+            return False
 
     def setup_tooltips(self):
         """Setup tooltips for all parameters"""
@@ -3830,114 +3882,104 @@ class CryptoScalpingBot:
 
     def live_update_conditions(self):
         """Apply condition changes without restarting the bot"""
+        try:
+            self.validate_parameters()  # Validate new parameters
+            self.force_update_fee_calculations()  # Update fees if needed
+            self.update_metrics()  # Refresh metrics
+            self.update_balance_display()  # Refresh balance
+            self.log_trade("Trading conditions updated and applied.")
+            messagebox.showinfo("Success", "Trading conditions updated and applied.")
+        except Exception as e:
+            self.log_trade(f"Error applying new conditions: {str(e)}")
+            messagebox.showerror("Error", f"Failed to apply new conditions: {str(e)}")
+
     def close_trade(self, trade_id, trade, current_price, reason="closed"):
         """Close a trade and update performance metrics"""
         try:
             if trade_id not in self.active_trades:
                 self.log_trade(f"Trade {trade_id} not found in active trades")
                 return False
-                
+
             symbol = trade['symbol']
             entry_price = trade['entry_price']
             position_size = trade.get('position_size', 0)
-            
+
             # Calculate profit/loss
             price_change = (current_price - entry_price) / entry_price
             gross_pl = position_size * price_change
-            
+
             # Calculate trade duration
             entry_time = trade.get('entry_time', datetime.now() - timedelta(minutes=1))
             duration = datetime.now() - entry_time
             hours, remainder = divmod(duration.total_seconds(), 3600)
             minutes, seconds = divmod(remainder, 60)
             duration_str = f"{int(hours)}:{int(minutes):02d}:{int(seconds):02d}"
-            
-            # Calculate fees
-            fee_type = "maker" if trade.get('is_limit_order', False) else "taker"
+
+            # Determine fee type (maker or taker)
+            if 'is_limit_order' in trade:
+                fee_type = "maker" if trade['is_limit_order'] else "taker"
+            elif hasattr(self, 'using_limit_orders'):
+                fee_type = "maker" if self.using_limit_orders else "taker"
+            else:
+                fee_type = "taker"  # Default fallback
+
             fee_pct = self.maker_fee if fee_type == "maker" else self.taker_fee
-            
+
             # Entry and exit fees
             entry_fee = position_size * fee_pct
             exit_fee = (position_size * (1 + price_change)) * fee_pct
             total_fees = entry_fee + exit_fee
-            
+
             # Calculate net profit/loss
             net_pl = gross_pl - total_fees
-            
+
             # Update paper balance
             self.paper_balance += position_size + net_pl
-            
+            self.gross_profit += gross_pl      # Track gross profit (before fees)
+            self.total_profit += net_pl        # Track net profit (after fees)
+            self.total_fees += total_fees      # <-- Only add ONCE
+
             # Log the trade closure
-            order_type = "LIMIT" if trade.get('is_limit_order', False) else "MARKET"
-            self.log_trade(f"CLOSED {order_type} {trade['symbol']} @ ${current_price:.6f} | P/L: ${net_pl:.2f} ({price_change*100:.2f}%) | Duration: {duration_str}")
-            self.log_trade(f"Exit Fee: ${exit_fee:.4f} ({fee_type}: {fee_pct*100:.2f}%) | Total Fees: ${total_fees:.4f}")
-            
+            order_type = "LIMIT" if fee_type == "maker" else "MARKET"
+            self.log_trade(
+                f"CLOSED {order_type} {trade['symbol']} @ ${current_price:.6f} | "
+                f"P/L: ${net_pl:.2f} ({price_change*100:.2f}%) | Duration: {duration_str}"
+            )
+            self.log_trade(
+                f"Exit Fee: ${exit_fee:.4f} ({fee_type}: {fee_pct*100:.2f}%) | Total Fees: ${total_fees:.4f}"
+            )
+
             # Update performance metrics
             self.total_trades += 1
             if net_pl > 0:
                 self.winning_trades += 1
             else:
                 self.losing_trades += 1
-            self.total_profit += net_pl  # Use net_pl instead of gross_pl
-            self.total_fees += total_fees
-            
+
             # Update trade history - simplified call without status
             self.update_trade_history(
                 symbol=symbol,
-                percentage=price_change*100,
+                percentage=price_change * 100,
                 profit=net_pl,
                 is_win=(net_pl > 0)
             )
-            
+
             # Remove from active trades
             if trade_id in self.active_trades:
                 del self.active_trades[trade_id]
-            
+
             # Update displays
             self.update_active_trades_display()
             self.update_balance_display()
             self.update_metrics()
-            
+
             return True
-            
+
         except Exception as e:
             self.log_trade(f"Error closing trade: {str(e)}")
-            import traceback
             self.log_trade(traceback.format_exc())
             return False
-        if not self.validate_conditions():
-            return
-        
-        # Get current settings
-        new_conditions = {
-            'consecutive_rises': int(self.consecutive_rises.get()),
-            'momentum': float(self.momentum_threshold.get()),
-            'max_spread': float(self.max_spread.get()),
-            'volume_increase': float(self.volume_increase.get()),
-            'max_volatility': float(self.max_volatility.get())
-        }
-        # Update active trades
-        for trade_id in list(self.active_trades.keys()):
-            try:
-                # Tighten trailing stops for existing trades
-                self.active_trades[trade_id]['trailing_stop_pct'] = min(
-                    self.active_trades[trade_id]['trailing_stop_pct'],
-                    float(self.trailing_stop.get()) / 100
-                )
-            except Exception as e:
-                self.log_trade(f"Failed to update trade {trade_id}: {str(e)}")
-        
-        # Log the changes
-        changes = "\n".join([f"{k}: {v}" for k,v in new_conditions.items()])
-        self.log_trade(f"""
-        [LIVE UPDATE] Applied new conditions:
-        {changes}
-        Active trades updated with tighter stops
-        """)
-        
-        # Visual feedback
-        self.status_label.config(text="Conditions Updated Live", foreground="blue")
-        self.root.after(3000, lambda: self.update_status(f"Running ({'Paper' if self.is_paper_trading else 'Real'})"))
+
     def validate_settings(self):
         try:
             # Validate basic settings
@@ -4557,8 +4599,14 @@ class CryptoScalpingBot:
             if len(self.active_trades) >= max_trades:
                 return False
             
-            # Get price and volume data
+            # Skip if price is above maximum allowed
             price = float(ticker['last'])
+            max_price = float(self.max_price.get()) if hasattr(self, 'max_price') else 5.0
+            if price > max_price:
+                self.log_trade(f"Price too high for {symbol}: ${price:.6f} > ${max_price:.2f}")
+                return False
+            
+            # Get price data
             df = pair_data.get('df')
             
             if df is None or len(df) < 20:
@@ -4568,7 +4616,7 @@ class CryptoScalpingBot:
             # Log the pair we're analyzing
             self.log_trade(f"Analyzing {symbol} at ${price:.6f} with volume ${volume:.2f}")
             
-            # Get trading parameters from GUI
+            # Get trading parameters from GUI - PROPERLY USE THE USER'S SETTING
             required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 3
             price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.5
             volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 20
@@ -4607,16 +4655,26 @@ class CryptoScalpingBot:
                     conditions_met += 1
                     conditions.append(f"Volume surge ({(vol_ratio-1)*100:.2f}% >= {volume_increase:.2f}%)")
             
+            # CONDITION 4: Trend Strength Check (optional based on user setting)
+            use_trend_filter = self.use_trend_filter.get() if hasattr(self, 'use_trend_filter') else False
+            
+            if use_trend_filter:
+                trend_min = float(self.trend_strength_min.get()) if hasattr(self, 'trend_strength_min') else 15
+                trend_direction, trend_strength = self.detect_trend_strength(df)
+                
+                if trend_direction > 0 and trend_strength >= trend_min:
+                    conditions_met += 1
+                    conditions.append(f"Strong uptrend (strength: {trend_strength:.2f} >= {trend_min})")
+                    
+                # Log trend info even if condition not met
+                self.log_trade(f"Trend analysis: direction={trend_direction}, strength={trend_strength:.2f}, min={trend_min}")
+            
             # Log conditions
             self.log_trade(f"Analysis for {symbol}: {conditions_met}/{required_conditions} conditions met")
             for condition in conditions:
                 self.log_trade(f"✓ {condition}")
             
-            # IMPORTANT: Temporarily lower the required conditions to find more trades
-            # For debugging purposes, accept just 1 condition to generate more trades
-            required_conditions = 1  # Accept any pair with at least one positive condition
-            
-            # Final decision
+            # Final decision - using actual required conditions from GUI
             if conditions_met >= required_conditions:
                 self.log_trade(f"OPPORTUNITY FOUND: {symbol} meets {conditions_met}/{required_conditions} conditions")
                 return True
@@ -4688,7 +4746,17 @@ class CryptoScalpingBot:
     def calculate_trade_parameters(self, entry_price):
         """Calculate optimal trade parameters considering fees"""
         try:
-            total_fees = self._total_fee_percentage  # Use the instance variable
+            # Use our tracking flag instead of checking the variable each time
+            if hasattr(self, 'using_limit_orders') and self.using_limit_orders:
+                total_fees = self.maker_fee * 2  # Entry and exit with maker fees
+                fee_type = "LIMIT"
+            else:
+                total_fees = self.taker_fee * 2  # Entry and exit with taker fees
+                fee_type = "MARKET"
+            
+            # Log the fee calculation
+            self.log_trade(f"Using {fee_type} orders: " +
+                        f"Total round-trip fee: {total_fees*100:.2f}%")
             
             # Minimum profit needed to break even
             min_profit = total_fees * 1.2  # Add 20% buffer over fees
@@ -4773,6 +4841,43 @@ class CryptoScalpingBot:
             self.log_trade(f"Bot error: {str(e)}")
             self.stop_bot()
 
+    def force_update_fee_calculations(self):
+        """Force update all fee-related calculations to ensure consistency"""
+        try:
+            # Check if we're using limit orders
+            use_limit_orders = False
+            if hasattr(self, 'use_limit_orders_var'):
+                use_limit_orders = self.use_limit_orders_var.get()
+            
+                # Update our tracking flag
+                self.using_limit_orders = use_limit_orders
+            
+            # Update the total fee percentage
+            if use_limit_orders:
+                self.total_fee_percentage = self.maker_fee * 2
+                fee_type = "maker"
+            else:
+                self.total_fee_percentage = self.taker_fee * 2
+                fee_type = "taker"
+            
+            # Update the total fees label
+            total_fee_pct = self.total_fee_percentage * 100
+            if hasattr(self, 'total_fees_label'):
+                self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
+            
+            # Log the update
+            self.log_trade(f"Fee calculations force-updated: Using {fee_type} fees ({fee_type}*2 = {total_fee_pct:.2f}%)")
+            
+            # Update tooltips
+            if hasattr(self, 'profit_target'):
+                self.add_tooltip(self.profit_target, 
+                    f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
+            
+            return True
+        except Exception as e:
+            self.log_trade(f"Error updating fee calculations: {str(e)}")
+            return False
+
     def execute_trade(self, symbol, ticker):
         """Execute a trade with proper error handling"""
         try:
@@ -4830,7 +4935,8 @@ class CryptoScalpingBot:
                 'highest_profit_percentage': 0.0,
                 'stop_loss_pct': float(self.stop_loss.get()) / 100 if hasattr(self, 'stop_loss') else 0.008,
                 'profit_target_pct': float(self.profit_target.get()) / 100 if hasattr(self, 'profit_target') else 0.015,
-                'trailing_stop_pct': float(self.trailing_stop.get()) / 100 if hasattr(self, 'trailing_stop') else 0.003
+                'trailing_stop_pct': float(self.trailing_stop.get()) / 100 if hasattr(self, 'trailing_stop') else 0.003,
+                'is_limit_order': self.using_limit_orders
             }
             
             # Double-check max trades one more time before adding
@@ -5410,6 +5516,56 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error initializing market data: {str(e)}")
             return False
+        
+    def detect_trend_strength(self, df):
+        """
+        Detect trend strength using directional movement for lower-priced cryptocurrencies
+        Returns a tuple of (trend_direction, trend_strength)
+        trend_direction: 1 for uptrend, -1 for downtrend, 0 for neutral
+        trend_strength: 0-100 value indicating strength (higher = stronger trend)
+        """
+        try:
+            if df is None or len(df) < 14:
+                return 0, 0  # Neutral trend, zero strength
+            
+            # Use percentage changes instead of absolute values to work well with any price range
+            price_series = df['price'].iloc[-14:].copy()
+            
+            # Calculate true range as percentage of price
+            high_pct = price_series.pct_change().fillna(0) + 1
+            low_pct = 1 - price_series.pct_change().fillna(0).abs()
+            
+            # Use percentage changes for calculations to work with any price range
+            changes = price_series.pct_change().fillna(0)
+            
+            # Calculate directional movement
+            up_moves = changes.copy()
+            up_moves[up_moves < 0] = 0
+            down_moves = -changes.copy()
+            down_moves[down_moves < 0] = 0
+            
+            # Calculate smoothed indicators
+            pos_di = 100 * up_moves.mean() / changes.abs().mean() if changes.abs().mean() > 0 else 0
+            neg_di = 100 * down_moves.mean() / changes.abs().mean() if changes.abs().mean() > 0 else 0
+            
+            # Calculate trend direction
+            if pos_di > neg_di:
+                trend_direction = 1  # Uptrend
+            elif neg_di > pos_di:
+                trend_direction = -1  # Downtrend
+            else:
+                trend_direction = 0  # Neutral
+            
+            # Calculate simplified trend strength (0-100)
+            di_diff = abs(pos_di - neg_di)
+            di_sum = pos_di + neg_di
+            trend_strength = 100 * (di_diff / di_sum) if di_sum > 0 else 0
+            
+            return trend_direction, trend_strength
+            
+        except Exception as e:
+            self.log_trade(f"Error in trend detection: {str(e)}")
+            return 0, 0  # Default to neutral trend, zero strength
 
     def smart_trade_filter(self, pair_data):
         """Smart filter for trade opportunities with adaptive thresholds"""
@@ -5595,62 +5751,48 @@ class CryptoScalpingBot:
             return None
 
     def update_metrics(self):
-        """Update performance metrics display"""
         try:
-            # Calculate win rate
             win_rate = 0
             if self.total_trades > 0:
                 win_rate = (self.winning_trades / self.total_trades) * 100
-                
-            # Calculate net profit
-            net_profit = self.total_profit - self.total_fees
-            
-            # Update metrics labels if they exist
+
+            # Show gross profit as "Total Profit", net profit as "Net Profit"
+            total_profit = self.gross_profit
+            net_profit = self.gross_profit - self.total_fees
+
             if hasattr(self, 'metrics_labels'):
-                # Update total profit
                 if 'total_profit' in self.metrics_labels:
                     self.metrics_labels['total_profit'].config(
-                        text=f"${self.total_profit:.2f}",
-                        foreground="green" if self.total_profit > 0 else "red"
+                        text=f"${total_profit:.2f}",
+                        foreground="green" if total_profit > 0 else "red"
                     )
-                
-                # Update total fees
                 if 'total_fees' in self.metrics_labels:
                     self.metrics_labels['total_fees'].config(
                         text=f"${self.total_fees:.2f}"
                     )
-                
-                # Update net profit
                 if 'net_profit' in self.metrics_labels:
                     self.metrics_labels['net_profit'].config(
                         text=f"${net_profit:.2f}",
                         foreground="green" if net_profit > 0 else "red"
                     )
-                
-                # Update win rate with win/loss ratio
                 if 'win_rate' in self.metrics_labels:
                     self.metrics_labels['win_rate'].config(
                         text=f"{win_rate:.1f}% ({self.winning_trades}/{self.losing_trades})"
                     )
-                
-                # Update total trades
                 if 'total_trades' in self.metrics_labels:
                     self.metrics_labels['total_trades'].config(
                         text=f"{self.total_trades}"
                     )
-                
-                # Update paper balance
                 if 'paper_balance' in self.metrics_labels:
                     self.metrics_labels['paper_balance'].config(
                         text=f"${self.paper_balance:.2f}"
                     )
-            
-            # Log metrics update for debugging
-            self.log_trade(f"Updated metrics: Profit=${self.total_profit:.2f}, Fees=${self.total_fees:.2f}, " +
-                          f"Net=${net_profit:.2f}, Trades={self.total_trades}, " +
-                          f"Wins={self.winning_trades}, Losses={self.losing_trades}, " +
-                          f"Win Rate={win_rate:.1f}%, Balance=${self.paper_balance:.2f}")
-                
+
+            self.log_trade(f"Updated metrics: Gross=${total_profit:.2f}, Fees=${self.total_fees:.2f}, "
+                        f"Net=${net_profit:.2f}, Trades={self.total_trades}, "
+                        f"Wins={self.winning_trades}, Losses={self.losing_trades}, "
+                        f"Win Rate={win_rate:.1f}%, Balance=${self.paper_balance:.2f}")
+
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
             import traceback
@@ -5659,10 +5801,6 @@ class CryptoScalpingBot:
     def collect_trade_data(self):
         """Initialize trade data collection system"""
         try:
-            import pandas as pd
-            from datetime import datetime
-            import json
-            import os
 
             # Initialize DataFrame if not exists
             if not hasattr(self, 'trade_data'):
@@ -5744,26 +5882,28 @@ class CryptoScalpingBot:
 
             # Format the trade result
             result = f"{symbol}: {percentage:.2f}%, ${profit:.2f}\n"
-            
+
             if hasattr(self, 'history_text'):
                 self.history_text.config(state=tk.NORMAL)
+                # Get the index before inserting
+                insert_index = self.history_text.index(tk.END)
+                line_number = insert_index.split('.')[0]
+
                 self.history_text.insert(tk.END, result)
-                
-                # Color code based on actual profit/loss
-                line_start = f"{float(self.history_text.index('end-2c').split('.')[0])-1}.0"
-                line_end = f"{float(self.history_text.index('end-1c').split('.')[0])-1}.end"
-                
+
+                # Tag the just-inserted line
+                line_start = f"{line_number}.0"
+                line_end = f"{line_number}.end"
+
                 color = "green" if profit > 0 else "red"
                 self.history_text.tag_add(color, line_start, line_end)
                 self.history_text.tag_config("green", foreground="green")
                 self.history_text.tag_config("red", foreground="red")
-                
+
                 self.history_text.see(tk.END)
                 self.history_text.config(state=tk.DISABLED)
-                
-                # Force GUI update
                 self.history_text.update_idletasks()
-                
+
         except Exception as e:
             self.log_trade(f"Error updating trade history: {str(e)}")
 
