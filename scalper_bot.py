@@ -333,6 +333,19 @@ class CryptoScalpingBot:
         # Add a flag to track if we're using limit orders
         self.using_limit_orders = False
 
+        # Support/Resistance parameters
+        self.use_support_resistance = tk.BooleanVar(self.root, value=True)
+        self.sr_lookback = tk.StringVar(self.root, value="50")
+        self.sr_threshold = tk.StringVar(self.root, value="0.2")
+        
+        # Candlestick pattern parameters
+        self.use_candlestick_patterns = tk.BooleanVar(self.root, value=True)
+        self.pattern_confidence_min = tk.StringVar(self.root, value="70")
+        
+        # Volume profile parameters
+        self.use_volume_profile = tk.BooleanVar(self.root, value=True)
+        self.volume_quality_min = tk.StringVar(self.root, value="60")
+
         # Initialize technical indicator StringVars
         self.rsi_period = tk.StringVar(self.root, value="14")
         self.rsi_overbought = tk.StringVar(self.root, value="75")
@@ -2111,6 +2124,30 @@ class CryptoScalpingBot:
             ttk.Label(trend_strength_row, text="Min Trend Strength").pack(side=tk.LEFT, padx=5)
             ttk.Entry(trend_strength_row, textvariable=self.trend_strength_min).pack(side=tk.RIGHT, padx=5)
 
+            # Add a separator line
+            ttk.Separator(filters_frame, orient='horizontal').pack(fill=tk.X, pady=5)
+
+            # Compact advanced filters
+            advanced_row1 = ttk.Frame(filters_frame)
+            advanced_row1.pack(fill=tk.X, pady=2)
+            sr_check = ttk.Checkbutton(advanced_row1, text="S/R", variable=self.use_support_resistance)
+            sr_check.pack(side=tk.LEFT, padx=5)
+            ttk.Entry(advanced_row1, textvariable=self.sr_lookback, width=4).pack(side=tk.LEFT, padx=2)
+            ttk.Label(advanced_row1, text="/").pack(side=tk.LEFT)
+            ttk.Entry(advanced_row1, textvariable=self.sr_threshold, width=4).pack(side=tk.LEFT, padx=2)
+            ttk.Label(advanced_row1, text="%").pack(side=tk.LEFT)
+
+            advanced_row2 = ttk.Frame(filters_frame)
+            advanced_row2.pack(fill=tk.X, pady=2)
+            pattern_check = ttk.Checkbutton(advanced_row2, text="Patterns", variable=self.use_candlestick_patterns)
+            pattern_check.pack(side=tk.LEFT, padx=5)
+            ttk.Entry(advanced_row2, textvariable=self.pattern_confidence_min, width=4).pack(side=tk.LEFT, padx=2)
+            ttk.Label(advanced_row2, text="%").pack(side=tk.LEFT)
+
+            volume_check = ttk.Checkbutton(advanced_row2, text="Vol Profile", variable=self.use_volume_profile)
+            volume_check.pack(side=tk.LEFT, padx=20)
+            ttk.Entry(advanced_row2, textvariable=self.volume_quality_min, width=4).pack(side=tk.LEFT, padx=2)
+
             # === TECHNICAL INDICATORS (Right Column) ===
             indicators_frame = ttk.LabelFrame(right_params, text="Technical Indicators")
             indicators_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -3330,7 +3367,7 @@ class CryptoScalpingBot:
                 self.log_trade(f"Error updating timer: {str(e)}")
 
     def update_chart(self):
-        """Update the price chart with active trades using real timestamps"""
+        """Update the price chart with active trades using a fixed time window"""
         try:
             # Check if chart objects exist
             if not hasattr(self, 'ax') or not hasattr(self, 'canvas'):
@@ -3354,6 +3391,11 @@ class CryptoScalpingBot:
             for spine in self.ax.spines.values():
                 spine.set_color(grid_color)
             
+            # Calculate time window (last 30 minutes)
+            now = datetime.now()
+            time_window = timedelta(minutes=30)
+            window_start = now - time_window
+            
             # Draw key levels
             try:
                 profit_target = float(self.profit_target.get())
@@ -3370,7 +3412,6 @@ class CryptoScalpingBot:
                 # Draw zero line
                 self.ax.axhline(y=0, color=grid_color, linestyle='-', alpha=0.3)
                 
-                self.log_trade(f"Drew key levels: PT={profit_target}%, SL={stop_loss}%")
             except Exception as e:
                 self.log_trade(f"Error drawing key levels: {str(e)}")
             
@@ -3388,52 +3429,28 @@ class CryptoScalpingBot:
             for trade_id, trade in self.active_trades.items():
                 symbol = trade['symbol']
                 entry_price = trade['entry_price']
+                entry_time = trade.get('entry_time', now - timedelta(minutes=1))
                 
                 # Initialize price history for this symbol if it doesn't exist
                 if symbol not in self.price_history:
                     self.price_history[symbol] = []
                 
-                # Get current price - use existing methods
+                # Add current price point
                 try:
-                    current_price = None
-                    
-                    # Try to get price from exchange
-                    if hasattr(self, 'exchange'):
-                        try:
-                            ticker = self.exchange.fetch_ticker(symbol)
-                            current_price = float(ticker['last'])
-                        except Exception as e:
-                            self.log_trade(f"Exchange price fetch error for {symbol}: {str(e)}")
-                    
-                    # If that failed, use the current price from the trade
-                    if current_price is None and 'current_price' in trade:
-                        current_price = trade['current_price']
-                    
-                    # If we still don't have a price, use entry price
-                    if current_price is None:
-                        current_price = entry_price
-                        self.log_trade(f"Using entry price as fallback for {symbol}")
-                    
-                    current_time = datetime.now()
-                    
-                    # Add to price history if not empty
-                    if len(self.price_history[symbol]) == 0:
-                        # Add entry point
-                        entry_time = trade.get('entry_time', datetime.now() - timedelta(minutes=1))
-                        self.price_history[symbol].append((entry_time, entry_price))
-                    
-                    # Add current point
-                    self.price_history[symbol].append((current_time, current_price))
-                    
-                    # Keep only last 100 points to avoid memory issues
-                    if len(self.price_history[symbol]) > 100:
-                        self.price_history[symbol] = self.price_history[symbol][-100:]
+                    current_price = float(self.exchange.fetch_ticker(symbol)['last'])
+                    self.price_history[symbol].append((now, current_price))
                 except Exception as e:
-                    self.log_trade(f"Error updating price history for {symbol}: {str(e)}")
+                    self.log_trade(f"Error fetching price for {symbol}: {str(e)}")
                     continue
                 
-                # Plot the price history
-                if symbol in self.price_history and len(self.price_history[symbol]) > 1:
+                # Filter price history to time window
+                self.price_history[symbol] = [
+                    (t, p) for t, p in self.price_history[symbol] 
+                    if t >= window_start
+                ]
+                
+                # Plot if we have data points
+                if self.price_history[symbol]:
                     times = [point[0] for point in self.price_history[symbol]]
                     prices = [point[1] for point in self.price_history[symbol]]
                     
@@ -3446,15 +3463,15 @@ class CryptoScalpingBot:
                             linewidth=2)
             
             # Set title and labels
-            self.ax.set_title("Active Trades (% Change from Entry)", color=fg_color, pad=20, fontsize=12)
-            self.ax.set_xlabel('Time', color=fg_color, fontsize=10)
-            self.ax.set_ylabel('Price Change (%)', color=fg_color, fontsize=10)
+            self.ax.set_title("Active Trades (% Change from Entry)", color=fg_color)
+            self.ax.set_xlabel('Time', color=fg_color)
+            self.ax.set_ylabel('Price Change (%)', color=fg_color)
             
             # Format x-axis to show time properly
             self.ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
             
-            # Add legend
-            self.ax.legend(loc='upper left')
+            # Set x-axis limits to time window
+            self.ax.set_xlim(window_start, now)
             
             # Set reasonable y-axis limits
             try:
@@ -3468,6 +3485,15 @@ class CryptoScalpingBot:
                 )
             except Exception as e:
                 self.log_trade(f"Error setting y-axis limits: {str(e)}")
+            
+            # Add legend
+            self.ax.legend(loc='upper left')
+            
+            # Rotate x-axis labels for better readability
+            plt.xticks(rotation=45)
+            
+            # Adjust layout to prevent label cutoff
+            self.fig.tight_layout()
             
             # Draw the chart
             self.canvas.draw()
@@ -4586,7 +4612,7 @@ class CryptoScalpingBot:
             return False
 
     def analyze_opportunity(self, ticker, volume, pair_data):
-        """Analyze if a trading opportunity exists with improved logging"""
+        """Enhanced opportunity analysis with configurable confirmation factors"""
         try:
             symbol = pair_data['symbol']
             
@@ -4616,7 +4642,7 @@ class CryptoScalpingBot:
             # Log the pair we're analyzing
             self.log_trade(f"Analyzing {symbol} at ${price:.6f} with volume ${volume:.2f}")
             
-            # Get trading parameters from GUI - PROPERLY USE THE USER'S SETTING
+            # Get trading parameters from GUI
             required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 3
             price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.5
             volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 20
@@ -4655,7 +4681,7 @@ class CryptoScalpingBot:
                     conditions_met += 1
                     conditions.append(f"Volume surge ({(vol_ratio-1)*100:.2f}% >= {volume_increase:.2f}%)")
             
-            # CONDITION 4: Trend Strength Check (optional based on user setting)
+            # CONDITION 4: Trend Strength Check (if enabled)
             use_trend_filter = self.use_trend_filter.get() if hasattr(self, 'use_trend_filter') else False
             
             if use_trend_filter:
@@ -4666,13 +4692,78 @@ class CryptoScalpingBot:
                     conditions_met += 1
                     conditions.append(f"Strong uptrend (strength: {trend_strength:.2f} >= {trend_min})")
                     
-                # Log trend info even if condition not met
                 self.log_trade(f"Trend analysis: direction={trend_direction}, strength={trend_strength:.2f}, min={trend_min}")
             
-            # Log conditions
+            # CONDITION 5: Support/Resistance Check (if enabled)
+            use_sr = self.use_support_resistance.get() if hasattr(self, 'use_support_resistance') else False
+            
+            if use_sr:
+                sr_lookback = int(self.sr_lookback.get()) if hasattr(self, 'sr_lookback') else 50
+                sr_threshold = float(self.sr_threshold.get()) if hasattr(self, 'sr_threshold') else 0.2
+                
+                sr_levels = self.detect_support_resistance_levels(df, lookback=sr_lookback, threshold_pct=sr_threshold)
+                supports = sr_levels['supports']
+                
+                # Check if price is near support
+                near_support = False
+                support_level = 0
+                
+                for support in supports:
+                    # Check if price is within the threshold percentage of a support level
+                    if price >= support * (1 - sr_threshold/100) and price <= support * (1 + sr_threshold/100):
+                        near_support = True
+                        support_level = support
+                        break
+                
+                if near_support:
+                    conditions_met += 1
+                    conditions.append(f"Price near support level (${support_level:.6f})")
+                
+                # Log support/resistance info
+                self.log_trade(f"S/R Analysis: Found {len(supports)} support levels")
+            
+            # CONDITION 6: Candlestick Pattern Recognition (if enabled)
+            use_patterns = self.use_candlestick_patterns.get() if hasattr(self, 'use_candlestick_patterns') else False
+            
+            if use_patterns:
+                min_confidence = float(self.pattern_confidence_min.get()) if hasattr(self, 'pattern_confidence_min') else 70
+                patterns = self.detect_candlestick_patterns(df)
+                
+                if patterns:
+                    # Get the highest confidence pattern
+                    best_pattern = max(patterns.items(), key=lambda x: x[1])
+                    pattern_name = best_pattern[0].replace('_', ' ').title()
+                    confidence = best_pattern[1]
+                    
+                    if confidence >= min_confidence:
+                        conditions_met += 1
+                        conditions.append(f"Bullish pattern: {pattern_name} ({confidence}% confidence)")
+                        
+                    # Log all detected patterns
+                    self.log_trade(f"Patterns detected: {', '.join([f'{k}({v}%)' for k,v in patterns.items()])}")
+            
+            # CONDITION 7: Volume Profile Analysis (if enabled)
+            use_vol_profile = self.use_volume_profile.get() if hasattr(self, 'use_volume_profile') else False
+            
+            if use_vol_profile:
+                min_quality = float(self.volume_quality_min.get()) if hasattr(self, 'volume_quality_min') else 60
+                volume_analysis = self.analyze_volume_profile(df)
+                
+                if volume_analysis['volume_quality'] >= min_quality:
+                    conditions_met += 1
+                    conditions.append(f"Healthy volume profile (quality: {volume_analysis['volume_quality']:.1f})")
+                    
+                # Log volume profile details
+                self.log_trade(f"Volume Profile: Quality={volume_analysis['volume_quality']:.1f}, Trend={volume_analysis['volume_trend']}")
+            
+            # Log conditions summary
             self.log_trade(f"Analysis for {symbol}: {conditions_met}/{required_conditions} conditions met")
             for condition in conditions:
                 self.log_trade(f"✓ {condition}")
+            
+            # Log any conditions that were checked but not met
+            if conditions_met < required_conditions:
+                self.log_trade(f"Insufficient conditions: Need {required_conditions - conditions_met} more")
             
             # Final decision - using actual required conditions from GUI
             if conditions_met >= required_conditions:
@@ -4683,6 +4774,8 @@ class CryptoScalpingBot:
             
         except Exception as e:
             self.log_trade(f"Error analyzing opportunity for {pair_data['symbol']}: {str(e)}")
+            import traceback
+            self.log_trade(traceback.format_exc())
             return False
 
     def analyze_pairs(self, pairs):
@@ -5566,6 +5659,209 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in trend detection: {str(e)}")
             return 0, 0  # Default to neutral trend, zero strength
+
+
+
+    def analyze_volume_profile(self, df, lookback=20):
+        """
+        Analyze volume profile to determine if volume is supporting price movement
+        Returns a dict with volume analysis indicators
+        """
+        try:
+            if df is None or len(df) < lookback or 'volume' not in df.columns:
+                return {'healthy_profile': False, 'volume_trend': 0, 'volume_quality': 0}
+                
+            # Get recent data
+            recent_data = df.iloc[-lookback:].copy()
+            
+            # Calculate price changes
+            recent_data['price_change'] = recent_data['price'].pct_change()
+            
+            # Separate up and down days
+            up_days = recent_data[recent_data['price_change'] > 0]
+            down_days = recent_data[recent_data['price_change'] < 0]
+            
+            # Calculate average volume on up days vs down days
+            avg_up_volume = up_days['volume'].mean() if not up_days.empty else 0
+            avg_down_volume = down_days['volume'].mean() if not down_days.empty else 0
+            
+            # Calculate volume trend (rising or falling)
+            volume_trend = 0
+            if len(recent_data) >= 5:
+                recent_vol = recent_data['volume'].iloc[-5:].mean()
+                earlier_vol = recent_data['volume'].iloc[-lookback:-5].mean() if len(recent_data) > 5 else 0
+                
+                if recent_vol > earlier_vol * 1.1:
+                    volume_trend = 1  # Rising volume
+                elif recent_vol < earlier_vol * 0.9:
+                    volume_trend = -1  # Falling volume
+            
+            # Calculate volume quality score (0-100)
+            volume_quality = 0
+            if avg_down_volume > 0:
+                # Higher is better - we want more volume on up days
+                up_down_ratio = avg_up_volume / avg_down_volume if avg_down_volume > 0 else 1
+                volume_quality = min(100, max(0, (up_down_ratio - 0.8) * 50))
+            
+            # Determine if volume profile is healthy for upward movement
+            healthy_profile = volume_quality > 60 and volume_trend >= 0
+            
+            return {
+                'healthy_profile': healthy_profile,
+                'volume_trend': volume_trend,
+                'volume_quality': volume_quality
+            }
+            
+        except Exception as e:
+            self.log_trade(f"Error analyzing volume profile: {str(e)}")
+            return {'healthy_profile': False, 'volume_trend': 0, 'volume_quality': 0}
+
+    def detect_candlestick_patterns(self, df):
+        """
+        Detect bullish candlestick patterns in recent price action
+        Returns a dict with pattern names and confidence levels
+        """
+        try:
+            if df is None or len(df) < 5:
+                return {}
+                
+            # Get the last 3 candles
+            if 'open' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+                # Create synthetic OHLC data if only price is available
+                df['open'] = df['price'].shift(1)
+                df['high'] = df['price']
+                df['low'] = df['price']
+                df['close'] = df['price']
+            
+            patterns = {}
+            
+            # Get last 3 candles
+            candles = df.iloc[-3:].copy()
+            
+            # 1. Bullish Engulfing Pattern
+            if len(candles) >= 2:
+                prev_candle = candles.iloc[-2]
+                curr_candle = candles.iloc[-1]
+                
+                prev_body_size = abs(prev_candle['open'] - prev_candle['price'])
+                curr_body_size = abs(curr_candle['open'] - curr_candle['price'])
+                
+                if prev_candle['open'] > prev_candle['price'] and \
+                curr_candle['open'] < curr_candle['price'] and \
+                curr_candle['open'] <= prev_candle['price'] and \
+                curr_candle['price'] >= prev_candle['open'] and \
+                curr_body_size > prev_body_size:
+                    patterns['bullish_engulfing'] = 80
+            
+            # 2. Morning Star Pattern
+            if len(candles) >= 3:
+                first = candles.iloc[-3]
+                middle = candles.iloc[-2]
+                last = candles.iloc[-1]
+                
+                first_body = abs(first['open'] - first['price'])
+                middle_body = abs(middle['open'] - middle['price'])
+                last_body = abs(last['open'] - last['price'])
+                
+                if first['open'] > first['price'] and \
+                last['open'] < last['price'] and \
+                middle_body < first_body * 0.5 and \
+                middle_body < last_body * 0.5:
+                    patterns['morning_star'] = 90
+            
+            # 3. Hammer Pattern
+            if len(candles) >= 1:
+                curr = candles.iloc[-1]
+                
+                if 'low' in curr and 'high' in curr:
+                    body = abs(curr['open'] - curr['price'])
+                    lower_wick = min(curr['open'], curr['price']) - curr['low']
+                    upper_wick = curr['high'] - max(curr['open'], curr['price'])
+                    
+                    if curr['price'] > curr['open'] and \
+                    lower_wick > body * 2 and \
+                    upper_wick < body * 0.5:
+                        patterns['hammer'] = 70
+            
+            return patterns
+            
+        except Exception as e:
+            self.log_trade(f"Error detecting candlestick patterns: {str(e)}")
+            return {}
+
+    def detect_support_resistance_levels(self, df, lookback=50, threshold_pct=0.2):
+        """
+        Detect key support and resistance levels in the price data
+        Returns a dict with 'supports' and 'resistances' lists
+        """
+        try:
+            if df is None or len(df) < lookback:
+                return {'supports': [], 'resistances': []}
+                
+            # Use recent price history for analysis
+            prices = df['price'].iloc[-lookback:].values
+            
+            # Find local maxima and minima
+            peaks = []
+            troughs = []
+            
+            for i in range(2, len(prices)-2):
+                # Detect peaks (local maxima)
+                if prices[i] > prices[i-1] and prices[i] > prices[i-2] and \
+                prices[i] > prices[i+1] and prices[i] > prices[i+2]:
+                    peaks.append((i, prices[i]))
+                    
+                # Detect troughs (local minima)
+                if prices[i] < prices[i-1] and prices[i] < prices[i-2] and \
+                prices[i] < prices[i+1] and prices[i] < prices[i+2]:
+                    troughs.append((i, prices[i]))
+            
+            # Group similar levels together
+            threshold = prices[-1] * threshold_pct / 100  # Convert percentage to absolute value
+            
+            # Cluster resistance levels
+            resistances = []
+            for peak in peaks:
+                peak_price = peak[1]
+                
+                # Check if this peak is close to an existing resistance
+                found_cluster = False
+                for i, resistance in enumerate(resistances):
+                    if abs(resistance - peak_price) <= threshold:
+                        # Average the levels if they're close
+                        resistances[i] = (resistance + peak_price) / 2
+                        found_cluster = True
+                        break
+                        
+                if not found_cluster:
+                    resistances.append(peak_price)
+                    
+            # Cluster support levels
+            supports = []
+            for trough in troughs:
+                trough_price = trough[1]
+                
+                # Check if this trough is close to an existing support
+                found_cluster = False
+                for i, support in enumerate(supports):
+                    if abs(support - trough_price) <= threshold:
+                        # Average the levels if they're close
+                        supports[i] = (support + trough_price) / 2
+                        found_cluster = True
+                        break
+                        
+                if not found_cluster:
+                    supports.append(trough_price)
+                    
+            # Sort levels
+            supports.sort()
+            resistances.sort()
+            
+            return {'supports': supports, 'resistances': resistances}
+            
+        except Exception as e:
+            self.log_trade(f"Error detecting support/resistance: {str(e)}")
+            return {'supports': [], 'resistances': []}
 
     def smart_trade_filter(self, pair_data):
         """Smart filter for trade opportunities with adaptive thresholds"""
