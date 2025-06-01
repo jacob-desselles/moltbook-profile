@@ -6688,17 +6688,12 @@ class CryptoScalpingBot:
                 
             # First enforce max trades limit
             self.enforce_max_trades_limit()
-                
-            self.log_trade(f"Monitoring {len(self.active_trades)} active trades...")
             
-            # Get parameters from GUI
+            # Get parameters from GUI once
             stop_loss = float(self.stop_loss.get())
             profit_target = float(self.profit_target.get())
             trailing_stop = float(self.trailing_stop.get())
             trailing_activation = float(self.trailing_activation.get())
-            
-            self.log_trade(f"Using stop loss: {stop_loss}%, profit target: {profit_target}%, " +
-                          f"trailing stop: {trailing_stop}%, trailing activation: {trailing_activation}%")
             
             # Check each active trade
             for trade_id in list(self.active_trades.keys()):
@@ -6719,45 +6714,28 @@ class CryptoScalpingBot:
                         trade['highest_price'] = current_price
                         trade['highest_profit'] = profit_pct
                     
-                    # Get exit thresholds from trade (these are the smart parameters)
-                    stop_loss = trade.get('stop_loss_pct', float(self.stop_loss.get()) / 100) * 100
-                    trailing_stop = trade.get('trailing_stop_pct', float(self.trailing_stop.get()) / 100) * 100
-                    profit_target = trade.get('profit_target_pct', float(self.profit_target.get()) / 100) * 100
-                    trailing_activation = float(self.trailing_activation.get())
-
-                    # Debug log
-                    self.log_trade(f"""
-                    Trade Check - {trade['symbol']}:
-                    Current P/L: {profit_pct:.2f}%
-                    Highest: {trade.get('highest_profit', 0):.2f}%
-                    Stop Loss: -{stop_loss:.2f}%
-                    Profit Target: {profit_target:.2f}%
-                    Trailing Stop: {trailing_stop:.2f}%
-                    Trailing Activation: {trailing_activation:.2f}%
-                    """)
-                    
-                    # CASE 1: Stop Loss - Exit if price drops below stop loss
+                    # CASE 1: Stop Loss
                     if profit_pct <= -stop_loss:
-                        self.log_trade(f"Stop loss triggered on {trade['symbol']} at {profit_pct:.2f}%")
+                        self.log_trade(f"Stop loss triggered on {symbol} at {profit_pct:.2f}%")
                         self.close_trade(trade_id, trade, current_price, "stop loss")
                         continue
                     
-                    # CASE 2: Take Profit - Exit if price reaches profit target
+                    # CASE 2: Take Profit
                     if profit_pct >= profit_target:
-                        self.log_trade(f"Profit target reached on {trade['symbol']} at {profit_pct:.2f}%")
+                        self.log_trade(f"Profit target reached on {symbol} at {profit_pct:.2f}%")
                         self.close_trade(trade_id, trade, current_price, "profit target")
                         continue
                     
-                    # CASE 3: Trailing Stop - Exit if price drops from highest by trailing stop amount
+                    # CASE 3: Trailing Stop
                     highest_profit = trade.get('highest_profit', 0)
                     if highest_profit >= trailing_activation:
                         drop_from_high = highest_profit - profit_pct
                         if drop_from_high >= trailing_stop:
-                            self.log_trade(f"Trailing stop triggered on {trade['symbol']} - Drop from {highest_profit:.2f}% to {profit_pct:.2f}%")
+                            self.log_trade(f"Trailing stop triggered on {symbol}")
                             self.close_trade(trade_id, trade, current_price, "trailing stop")
                             continue
                     
-                    # Update trade data for monitoring
+                    # Update trade data
                     trade['current_price'] = current_price
                     trade['current_profit_percentage'] = profit_pct
                     trade['last_update'] = datetime.now()
@@ -6765,7 +6743,6 @@ class CryptoScalpingBot:
                     # Update price history for charting
                     if symbol in self.price_history:
                         self.price_history[symbol].append((datetime.now(), current_price))
-                        # Limit history size
                         self.price_history[symbol] = self.price_history[symbol][-100:]
                     
                 except Exception as e:
@@ -6818,7 +6795,7 @@ class CryptoScalpingBot:
                     
                     # Force a scan every 30 seconds if we're not at max trades and not currently scanning
                     if len(self.active_trades) < max_trades and not self.is_scanning:
-                        if (current_time - self.last_scan_time) > 30:
+                        if (current_time - self.last_scan_time) > 10:
                             self.log_trade(f"Initiating scheduled scan (active: {len(self.active_trades)}, max: {max_trades})")
                             self.is_scanning = True  # Set flag to prevent multiple scans
                             self.scan_opportunities()
