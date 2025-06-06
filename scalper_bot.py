@@ -5864,10 +5864,9 @@ class CryptoScalpingBot:
             return {'supports': [], 'resistances': []}
 
     def smart_trade_filter(self, pair_data):
-        """Smart filter for trade opportunities with adaptive thresholds"""
+        """Enhanced smart filter that considers overall market conditions"""
         try:
             symbol = pair_data['symbol']
-            self.log_trade(f"Evaluating {symbol} with smart filter...")
             
             # Check if we have enough data
             if 'df' not in pair_data or pair_data['df'] is None or len(pair_data['df']) < 5:
@@ -5880,98 +5879,100 @@ class CryptoScalpingBot:
             market_override = hasattr(self, 'market_override_var') and self.market_override_var.get()
             if market_override:
                 self.log_trade(f"[OK] Market override ACTIVE for {symbol}")
+                # Skip market condition checks if override is active
+            else:
+                # Check overall market conditions (cache for efficiency)
+                if not hasattr(self, '_last_market_check') or \
+                (datetime.now() - self._last_market_check).total_seconds() > 60:
+                    self.market_conditions = self.analyze_market_conditions()
+                    self._last_market_check = datetime.now()
+                
+                market_action = self.market_conditions.get('recommended_action', 'normal')
+                
+                # If market conditions are bad, reject immediately
+                if market_action == 'avoid':
+                    self.log_trade(f"Rejected {symbol} - Market crash risk detected")
+                    return False
+            
+            # Adjust thresholds based on market conditions
+            market_action = self.market_conditions.get('recommended_action', 'normal') if hasattr(self, 'market_conditions') else 'normal'
+            
+            if market_action == 'very_cautious':
+                # Require stronger signals in bear market
+                min_momentum = 1.0
+                min_volume_ratio = 1.5
+                max_rsi = 65
+                ema_strictness = 1.02  # EMA5 must be 2% above EMA15
+            elif market_action == 'cautious':
+                min_momentum = 0.5
+                min_volume_ratio = 1.2
+                max_rsi = 70
+                ema_strictness = 1.01
+            elif market_action == 'aggressive':
+                # Relax requirements in strong bull market
+                min_momentum = -0.5  # Can even be slightly negative
+                min_volume_ratio = 0.8
+                max_rsi = 80
+                ema_strictness = 0.99
+            else:  # normal
+                min_momentum = 0
+                min_volume_ratio = 1.0
+                max_rsi = 75
+                ema_strictness = 1.0
             
             # Log current price
             current_price = pair_data['price']
-            self.log_trade(f"Current price for {symbol}: ${current_price}")
+            self.log_trade(f"Evaluating {symbol} at ${current_price} (Market: {market_action})")
             
-            # Check EMA crossover if available
+            # Check EMA crossover with market-adjusted strictness
             if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
-                # Log EMA values for debugging
                 ema5_current = df['ema_5'].iloc[-1]
                 ema15_current = df['ema_15'].iloc[-1]
-                ema5_prev = df['ema_5'].iloc[-2] if len(df) > 2 else 0
-                ema15_prev = df['ema_15'].iloc[-2] if len(df) > 2 else 0
                 
-                self.log_trade(f"EMA values for {symbol}: EMA_5={ema5_current:.5f}, EMA_15={ema15_current:.5f}, EMA_5_prev={ema5_prev:.5f}, EMA_15_prev={ema15_prev:.5f}")
+                ema_ratio = ema5_current / ema15_current if ema15_current > 0 else 0
+                ema_cross = ema_ratio >= ema_strictness
                 
-                # Check if EMA5 is crossing above EMA15 or already above
-                ema_cross = (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
-                
-                # If market override is active, also accept if EMAs are close to crossing
-                if market_override:
-                    ema_ratio = df['ema_5'].iloc[-1] / df['ema_15'].iloc[-1]
-                    ema_cross = ema_cross or (ema_ratio > 0.98)  # Accept if within 2% of crossing
-                    self.log_trade(f"[OK] Market override ACTIVE - relaxed EMA crossover check (ratio: {ema_ratio:.4f})")
-                    
-                if ema_cross:
-                    self.log_trade(f"EMA check passed for {symbol}: EMA5 > EMA15 or close to crossing")
-                else:
-                    self.log_trade(f"EMA check failed for {symbol}: No bullish crossover")
-                    if not market_override:
-                        return False
-            else:
-                self.log_trade(f"Warning: EMA data not available for {symbol}")
-                
-            # Check RSI if available
+                if not ema_cross and not market_override:
+                    self.log_trade(f"EMA check failed for {symbol}: Ratio {ema_ratio:.4f} < {ema_strictness}")
+                    return False
+            
+            # Check RSI with market-adjusted threshold
             rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
             rsi_column = f'rsi_{rsi_period}'
             
             if rsi_column in df.columns:
-                rsi = df[rsi_column]
-                rsi_value = rsi.iloc[-1]
+                rsi_value = df[rsi_column].iloc[-1]
                 
-                # Get RSI thresholds
-                rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 70
-                rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
-                
-                self.log_trade(f"RSI for {symbol}: {rsi_value:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
-                
-                # For testing purposes, temporarily allow higher RSI values
-                # In production, you'd want to avoid buying when RSI is overbought
-                if rsi_value > rsi_overbought and not market_override:
-                    self.log_trade(f"RSI filter rejected {symbol}: Overbought condition ({rsi_value:.2f} > {rsi_overbought})")
+                if rsi_value > max_rsi and not market_override:
+                    self.log_trade(f"RSI filter rejected {symbol}: {rsi_value:.2f} > {max_rsi}")
                     return False
-            else:
-                self.log_trade(f"Warning: RSI data not available for {symbol}")
-                
-            # Check for price momentum
+            
+            # Check momentum with market-adjusted threshold
             if 'price' in df.columns and len(df) >= 5:
-                # Calculate short-term momentum (last 5 periods)
                 recent_prices = df['price'].iloc[-5:]
                 price_change = (recent_prices.iloc[-1] - recent_prices.iloc[0]) / recent_prices.iloc[0] * 100
                 
-                self.log_trade(f"Price momentum for {symbol}: {price_change:.2f}%")
-                
-                # Require positive momentum unless market override is active
-                if price_change <= 0 and not market_override:
-                    self.log_trade(f"Momentum filter rejected {symbol}: No positive momentum ({price_change:.2f}%)")
+                if price_change < min_momentum and not market_override:
+                    self.log_trade(f"Momentum filter rejected {symbol}: {price_change:.2f}% < {min_momentum}%")
                     return False
-            else:
-                self.log_trade(f"Warning: Price data not available for momentum calculation for {symbol}")
-                
-            # Check volume
+            
+            # Check volume with market-adjusted threshold
             if 'volume' in df.columns and len(df) >= 5:
                 recent_volume = df['volume'].iloc[-5:]
                 avg_volume = recent_volume.mean()
                 current_volume = recent_volume.iloc[-1]
                 volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
                 
-                self.log_trade(f"Volume ratio for {symbol}: {volume_ratio:.2f}x average")
-                
-                # Require above-average volume unless market override is active
-                if volume_ratio < 1.0 and not market_override:
-                    self.log_trade(f"Volume filter rejected {symbol}: Below average volume ({volume_ratio:.2f}x)")
+                if volume_ratio < min_volume_ratio and not market_override:
+                    self.log_trade(f"Volume filter rejected {symbol}: {volume_ratio:.2f}x < {min_volume_ratio}x")
                     return False
-            else:
-                self.log_trade(f"Warning: Volume data not available for {symbol}")
-                
+            
             # If we passed all checks, this is a potential opportunity
-            self.log_trade(f"Opportunity found for {symbol}")
+            self.log_trade(f"✓ {symbol} passed smart filter (Market: {market_action})")
             return True
             
         except Exception as e:
-            self.log_trade(f"Error checking {pair_data['symbol']}: {str(e)}")
+            self.log_trade(f"Error in smart_trade_filter for {pair_data['symbol']}: {str(e)}")
             return False
 
     def check_counter_trend_strength(self, df):
