@@ -3929,6 +3929,33 @@ class CryptoScalpingBot:
             symbol = trade['symbol']
             entry_price = trade['entry_price']
             position_size = trade.get('position_size', 0)
+            
+            # Execute real sell order if not paper trading
+            if not self.is_paper_trading:
+                try:
+                    # Calculate quantity to sell
+                    quantity = position_size / entry_price
+                    
+                    # Check if we should use limit orders
+                    use_limit = trade.get('is_limit_order', False)
+                    
+                    if use_limit:
+                        # Limit sell order - slightly below current price for quicker fill
+                        limit_price = current_price * 0.9995
+                        order = self.exchange.create_limit_sell_order(symbol, quantity, limit_price)
+                        self.log_trade(f"Created LIMIT sell order: {quantity:.6f} {symbol} at ${limit_price:.6f}")
+                    else:
+                        # Market sell order
+                        order = self.exchange.create_market_sell_order(symbol, quantity)
+                        self.log_trade(f"Created MARKET sell order: {quantity:.6f} {symbol}")
+                    
+                    # Update current_price if order filled at different price
+                    if order and 'price' in order and order['price']:
+                        current_price = float(order['price'])
+                        
+                except Exception as e:
+                    self.log_trade(f"Failed to execute sell order: {str(e)}")
+                    # Continue with closing even if order fails - you might want to change this
 
             # Calculate profit/loss
             price_change = (current_price - entry_price) / entry_price
@@ -5016,6 +5043,31 @@ class CryptoScalpingBot:
             # Generate a unique trade ID
             trade_id = f"{'paper' if self.is_paper_trading else 'live'}_{int(time.time())}"
             
+            # FIXED: Get the actual checkbox value
+            use_limit_orders = self.use_limit_orders_var.get() if hasattr(self, 'use_limit_orders_var') else False
+            
+            # Calculate quantity
+            quantity = position_size / price
+            
+            # For real trading, execute the actual order
+            if not self.is_paper_trading:
+                try:
+                    if use_limit_orders:
+                        # Calculate limit price (slightly below current price for better fill)
+                        limit_price = price * 0.9995  # 0.05% below current price
+                        order = self.execute_real_trade(symbol, quantity, limit_price, use_limit_orders=True)
+                    else:
+                        # Market order
+                        order = self.execute_real_trade(symbol, quantity, use_limit_orders=False)
+                    
+                    # Update price if order was filled at a different price
+                    if order and 'price' in order and order['price']:
+                        price = float(order['price'])
+                        
+                except Exception as e:
+                    self.log_trade(f"Failed to execute real order: {str(e)}")
+                    return False
+            
             # Create trade object
             trade = {
                 'id': trade_id,
@@ -5029,7 +5081,7 @@ class CryptoScalpingBot:
                 'stop_loss_pct': float(self.stop_loss.get()) / 100 if hasattr(self, 'stop_loss') else 0.008,
                 'profit_target_pct': float(self.profit_target.get()) / 100 if hasattr(self, 'profit_target') else 0.015,
                 'trailing_stop_pct': float(self.trailing_stop.get()) / 100 if hasattr(self, 'trailing_stop') else 0.003,
-                'is_limit_order': self.using_limit_orders
+                'is_limit_order': use_limit_orders  # FIXED: Using the actual checkbox value
             }
             
             # Double-check max trades one more time before adding
@@ -5044,9 +5096,10 @@ class CryptoScalpingBot:
             if self.is_paper_trading:
                 self.paper_balance -= position_size
                 
-            # Log the trade - using explicit string formatting to avoid dict.__format__ error
+            # Log the trade with order type
+            order_type = "LIMIT" if use_limit_orders else "MARKET"
             self.log_trade(
-                f"{'PAPER' if self.is_paper_trading else 'LIVE'} TRADE EXECUTED:\n"
+                f"{'PAPER' if self.is_paper_trading else 'LIVE'} {order_type} TRADE EXECUTED:\n"
                 f"Symbol: {symbol}\n"
                 f"Entry Price: ${price:.8f}\n"
                 f"Position Size: ${position_size:.2f}\n"
@@ -5864,7 +5917,7 @@ class CryptoScalpingBot:
             return {'supports': [], 'resistances': []}
 
     def smart_trade_filter(self, pair_data):
-        """Enhanced smart filter that considers overall market conditions"""
+        """Enhanced smart filter that considers overall market conditions and crash risk"""
         try:
             symbol = pair_data['symbol']
             
@@ -5924,6 +5977,109 @@ class CryptoScalpingBot:
             current_price = pair_data['price']
             self.log_trade(f"Evaluating {symbol} at ${current_price} (Market: {market_action})")
             
+            # === CRASH DETECTION SECTION (NEW) ===
+            crash_signals = 0
+            crash_reasons = []
+            
+            # 1. EXHAUSTION PATTERN - Rapid rise with declining volume
+            if 'price' in df.columns and 'volume' in df.columns and len(df) >= 10:
+                price_10bars = (df['price'].iloc[-1] - df['price'].iloc[-10]) / df['price'].iloc[-10] * 100
+                
+                # Volume trend
+                recent_vol = df['volume'].iloc[-3:].mean()
+                older_vol = df['volume'].iloc[-10:-3].mean()
+                vol_decline = (older_vol - recent_vol) / older_vol if older_vol > 0 else 0
+                
+                # Exhaustion: Big rise + declining volume = potential crash
+                if price_10bars > 10 and vol_decline > 0.3:
+                    crash_signals += 1
+                    crash_reasons.append(f"Exhaustion: {price_10bars:.1f}% rise with {vol_decline*100:.0f}% volume decline")
+            
+            # 2. WHALE DUMP DETECTION - Abnormal volume with price drops
+            if 'volume' in df.columns and 'price' in df.columns and len(df) >= 20:
+                vol_mean = df['volume'].iloc[-20:].mean()
+                vol_std = df['volume'].iloc[-20:].std()
+                
+                # Check last 3 candles for dump signature
+                for i in range(-3, 0):
+                    if i >= -len(df):
+                        vol_zscore = (df['volume'].iloc[i] - vol_mean) / vol_std if vol_std > 0 else 0
+                        price_drop = (df['price'].iloc[i] - df['price'].iloc[i-1]) / df['price'].iloc[i-1] if i > -len(df) else 0
+                        
+                        if vol_zscore > 2.5 and price_drop < -0.005:
+                            crash_signals += 1
+                            crash_reasons.append(f"Potential whale activity (Z-score: {vol_zscore:.1f})")
+                            break
+            
+            # 3. REJECTION FROM RESISTANCE - Multiple failed breakouts
+            if 'price' in df.columns and len(df) >= 20:
+                prices = df['price'].iloc[-20:]
+                current = prices.iloc[-1]
+                recent_high = prices.max()
+                
+                # Are we near but below recent high?
+                distance_from_high = (recent_high - current) / recent_high
+                if 0.005 < distance_from_high < 0.02:  # 0.5-2% below high
+                    # Count touches of this level
+                    touches = sum(1 for p in prices if p > recent_high * 0.995)
+                    if touches >= 3:
+                        crash_signals += 1
+                        crash_reasons.append(f"Triple top rejection at ${recent_high:.6f}")
+            
+            # 4. BEARISH DIVERGENCE - Price up, momentum down
+            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
+            rsi_column = f'rsi_{rsi_period}'
+            
+            if rsi_column in df.columns and len(df) >= 10:
+                # Compare recent price action to RSI
+                price_change = (df['price'].iloc[-1] - df['price'].iloc[-10]) / df['price'].iloc[-10]
+                rsi_change = (df[rsi_column].iloc[-1] - df[rsi_column].iloc[-10]) / df[rsi_column].iloc[-10] if df[rsi_column].iloc[-10] > 0 else 0
+                
+                # Strong bearish divergence
+                if price_change > 0.03 and rsi_change < -0.05:
+                    crash_signals += 1
+                    crash_reasons.append("Strong bearish RSI divergence")
+                
+                # Extreme overbought conditions
+                current_rsi = df[rsi_column].iloc[-1]
+                if current_rsi > 80:
+                    crash_signals += 1
+                    crash_reasons.append(f"Extreme overbought RSI: {current_rsi:.1f}")
+            
+            # 5. SUPPORT BREAKDOWN WARNING
+            if 'price' in df.columns and len(df) >= 30:
+                prices = df['price'].iloc[-30:]
+                current = prices.iloc[-1]
+                
+                # Find recent lows that might be support
+                recent_lows = []
+                for i in range(2, len(prices)-2):
+                    if prices.iloc[i] < prices.iloc[i-1] and prices.iloc[i] < prices.iloc[i+1]:
+                        recent_lows.append(prices.iloc[i])
+                
+                if recent_lows:
+                    nearest_support = max(recent_lows)
+                    support_distance = (current - nearest_support) / current * 100
+                    
+                    # Very close to support with downward momentum
+                    if support_distance < 0.5:
+                        momentum = (df['price'].iloc[-1] - df['price'].iloc[-3]) / df['price'].iloc[-3]
+                        if momentum < -0.001:
+                            crash_signals += 1
+                            crash_reasons.append(f"Testing support at ${nearest_support:.6f} with negative momentum")
+            
+            # Log crash detection results if any signals found
+            if crash_signals > 0:
+                self.log_trade(f"⚠️ Crash warning signals for {symbol}: {crash_signals} detected")
+                for reason in crash_reasons:
+                    self.log_trade(f"  - {reason}")
+            
+            # Reject if too many crash signals (unless override is active)
+            if crash_signals >= 2 and not market_override:
+                self.log_trade(f"❌ CRASH RISK: Rejecting {symbol} due to {crash_signals} warning signals")
+                return False
+            
+            # === EXISTING FILTER LOGIC ===
             # Check EMA crossover with market-adjusted strictness
             if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
                 ema5_current = df['ema_5'].iloc[-1]
@@ -5937,9 +6093,6 @@ class CryptoScalpingBot:
                     return False
             
             # Check RSI with market-adjusted threshold
-            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
-            rsi_column = f'rsi_{rsi_period}'
-            
             if rsi_column in df.columns:
                 rsi_value = df[rsi_column].iloc[-1]
                 
@@ -5968,13 +6121,13 @@ class CryptoScalpingBot:
                     return False
             
             # If we passed all checks, this is a potential opportunity
-            self.log_trade(f"✓ {symbol} passed smart filter (Market: {market_action})")
+            self.log_trade(f"✓ {symbol} passed smart filter (Market: {market_action}, Crash signals: {crash_signals})")
             return True
             
         except Exception as e:
             self.log_trade(f"Error in smart_trade_filter for {pair_data['symbol']}: {str(e)}")
             return False
-
+    
     def check_counter_trend_strength(self, df):
         """Check for counter-trend strength in bear markets"""
         try:
@@ -6081,8 +6234,9 @@ class CryptoScalpingBot:
                         text=f"{self.total_trades}"
                     )
                 if 'paper_balance' in self.metrics_labels:
+                    # Changed this line to remove the duplicate "Paper Balance:" text
                     self.metrics_labels['paper_balance'].config(
-                        text=f"${self.paper_balance:.2f}"
+                        text=f"${self.paper_balance:.2f} (${self.paper_balance + self.total_profit:.2f} total)"
                     )
 
             self.log_trade(f"Updated metrics: Gross=${total_profit:.2f}, Fees=${self.total_fees:.2f}, "
@@ -6092,7 +6246,6 @@ class CryptoScalpingBot:
 
         except Exception as e:
             self.log_trade(f"Error updating metrics: {str(e)}")
-            import traceback
             self.log_trade(traceback.format_exc())
 
     def collect_trade_data(self):
