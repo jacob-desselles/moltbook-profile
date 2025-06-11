@@ -3946,65 +3946,91 @@ class CryptoScalpingBot:
                     # Get the base currency (e.g., 'BTC' from 'BTC/USD')
                     base_currency = symbol.split('/')[0]
                     
+                    # Fetch minimum order size for the symbol
+                    try:
+                        market = self.exchange.market(symbol)
+                        min_amount = float(market['limits']['amount']['min'])
+                        self.log_trade(f"Minimum order size for {symbol}: {min_amount}")
+                    except Exception as e:
+                        self.log_trade(f"Error fetching minimum amount for {symbol}: {str(e)}")
+                        min_amount = 0
+
                     # Verify if we still own the position
                     balance = self.exchange.fetch_balance()
-                    available_amount = float(balance.get(base_currency, {}).get('free', 0))
-                    
-                    if available_amount <= 0:
-                        self.log_trade(f"Position already closed for {symbol}. Removing from tracking.")
-                        del self.active_trades[trade_id]
-                        self.update_active_trades_display()
-                        return True
+                    if balance and base_currency in balance:
+                        available_amount = float(balance[base_currency].get('free', 0))
+                        
+                        if available_amount <= 0:
+                            self.log_trade(f"Position already closed for {symbol}. Removing from tracking.")
+                            del self.active_trades[trade_id]
+                            self.update_active_trades_display()
+                            return True
 
-                    # Calculate actual quantity from available balance
-                    quantity = min(position_size / entry_price, available_amount)
-                    
-                    if quantity <= 0:
-                        self.log_trade(f"No position to close for {symbol}. Removing from tracking.")
-                        del self.active_trades[trade_id]
-                        self.update_active_trades_display()
-                        return True
+                        # Check if amount meets minimum requirements
+                        if available_amount < min_amount:
+                            self.log_trade(f"Position size {available_amount} below minimum {min_amount} for {symbol}")
+                            # Just remove from tracking since we can't sell
+                            del self.active_trades[trade_id]
+                            self.update_active_trades_display()
+                            return True
 
-                    # Execute sell order and track metrics
-                    if trade.get('is_limit_order', False):
-                        limit_price = current_price * 0.999
-                        order = self.exchange.create_limit_sell_order(symbol, quantity, limit_price)
+                        # Calculate actual quantity from available balance
+                        quantity = min(position_size / entry_price, available_amount)
+                        
+                        if quantity <= 0:
+                            self.log_trade(f"No position to close for {symbol}. Removing from tracking.")
+                            del self.active_trades[trade_id]
+                            self.update_active_trades_display()
+                            return True
+
+                        # Execute sell order with proper error handling
+                        try:
+                            if trade.get('is_limit_order', False):
+                                limit_price = current_price * 0.999  # Slightly below market for immediate fill
+                                order = self.exchange.create_limit_sell_order(symbol, quantity, limit_price)
+                            else:
+                                order = self.exchange.create_market_sell_order(symbol, quantity)
+
+                            # Update metrics if order was successful
+                            if order and order.get('status') in ['closed', 'filled']:
+                                actual_price = float(order['price']) if 'price' in order else current_price
+                                profit = (actual_price - entry_price) * quantity
+                                self.total_profit += profit
+                                
+                                # Update trade history
+                                profit_pct = ((actual_price - entry_price) / entry_price) * 100
+                                self.update_trade_history(symbol, profit_pct, profit)
+                                
+                                # Remove from active trades
+                                del self.active_trades[trade_id]
+                                
+                                self.log_trade(f"Successfully closed trade {symbol} with {profit_pct:.2f}% profit")
+                        except Exception as e:
+                            error_str = str(e)
+                            if "minimum not met" in error_str.lower():
+                                self.log_trade(f"Position size too small to close for {symbol}. Removing from tracking.")
+                                del self.active_trades[trade_id]
+                            else:
+                                self.log_trade(f"Error executing sell order: {str(e)}")
+                                return False
                     else:
-                        order = self.exchange.create_market_sell_order(symbol, quantity)
-
-                    # Update metrics for real trading
-                    if order and 'price' in order:
-                        actual_price = float(order['price'])
-                        actual_pl = (actual_price - entry_price) / entry_price * position_size
-                        fee_type = "maker" if trade.get('is_limit_order', False) else "taker"
-                        fee_pct = self.maker_fee if fee_type == "maker" else self.taker_fee
-                        total_fees = (position_size * fee_pct * 2)  # Entry and exit fees
-                        net_pl = actual_pl - total_fees
-
-                        # Update real trading metrics
-                        self.total_profit += actual_pl
-                        self.total_fees += total_fees
-                        self.total_trades += 1
-                        if net_pl > 0:
-                            self.winning_trades += 1
-                        self.log_trade(f"Updated real trading metrics - P/L: ${actual_pl:.2f}, Fees: ${total_fees:.2f}")
+                        self.log_trade(f"Unable to fetch balance for {base_currency}. Removing trade from tracking.")
+                        del self.active_trades[trade_id]
 
                 except Exception as e:
-                    self.log_trade(f"Error executing sell order: {str(e)}")
+                    self.log_trade(f"Error closing trade: {str(e)}")
                     return False
 
-            # Rest of the existing close_trade logic...
-
-            # Update displays with proper metrics
-            self.update_metrics()
+            # Update displays
             self.update_active_trades_display()
             self.update_balance_display()
+            self.update_metrics()
             self.update_chart()
 
             return True
 
         except Exception as e:
-            self.log_trade(f"Error closing trade: {str(e)}")
+            self.log_trade(f"Error in close_trade: {str(e)}")
             return False
 
     def validate_settings(self):
@@ -5158,56 +5184,42 @@ class CryptoScalpingBot:
             return False            
 
     def verify_active_trades(self):
-        """Automatically verify active trades against Kraken's open positions"""
+        """Verify all active trades against actual exchange positions"""
         if self.is_paper_trading:
-            self.log_trade("Trade verification skipped in paper trading mode")
             return
             
         try:
-            self.log_trade("Verifying active trades with Kraken...")
+            self.log_trade("Verifying active trades with exchange...")
             
-            # Get open positions from Kraken
+            # Fetch current positions from exchange
+            exchange_positions = {}
             try:
-                # Fetch positions
-                positions = self.exchange.fetch_positions()
-                self.log_trade(f"Found {len(positions)} open positions on Kraken")
-                
-                # Create lookup by symbol
-                kraken_positions = {}
-                for position in positions:
-                    if float(position.get('contracts', 0)) > 0:
-                        kraken_positions[position['symbol']] = position
-                        
-                # Also check open orders
-                open_orders = self.exchange.fetch_open_orders()
-                self.log_trade(f"Found {len(open_orders)} open orders on Kraken")
-                
-                # Add symbols from open orders
-                for order in open_orders:
-                    if order['side'] == 'buy' and order['status'] == 'open':
-                        kraken_positions[order['symbol']] = order
-                        
+                balance = self.exchange.fetch_balance()
+                # Get all non-zero balances
+                for currency, data in balance.items():
+                    if currency != 'USD' and float(data.get('free', 0)) > 0:
+                        exchange_positions[f"{currency}/USD"] = float(data['free'])
             except Exception as e:
                 self.log_trade(f"Error fetching positions: {str(e)}")
                 return
-                
+
             # Check each active trade
             for trade_id, trade in list(self.active_trades.items()):
                 symbol = trade['symbol']
                 
-                # Check if position exists on Kraken
-                if symbol not in kraken_positions:
-                    self.log_trade(f"Warning: Trade {trade_id} for {symbol} not found in Kraken positions")
-                    
-                    # Instead of handling it here, use the close_trade method
-                    # This ensures consistent handling and proper history updates
-                    current_price = float(self.exchange.fetch_ticker(symbol)['last'])
-                    self.close_trade(trade_id, trade, current_price, "position_not_found")
-                else:
-                    self.log_trade(f"Verified: {symbol} exists in Kraken positions")
-                    
+                # If we don't have a position for this symbol, remove it from active trades
+                if symbol not in exchange_positions or exchange_positions[symbol] <= 0:
+                    self.log_trade(f"No active position found for {symbol}, removing from tracking")
+                    del self.active_trades[trade_id]
+                    continue
+
+            # Update displays
+            self.update_active_trades_display()
+            self.update_balance_display()
+            self.update_metrics()
+            
         except Exception as e:
-            self.log_trade(f"Error verifying trades: {str(e)}")
+            self.log_trade(f"Error verifying active trades: {str(e)}")
         
     def advanced_checks(self, symbol, df):
         """Advanced market checks including order book analysis and RSI"""
