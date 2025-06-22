@@ -23,6 +23,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.dates import DateFormatter
 import matplotlib.dates as mdates
+import threading
 class DataManager:
     def __init__(self, exchange=None, log_function=None, bot=None):
         self.price_data = {}
@@ -254,6 +255,9 @@ class DataManager:
             self.log_trade(f"Error in update_price_data: {str(e)}")
 
 class CryptoScalpingBot:
+
+    MIN_TRADE_SIZE = 5.0
+
     def __init__(self):
         # Create root window FIRST
         self.root = tk.Tk()
@@ -389,6 +393,8 @@ class CryptoScalpingBot:
             'total_trades': 0
         }
         
+        self.processed_trade_ids = set()
+        
         # Load saved metrics if available
         self.load_metrics()
 
@@ -418,7 +424,12 @@ class CryptoScalpingBot:
         self.excluded_symbols = {}  # Dictionary to track excluded symbols with expiry times
         self.exclusion_duration = 300  # 5 minutes default (configurable)
 
+        self.sync_active_trades_with_exchange()
+        self.root.after(30000, self.periodic_sync_active_trades) 
+
         self.use_ml_prediction_var = tk.BooleanVar(self.root, value=False)
+
+        self.kraken_lock = threading.Lock()
     
 
     def init_memory_monitor(self):
@@ -1534,44 +1545,71 @@ class CryptoScalpingBot:
             self.mode_var.set("Paper Trading")
             return False   
         
+    def update_btc_data(self):
+        """Update BTC/USD market data for trend analysis"""
+        try:
+            self.log_trade("Updating BTC/USD market data...")
+            
+            # Fetch latest BTC/USD ticker
+            ticker = self.exchange.fetch_ticker('BTC/USD')
+            
+            # Extract price
+            price = float(ticker['last'])
+            
+            # Update data in DataManager
+            if hasattr(self, 'data_manager'):
+                self.data_manager.update_price_data('BTC/USD', ticker)
+                
+                # Get updated DataFrame
+                df = self.data_manager.get_price_data('BTC/USD')
+                if df is not None:
+                    self.log_trade(f"Updated BTC/USD data: {len(df)} points collected")
+                    self.log_trade(f"Latest price: {price}")
+            
+            # Update UI
+            self.log_trade(f"Updated BTC/USD price: ${price}")
+            
+            return True
+            
+        except Exception as e:
+            self.log_trade(f"Error updating BTC/USD data: {str(e)}")
+            return False
+
     def start_bot(self):
-        """Start the trading bot with proper initialization"""
+        """Start the trading bot"""
         try:
             if self.running:
                 self.log_trade("Bot is already running")
                 return
                     
-            # Verify paper balance before starting
-            if self.is_paper_trading:
-                self.verify_paper_balance()
-                    
-            # Set running flag
+            self.log_trade("Starting bot...")
             self.running = True
-            self.start_time = datetime.now()
-                
-            # Update status
-            self.update_status("Starting...")
-            self.log_trade("=== BOT STARTED ===")
-                
-            # Force update fee calculations before starting
-            self.force_update_fee_calculations()
-                
-            # Start the trading thread
-            self.trading_thread = threading.Thread(target=self.run_bot)
-            self.trading_thread.daemon = True
-            self.trading_thread.start()
-                
-            # Update UI - change start button to show "Stop" and make it call stop_bot
+            
+            # Update button text and command
             if hasattr(self, 'start_button'):
                 self.start_button.config(text="Stop", command=self.stop_bot)
-                
+            
             # Start the timer
-            if hasattr(self, 'start_timer'):
-                self.start_timer()
-                
+            self.start_time = datetime.now()
+            self.timer_running = True
+            self.update_timer()
+            
+            # Update status
+            self.update_status("Running")
+            
+            # Start trading in a separate thread
+            self.trading_thread = threading.Thread(target=self.trading_loop)
+            self.trading_thread.daemon = True
+            self.trading_thread.start()
+            
+            self.log_trade("Bot started successfully")
+            
         except Exception as e:
             self.log_trade(f"Error starting bot: {str(e)}")
             self.running = False
+            # Reset button in case of error
+            if hasattr(self, 'start_button'):
+                self.start_button.config(text="Start", command=self.start_bot)
 
     def stop_bot(self):
         """Stop the trading bot with proper cleanup"""
@@ -1579,10 +1617,14 @@ class CryptoScalpingBot:
             if not self.running:
                 self.log_trade("Bot is not running")
                 return
-                
+                    
             # Update status
             self.update_status("Stopping...")
             self.log_trade("=== BOT STOPPING ===")
+            
+            # Update button text and command FIRST
+            if hasattr(self, 'start_button'):
+                self.start_button.config(text="Start", command=self.start_bot)
             
             # Close all positions
             self.close_all_positions_on_stop()
@@ -1591,12 +1633,8 @@ class CryptoScalpingBot:
             self.running = False
             
             # Stop the timer if it exists
-            if hasattr(self, 'stop_timer'):
-                self.stop_timer()
-            
-            # Update UI - change button back to "Start" and make it call start_bot
-            if hasattr(self, 'start_button'):
-                self.start_button.config(text="Start", command=self.start_bot)
+            if hasattr(self, 'timer_running'):
+                self.timer_running = False
             
             # Wait for trading thread to finish if it exists
             if hasattr(self, 'trading_thread') and self.trading_thread and self.trading_thread.is_alive():
@@ -1609,6 +1647,33 @@ class CryptoScalpingBot:
             
         except Exception as e:
             self.log_trade(f"Error stopping bot: {str(e)}")
+            # Ensure button is reset even if there's an error
+            if hasattr(self, 'start_button'):
+                self.start_button.config(text="Start", command=self.start_bot)
+            self.running = False
+
+    def main_loop(self):
+        """Main bot loop that handles trading operations"""
+        try:
+            if not self.running:
+                return
+                
+            # Update BTC/USD data for market trend analysis
+            self.update_btc_data()
+            
+            # Start trading thread if not already running
+            if not hasattr(self, 'trading_thread') or not self.trading_thread.is_alive():
+                self.log_trade("Starting trading thread...")
+                self.trading_thread = threading.Thread(target=self.trading_loop)
+                self.trading_thread.daemon = True
+                self.trading_thread.start()
+                
+            # Schedule next update
+            self.root.after(1000, self.main_loop)
+            
+        except Exception as e:
+            self.log_trade(f"Error in main loop: {str(e)}")
+            self.update_status("Error")       
 
     def close_all_positions_on_stop(self):
         """Close all positions when stopping the bot"""
@@ -1706,19 +1771,31 @@ class CryptoScalpingBot:
             maker_fee = float(self.maker_fee_var.get()) / 100  # Convert from percentage to decimal
             taker_fee = float(self.taker_fee_var.get()) / 100  # Convert from percentage to decimal
             
+            # Log the values for debugging
+            self.log_trade(f"DEBUG: maker_fee_str = '{self.maker_fee_var.get()}'")
+            self.log_trade(f"DEBUG: taker_fee_str = '{self.taker_fee_var.get()}'")
+            self.log_trade(f"DEBUG: maker_fee (converted) = {maker_fee}")
+            self.log_trade(f"DEBUG: taker_fee (converted) = {taker_fee}")
+            
             # Update instance variables
             self.maker_fee = maker_fee
             self.taker_fee = taker_fee
             
-            # Calculate total round-trip fee based on order type
+            # Check if we're using limit orders
             use_limit_orders = self.use_limit_orders_var.get() if hasattr(self, 'use_limit_orders_var') else False
             
+            # Update our tracking flag
+            self.using_limit_orders = use_limit_orders
+            
+            # Calculate total round-trip fee based on order type
             if use_limit_orders:
                 # Using limit orders (maker fees)
                 self.total_fee_percentage = self.maker_fee * 2  # Entry and exit
+                fee_type = "maker"
             else:
                 # Using market orders (taker fees)
                 self.total_fee_percentage = self.taker_fee * 2  # Entry and exit
+                fee_type = "taker"
             
             # Debug: Print the updated instance variables
             self.log_trade(f"DEBUG: self.maker_fee = {self.maker_fee}")
@@ -1728,20 +1805,15 @@ class CryptoScalpingBot:
             
             # Update the total fees label
             total_fee_pct = self.total_fee_percentage * 100
-            fee_type = "maker" if use_limit_orders else "taker"
             if hasattr(self, 'total_fees_label'):
                 self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
             
             # Log the update
             self.log_trade(f"Fee structure updated: Maker {maker_fee*100:.2f}%, Taker {taker_fee*100:.2f}%, " +
                         f"Total ({fee_type}*2) {total_fee_pct:.2f}%")
-            
-            # Update tooltips
-            if hasattr(self, 'profit_target'):
-                self.add_tooltip(self.profit_target, 
-                    f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
-            
+                        
             return True
+            
         except Exception as e:
             self.log_trade(f"Error initializing fees: {str(e)}")
             return False
@@ -1794,33 +1866,25 @@ class CryptoScalpingBot:
         """Initialize historical data for a trading pair"""
         try:
             self.log_trade(f"Initializing historical data for {symbol}...")
-            
-            # Fetch initial ticker
+
             try:
                 ticker = self.exchange.fetch_ticker(symbol)
                 if not ticker:
                     self.log_trade(f"Could not fetch ticker for {symbol}")
                     return False
-                    
                 self.data_manager.update_price_data(symbol, ticker)
             except Exception as e:
                 self.log_trade(f"Error fetching ticker for {symbol}: {str(e)}")
                 return False
-                
-            # Fetch historical OHLCV data
+
             try:
                 since = int((datetime.now() - timedelta(days=3)).timestamp() * 1000)
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='15m', since=since, limit=100)
-                
                 if not ohlcv or len(ohlcv) < 20:
                     self.log_trade(f"Insufficient OHLCV data for {symbol}: {len(ohlcv) if ohlcv else 0} candles")
                     return False
-                    
-                # Process each candle
                 for candle in ohlcv:
                     timestamp, open_price, high, low, close, volume = candle
-                    
-                    # Create synthetic ticker
                     synthetic_ticker = {
                         'timestamp': pd.Timestamp(timestamp, unit='ms'),
                         'last': close,
@@ -1828,17 +1892,14 @@ class CryptoScalpingBot:
                         'bid': close * 0.999,
                         'ask': close * 1.001
                     }
-                    
-                    # Update price data
                     self.data_manager.update_price_data(symbol, synthetic_ticker)
             except Exception as e:
                 self.log_trade(f"Error fetching historical data for {symbol}: {str(e)}")
                 return False
-            
-            # Verify we have enough data
+
             try:
                 df = self.data_manager.get_price_data(symbol)
-                if df is not None and len(df) >= 20:  # Ensure we have enough data
+                if df is not None and len(df) >= 20:
                     self.log_trade(f"Successfully loaded {len(df)} data points for {symbol}")
                     return True
                 else:
@@ -1847,7 +1908,7 @@ class CryptoScalpingBot:
             except Exception as e:
                 self.log_trade(f"Error verifying data for {symbol}: {str(e)}")
                 return False
-                
+
         except Exception as e:
             self.log_trade(f"Error initializing data for {symbol}: {str(e)}")
             return False
@@ -1911,6 +1972,84 @@ class CryptoScalpingBot:
         ttk.Label(limit_frame, text=cancel_text, wraplength=350, justify="left").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=5, pady=1)
 
+    # This is a function to create or update the ML prediction checkbox
+    def create_ml_prediction_checkbox(self, parent_frame):
+        """Create or update the ML prediction checkbox with manual toggle"""
+        # Remove existing checkbox if it exists
+        if hasattr(self, 'ml_prediction_check') and self.ml_prediction_check:
+            self.ml_prediction_check.destroy()
+        
+        # Create new variable with explicit root
+        if not hasattr(self, 'use_ml_prediction_var'):
+            self.use_ml_prediction_var = tk.BooleanVar(self.root)
+            self.use_ml_prediction_var.set(False)
+        
+        # Create a frame to hold the checkbox and a label to show its state
+        ml_frame = ttk.Frame(parent_frame)
+        ml_frame.pack(side=tk.LEFT, padx=5)
+        
+        # Create a button instead of a checkbox for more reliable toggling
+        self.ml_prediction_button = ttk.Button(
+            ml_frame,
+            text="ML: OFF",
+            command=self.manual_toggle_ml_prediction
+        )
+        self.ml_prediction_button.pack(side=tk.LEFT)
+        
+        # Log the creation
+        self.log_trade("ML prediction button created with manual toggle")
+
+    def manual_toggle_ml_prediction(self):
+        """Manually toggle ML prediction state"""
+        # Get current state and invert it
+        current_state = self.use_ml_prediction_var.get()
+        new_state = not current_state
+        
+        self.log_trade(f"Manual ML toggle: {current_state} -> {new_state}")
+        
+        # Set the new state
+        self.use_ml_prediction_var.set(new_state)
+        
+        # Update button text
+        if hasattr(self, 'ml_prediction_button'):
+            self.ml_prediction_button.config(text=f"ML: {'ON' if new_state else 'OFF'}")
+        
+        # Handle the state change
+        if new_state:
+            # Initialize prediction service if not already done
+            if not hasattr(self, 'prediction_service'):
+                try:
+                    from trade_prediction import prediction_service
+                    self.prediction_service = prediction_service
+                    self.log_trade("ML prediction service initialized")
+                except ImportError as e:
+                    self.log_trade(f"Error importing prediction service: {str(e)}")
+                    # Reset the state if import fails
+                    self.use_ml_prediction_var.set(False)
+                    if hasattr(self, 'ml_prediction_button'):
+                        self.ml_prediction_button.config(text="ML: OFF")
+                    messagebox.showerror("ML Error", f"Could not enable ML predictions: {str(e)}")
+                    return
+                    
+            self.log_trade("ML PREDICTION ENABLED: Bot will use machine learning to filter trades")
+            messagebox.showinfo("ML Prediction", "Machine learning prediction is now enabled.")
+            
+            # Update ML info display
+            if hasattr(self, 'ml_accuracy_label'):
+                self.update_ml_info()
+        else:
+            self.log_trade("ML PREDICTION DISABLED: Bot will use standard conditions only")
+            
+            # Update ML info display to show disabled state
+            if hasattr(self, 'ml_accuracy_label'):
+                self.ml_accuracy_label.config(text="ML predictions disabled")
+                if hasattr(self, 'ml_predictions_label'):
+                    self.ml_predictions_label.config(text="ML predictions disabled")
+        
+        # Verify the state was set correctly
+        final_state = self.use_ml_prediction_var.get()
+        self.log_trade(f"ML prediction state after manual toggle: {final_state}")
+
     def create_parameter_entry(self, parent, row, label_text, variable, default_value, tooltip_text=None):
         """Create a parameter entry with proper styling and optional tooltip"""
         try:
@@ -1941,6 +2080,9 @@ class CryptoScalpingBot:
             # Get the current state of the checkbox
             use_limit_orders = self.use_limit_orders_var.get()
             
+            # Update the instance flag to match the checkbox state
+            self.using_limit_orders = use_limit_orders
+            
             # Update the fee calculation
             if use_limit_orders:
                 # Using limit orders (maker fees)
@@ -1965,19 +2107,32 @@ class CryptoScalpingBot:
             self.log_trade(f"Total round-trip fee: {total_fee_pct:.2f}%")
             
             # Update tooltips
-            if hasattr(self, 'profit_target_entry'):
-                self.add_tooltip(self.profit_target_entry, 
+            if hasattr(self, 'profit_target'):
+                self.add_tooltip(self.profit_target, 
                     f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
             
             # Show/hide limit order settings based on selection
             if hasattr(self, 'limit_frame'):
                 if use_limit_orders:
-                    self.limit_frame.grid(row=1, column=2, padx=5, pady=5, sticky="nw")
+                    self.limit_frame.pack(fill="x", padx=5, pady=5)
                 else:
-                    self.limit_frame.grid_forget()
+                    self.limit_frame.pack_forget()
+                    
+            # Force update all fee-related calculations
+            self.force_update_fee_calculations()
             
         except Exception as e:
             self.log_trade(f"Error toggling order type: {str(e)}")
+
+    def get_market_pairs_async(self, callback=None):
+        def task():
+            pairs = self.get_market_pairs()
+            if callback:
+                self.root.after(0, lambda: callback(pairs))
+        threading.Thread(target=task, daemon=True).start()
+
+    def scan_opportunities_async(self):
+        threading.Thread(target=self.scan_opportunities, daemon=True).start()
 
     def setup_gui(self):
         """Set up the GUI components"""
@@ -2026,14 +2181,7 @@ class CryptoScalpingBot:
             self.market_override_check.pack(side=tk.LEFT, padx=5)
 
             # ML prediction checkbox - NEW
-            self.use_ml_prediction_var = tk.BooleanVar(value=False)
-            self.ml_prediction_check = ttk.Checkbutton(
-                first_row, 
-                text="Use ML Prediction", 
-                variable=self.use_ml_prediction_var,
-                command=self.toggle_ml_prediction
-            )
-            self.ml_prediction_check.pack(side=tk.LEFT, padx=5)
+            self.create_ml_prediction_checkbox(first_row)
             
             # Second row of buttons
             second_row = ttk.Frame(buttons_frame)
@@ -2767,29 +2915,67 @@ class CryptoScalpingBot:
     def enforce_max_trades_limit(self):
         """Enforce the maximum trades limit by closing excess trades if necessary"""
         try:
+            # Get max trades from UI or use default
             max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
             current_trades = len(self.active_trades)
+            
+            self.log_trade(f"Checking trade limits: {current_trades}/{max_trades} active trades")
             
             if current_trades <= max_trades:
                 return  # No action needed
                 
-            # We have more trades than allowed, close the least profitable ones
+            # We have more trades than allowed, close the excess trades
             self.log_trade(f"WARNING: Found {current_trades} active trades but max is {max_trades}. Closing excess trades.")
             
-            # Sort trades by profit percentage (ascending)
-            sorted_trades = sorted(
-                self.active_trades.items(),
-                key=lambda x: self.calculate_profit_percentage(x[1]),
-            )
+            # Group trades by symbol to identify duplicates
+            symbol_trades = {}
+            for trade_id, trade in self.active_trades.items():
+                symbol = trade['symbol']
+                if symbol not in symbol_trades:
+                    symbol_trades[symbol] = []
+                symbol_trades[symbol].append((trade_id, trade))
             
-            # Close the least profitable trades until we're at the limit
-            trades_to_close = sorted_trades[:current_trades - max_trades]
+            # Log duplicate trades if found
+            for symbol, trades in symbol_trades.items():
+                if len(trades) > 1:
+                    self.log_trade(f"DUPLICATE DETECTED: Found {len(trades)} trades for {symbol}")
+                    
+            # First close duplicate trades (keep the most profitable one for each symbol)
+            trades_to_close = []
+            for symbol, symbol_trade_list in symbol_trades.items():
+                if len(symbol_trade_list) > 1:
+                    # Sort by profit percentage (descending)
+                    sorted_symbol_trades = sorted(
+                        symbol_trade_list,
+                        key=lambda x: self.calculate_profit_percentage(x[1]),
+                        reverse=True
+                    )
+                    
+                    # Keep the most profitable one, close the rest
+                    trades_to_close.extend(sorted_symbol_trades[1:])
+                    self.log_trade(f"Keeping most profitable {symbol} trade, closing {len(sorted_symbol_trades)-1} duplicates")
+            
+            # If we still have too many trades after closing duplicates, close the least profitable ones
+            if len(self.active_trades) - len(trades_to_close) > max_trades:
+                # Sort all trades by profit percentage (ascending)
+                sorted_trades = sorted(
+                    [(trade_id, trade) for trade_id, trade in self.active_trades.items() 
+                    if trade_id not in [t[0] for t in trades_to_close]],
+                    key=lambda x: self.calculate_profit_percentage(x[1])
+                )
+                
+                # Add more trades to close until we're at the limit
+                trades_needed_to_close = len(self.active_trades) - len(trades_to_close) - max_trades
+                additional_trades_to_close = sorted_trades[:trades_needed_to_close]
+                trades_to_close.extend(additional_trades_to_close)
+            
+            # Close all identified trades
             for trade_id, trade in trades_to_close:
-                # Use the existing method to get current price (fetch_ticker)
                 try:
+                    # Get current price
                     ticker = self.exchange.fetch_ticker(trade['symbol'])
                     current_price = float(ticker['last'])
-                    self.log_trade(f"Closing excess trade {trade['symbol']} to enforce max trades limit")
+                    self.log_trade(f"Closing {'duplicate' if trade['symbol'] in [t[1]['symbol'] for t in trades_to_close if t[0] != trade_id] else 'excess'} trade {trade['symbol']} to enforce max trades limit")
                     self.close_trade(trade_id, trade, current_price, "max trades enforcement")
                 except Exception as e:
                     self.log_trade(f"Error closing excess trade {trade['symbol']}: {str(e)}")
@@ -2798,15 +2984,32 @@ class CryptoScalpingBot:
             self.log_trade(f"Error enforcing max trades limit: {str(e)}")
             
     def calculate_profit_percentage(self, trade):
-        """Calculate current profit percentage for a trade"""
+        """Calculate profit percentage for a trade"""
         try:
-            # Use the existing method to get current price
-            ticker = self.exchange.fetch_ticker(trade['symbol'])
-            current_price = float(ticker['last'])
+            if 'entry_price' not in trade or 'current_price' not in trade:
+                return 0.0
+                
             entry_price = float(trade['entry_price'])
-            return ((current_price - entry_price) / entry_price) * 100
-        except Exception:
-            return -999  # Return a very negative number to prioritize closing this trade
+            
+            # Get current price if not already in trade
+            if 'current_price' in trade and trade['current_price']:
+                current_price = float(trade['current_price'])
+            else:
+                try:
+                    ticker = self.exchange.fetch_ticker(trade['symbol'])
+                    current_price = float(ticker['last'])
+                except Exception as e:
+                    self.log_trade(f"Error getting current price for {trade['symbol']}: {str(e)}")
+                    return 0.0
+                    
+            # Calculate profit percentage
+            if entry_price > 0:
+                return ((current_price - entry_price) / entry_price) * 100
+            return 0.0
+            
+        except Exception as e:
+            self.log_trade(f"Error calculating profit percentage: {str(e)}")
+            return 0.0
 
     def calculate_price_acceleration(self, df):
         """Calculate price acceleration (Alpha)"""
@@ -2881,6 +3084,43 @@ class CryptoScalpingBot:
             # Update the label if it exists
             if hasattr(self, 'market_condition_label'):
                 self.market_condition_label.config(text=f"Market: {condition_text}", fg=color)
+            
+            # Update BTC movement label if it exists
+            if hasattr(self, 'btc_movement_label') and 'btc_changes' in market:
+                btc_changes = market['btc_changes']
+                btc_text = f"BTC: 5m: {btc_changes['5min']:.2f}%, 15m: {btc_changes['15min']:.2f}%, 1h: {btc_changes['1hour']:.2f}%"
+                
+                # Set color based on 15-minute change
+                if btc_changes['15min'] > 0.5:
+                    btc_color = "green"
+                elif btc_changes['15min'] < -0.5:
+                    btc_color = "red"
+                else:
+                    btc_color = "black"
+                    
+                self.btc_movement_label.config(text=btc_text, fg=btc_color)
+            
+            # Update ML model information if available
+            if hasattr(self, 'ml_accuracy_label'):
+                # Check if ML prediction is enabled
+                use_ml = hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get()
+                
+                if use_ml:
+                    # Get ML model metrics if available
+                    if hasattr(self, 'ml_model') and hasattr(self.ml_model, 'get_metrics'):
+                        metrics = self.ml_model.get_metrics()
+                        self.ml_accuracy_label.config(text=f"Accuracy: {metrics['accuracy']:.1f}%")
+                        
+                        if hasattr(self, 'ml_predictions_label'):
+                            self.ml_predictions_label.config(
+                                text=f"Recent: {metrics['recent_correct']}/{metrics['recent_total']} correct"
+                            )
+                    else:
+                        self.ml_accuracy_label.config(text="ML model active - metrics unavailable")
+                else:
+                    self.ml_accuracy_label.config(text="ML predictions disabled")
+                    if hasattr(self, 'ml_predictions_label'):
+                        self.ml_predictions_label.config(text="ML predictions disabled")
             
             # Log the update
             self.log_trade(f"Market condition updated: {condition_text}")
@@ -3092,47 +3332,57 @@ class CryptoScalpingBot:
             self.log_trade(f"Error resetting metrics: {str(e)}")
             return False
 
-    def execute_real_trade(self, symbol, quantity, price=None):
+    def execute_real_trade(self, symbol, quantity, price=None, use_limit_orders=None):
         """Execute a real trade on the exchange"""
         try:
             if not hasattr(self, 'exchange') or self.exchange is None:
                 self.log_trade("Exchange not initialized")
                 return None
                 
-            # Check if we're using limit orders
-            use_limit_orders = hasattr(self, 'using_limit_orders') and self.using_limit_orders
+            # Check if we're using limit orders - use the parameter or instance variable
+            if use_limit_orders is None:
+                use_limit_orders = self.using_limit_orders if hasattr(self, 'using_limit_orders') else False
+                
+            # Log the order type for debugging
+            self.log_trade(f"Executing real {'LIMIT' if use_limit_orders else 'MARKET'} trade for {symbol}")
             
-            # Execute the order
-            if use_limit_orders and price is not None:
+            # For limit orders, we need a price
+            if use_limit_orders:
+                # If no price provided, get current price
+                if price is None:
+                    ticker = self.exchange.fetch_ticker(symbol)
+                    price = float(ticker['last'])
+                    
+                # Get order book to find best bid/ask
+                order_book = self.exchange.fetch_order_book(symbol)
+                best_bid = float(order_book['bids'][0][0]) if order_book['bids'] else price * 0.99
+                best_ask = float(order_book['asks'][0][0]) if order_book['asks'] else price * 1.01
+                
+                # Set limit price slightly above best bid for better fill probability
+                limit_price = best_bid * 1.001  # 0.1% above best bid
+                
+                # Log the price details
+                self.log_trade(f"Setting limit buy price at ${limit_price:.8f}")
+                self.log_trade(f"Best bid: ${best_bid:.8f}, Best ask: ${best_ask:.8f}")
+                
+                # Calculate percentage above best bid
+                pct_above_bid = ((limit_price - best_bid) / best_bid) * 100 if best_bid > 0 else 0
+                self.log_trade(f"Price is {pct_above_bid:.3f}% above best bid")
+                
                 # Create limit buy order
-                order = self.exchange.create_limit_buy_order(symbol, quantity, price)
-                self.log_trade(f"Created limit buy order for {quantity} {symbol} at ${price}")
+                order = self.exchange.create_limit_buy_order(symbol, quantity, limit_price)
+                self.log_trade(f"Created limit buy order for {quantity} {symbol} at ${limit_price}")
+                
+                # Return the order with the actual price used
+                return order
             else:
                 # Create market buy order
                 order = self.exchange.create_market_buy_order(symbol, quantity)
                 self.log_trade(f"Created market buy order for {quantity} {symbol}")
                 
-            # Calculate and track fees
-            if order and order.get('status') in ['closed', 'filled']:
-                # Get the actual price
-                actual_price = float(order['price']) if 'price' in order and order['price'] else price
-                position_size = quantity * actual_price
+                # Return the order
+                return order
                 
-                # Calculate entry fee
-                fee_rate = self.maker_fee if use_limit_orders else self.taker_fee
-                entry_fee = position_size * fee_rate
-                
-                # Log the fee
-                self.log_trade(f"Entry fee for {symbol}: ${entry_fee:.2f} ({fee_rate*100:.2f}%)")
-                
-                # Update real metrics with the entry fee
-                self.real_metrics['total_fees'] += entry_fee
-                
-                # Update metrics display
-                self.update_metrics()
-                
-            return order
-            
         except Exception as e:
             self.log_trade(f"Error executing real trade: {str(e)}")
             return None
@@ -3533,161 +3783,205 @@ class CryptoScalpingBot:
         self.start_time = datetime.now()
         self.timer_running = True
         self.update_timer()
+
     def stop_timer(self):
         """Stop the runtime timer"""
         self.timer_running = False
+
     def update_timer(self):
         """Update the timer display"""
-        if self.timer_running and self.start_time:
+        if self.timer_running and hasattr(self, 'start_time') and self.start_time:
             try:
                 current_time = datetime.now()
                 elapsed = current_time - self.start_time
                 
                 # Convert to hours, minutes, seconds
-                hours = int(elapsed.total_seconds() // 3600)
-                minutes = int((elapsed.total_seconds() % 3600) // 60)
-                seconds = int(elapsed.total_seconds() % 60)
+                total_seconds = int(elapsed.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
                 
                 # Update timer label
-                self.timer_label.config(text=f"Runtime: {hours:02d}:{minutes:02d}:{seconds:02d}")
+                if hasattr(self, 'timer_label'):
+                    self.timer_label.config(text=f"Runtime: {hours:02d}:{minutes:02d}:{seconds:02d}")
                 
                 # Schedule next update
                 self.root.after(1000, self.update_timer)
             except Exception as e:
                 self.log_trade(f"Error updating timer: {str(e)}")
+        elif self.timer_running:
+            # If timer is running but start_time is not set, try again in 1 second
+            self.root.after(1000, self.update_timer)
 
     def update_chart(self):
-        """Update the price chart with active trades using a fixed time window"""
+        """Update the price chart with active trades, throttled to avoid GUI freeze."""
         try:
-            # Check if chart objects exist
-            if not hasattr(self, 'ax') or not hasattr(self, 'canvas'):
-                self.log_trade("Chart objects not initialized, skipping chart update")
+            # Throttle chart updates to once every 2 seconds
+            now = time.time()
+            if hasattr(self, '_last_chart_update') and now - self._last_chart_update < 2:
                 return
-                
+            self._last_chart_update = now
+
+            # Always update on the main thread
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, self.update_chart)
+                return
+
+            if not hasattr(self, 'ax') or not hasattr(self, 'canvas'):
+                self.log_trade("Chart not initialized yet")
+                return
+
             # Clear the current plot
             self.ax.clear()
-            
+
             # Set colors based on night mode
             bg_color = '#2d2d2d' if self.night_mode else 'white'
             fg_color = 'white' if self.night_mode else 'black'
             grid_color = '#3d3d3d' if self.night_mode else '#cccccc'
-            
+
             # Set background color
             self.ax.set_facecolor(bg_color)
-            self.ax.tick_params(axis='both', colors=fg_color)
-            self.ax.grid(True, color=grid_color, linestyle='--', alpha=0.5)
-            
-            # Set spine colors
-            for spine in self.ax.spines.values():
-                spine.set_color(grid_color)
-            
-            # Calculate time window (last 30 minutes)
-            now = datetime.now()
-            time_window = timedelta(minutes=30)
-            window_start = now - time_window
-            
-            # Draw key levels
+
+            # Draw profit target and stop loss lines
             try:
-                profit_target = float(self.profit_target.get())
-                stop_loss = float(self.stop_loss.get())
-                
-                # Draw profit target line
-                self.ax.axhline(y=profit_target, color='green', linestyle=':', alpha=0.5, 
-                            label=f"Profit Target ({profit_target}%)")
-                
-                # Draw stop loss line
-                self.ax.axhline(y=-stop_loss, color='red', linestyle=':', alpha=0.5,
-                            label=f"Stop Loss (-{stop_loss}%)")
-                
-                # Draw zero line
-                self.ax.axhline(y=0, color=grid_color, linestyle='-', alpha=0.3)
-                
+                if hasattr(self, 'profit_target') and hasattr(self, 'stop_loss'):
+                    profit_target = float(self.profit_target.get())
+                    stop_loss = float(self.stop_loss.get())
+
+                    # Draw horizontal lines for profit target and stop loss
+                    self.ax.axhline(y=profit_target, color='g', linestyle='--', alpha=0.7, label=f"PT: {profit_target}%")
+                    self.ax.axhline(y=-stop_loss, color='r', linestyle='--', alpha=0.7, label=f"SL: -{stop_loss}%")
+                    self.ax.axhline(y=0, color=grid_color, linestyle='-', alpha=0.5)
+
+                    # Draw trailing stop activation line if applicable
+                    if hasattr(self, 'trailing_activation'):
+                        trailing_activation = float(self.trailing_activation.get())
+                        self.ax.axhline(y=trailing_activation, color='b', linestyle=':', alpha=0.5,
+                                        label=f"TS Act: {trailing_activation}%")
             except Exception as e:
                 self.log_trade(f"Error drawing key levels: {str(e)}")
-            
-            # Plot active trades
+
+            # If there are no active trades, just draw an empty chart
             if not self.active_trades:
                 self.ax.set_title("No Active Trades", color=fg_color)
+                self.ax.set_xlabel("Time", color=fg_color)
+                self.ax.set_ylabel("Price Change (%)", color=fg_color)
+                self.ax.tick_params(colors=fg_color)
+                for spine in self.ax.spines.values():
+                    spine.set_color(grid_color)
                 self.canvas.draw()
                 return
-            
-            # Initialize price history if needed
-            if not hasattr(self, 'price_history'):
-                self.price_history = {}
-            
+
             # Plot each active trade
-            for trade_id, trade in self.active_trades.items():
+            for trade_id, trade in list(self.active_trades.items()):
                 symbol = trade['symbol']
-                entry_price = trade['entry_price']
-                entry_time = trade.get('entry_time', now - timedelta(minutes=1))
-                
-                # Initialize price history for this symbol if it doesn't exist
-                if symbol not in self.price_history:
-                    self.price_history[symbol] = []
-                
-                # Add current price point
+
+                # Get current price and add to history if needed
                 try:
-                    current_price = float(self.exchange.fetch_ticker(symbol)['last'])
-                    self.price_history[symbol].append((now, current_price))
+                    current_price = trade.get('current_price')
+                    if current_price is None:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                        current_price = float(ticker['last'])
+
+                    # Add current price to history
+                    current_time = datetime.now()
+
+                    # Initialize price history for this symbol if it doesn't exist
+                    if symbol not in self.price_history:
+                        self.price_history[symbol] = []
+
+                    self.price_history[symbol].append((current_time, current_price))
+
+                    # Limit history length to prevent compression over time
+                    max_points = 50  # Keep only the last 50 points
+                    if len(self.price_history[symbol]) > max_points:
+                        self.price_history[symbol] = self.price_history[symbol][-max_points:]
                 except Exception as e:
-                    self.log_trade(f"Error fetching price for {symbol}: {str(e)}")
-                    continue
-                
-                # Filter price history to time window
-                self.price_history[symbol] = [
-                    (t, p) for t, p in self.price_history[symbol] 
-                    if t >= window_start
-                ]
-                
-                # Plot if we have data points
-                if self.price_history[symbol]:
-                    times = [point[0] for point in self.price_history[symbol]]
-                    prices = [point[1] for point in self.price_history[symbol]]
-                    
-                    # Calculate percentage change from entry
-                    prices_pct = [(p - entry_price) / entry_price * 100 for p in prices]
-                    
-                    # Plot with proper formatting
-                    self.ax.plot(times, prices_pct, 
-                            label=f"{symbol} ({prices_pct[-1]:.2f}%)",
-                            linewidth=2)
-            
-            # Set title and labels
+                    self.log_trade(f"Error updating price history for {symbol}: {str(e)}")
+
+                # Plot the price history
+                if symbol in self.price_history and len(self.price_history[symbol]) > 1:
+                    try:
+                        # Extract times and prices
+                        times, prices = zip(*self.price_history[symbol])
+
+                        # Use sequential indices for x-axis instead of actual timestamps
+                        x_indices = list(range(len(times)))
+
+                        # Calculate percentage change from entry
+                        entry_price = trade['entry_price']
+                        prices_pct = [(p - entry_price) / entry_price * 100 for p in prices]
+
+                        # Plot with a distinctive color and label showing current percentage
+                        current_pct = prices_pct[-1] if prices_pct else 0
+                        self.ax.plot(x_indices, prices_pct,
+                                    label=f"{symbol} ({current_pct:.2f}%)",
+                                    linewidth=2)
+
+                        # Add timestamp labels at regular intervals
+                        if len(times) > 5:
+                            num_labels = min(5, len(times))
+                            indices = [int(i * (len(times)-1) / (num_labels-1)) for i in range(num_labels)]
+                            self.ax.set_xticks([x_indices[i] for i in indices])
+                            self.ax.set_xticklabels([times[i].strftime('%H:%M:%S') for i in indices])
+                        else:
+                            self.ax.set_xticks(x_indices)
+                            self.ax.set_xticklabels([t.strftime('%H:%M:%S') for t in times])
+
+                    except Exception as e:
+                        self.log_trade(f"Error plotting {symbol}: {str(e)}")
+
+            # Set chart title and labels
             self.ax.set_title("Active Trades (% Change from Entry)", color=fg_color)
-            self.ax.set_xlabel('Time', color=fg_color)
-            self.ax.set_ylabel('Price Change (%)', color=fg_color)
-            
-            # Format x-axis to show time properly
-            self.ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
-            
-            # Set x-axis limits to time window
-            self.ax.set_xlim(window_start, now)
-            
-            # Set reasonable y-axis limits
+            self.ax.set_xlabel("Time", color=fg_color)
+            self.ax.set_ylabel("Price Change (%)", color=fg_color)
+
+            # Set colors for ticks and spines
+            self.ax.tick_params(colors=fg_color)
+            for spine in self.ax.spines.values():
+                spine.set_color(grid_color)
+
+            # Add legend with proper coloring
+            legend = self.ax.legend(loc='upper left')
+            if legend:
+                for text in legend.get_texts():
+                    text.set_color(fg_color)
+
+            # Set reasonable y-axis limits based on profit target and stop loss
             try:
                 profit_target = float(self.profit_target.get())
                 stop_loss = float(self.stop_loss.get())
-                
-                # Ensure the profit target and stop loss lines are visible
-                self.ax.set_ylim(
-                    min(-stop_loss * 1.5, -0.5),
-                    max(profit_target * 1.5, 0.5)
-                )
+
+                y_min = min(-stop_loss * 1.5, -0.5)
+                y_max = max(profit_target * 1.5, 0.5)
+
+                # Expand limits based on current data
+                for trade_id, trade in self.active_trades.items():
+                    symbol = trade['symbol']
+                    if symbol in self.price_history and len(self.price_history[symbol]) > 0:
+                        entry_price = trade['entry_price']
+                        prices = [point[1] for point in self.price_history[symbol]]
+                        prices_pct = [(p - entry_price) / entry_price * 100 for p in prices]
+
+                        if prices_pct:
+                            min_pct = min(prices_pct)
+                            max_pct = max(prices_pct)
+                            y_min = min(y_min, min_pct * 1.1)
+                            y_max = max(y_max, max_pct * 1.1)
+
+                self.ax.set_ylim(y_min, y_max)
             except Exception as e:
                 self.log_trade(f"Error setting y-axis limits: {str(e)}")
-            
-            # Add legend
-            self.ax.legend(loc='upper left')
-            
-            # Rotate x-axis labels for better readability
-            plt.xticks(rotation=45)
-            
-            # Adjust layout to prevent label cutoff
+
+            # Add grid
+            self.ax.grid(True, color=grid_color, linestyle='--', alpha=0.3)
+
+            # Apply tight layout to ensure proper spacing
             self.fig.tight_layout()
-            
-            # Draw the chart
+
+            # Draw the updated chart
             self.canvas.draw()
-            
+
         except Exception as e:
             self.log_trade(f"Error updating chart: {str(e)}")
 
@@ -4088,6 +4382,234 @@ class CryptoScalpingBot:
             self.log_trade(f"Error applying new conditions: {str(e)}")
             messagebox.showerror("Error", f"Failed to apply new conditions: {str(e)}")
 
+    def update_market_info(self):
+        """Update market condition information display"""
+        try:
+            # Get current market conditions
+            market = self.analyze_market_conditions()
+            
+            # Format the market state display
+            if market['state'] == 'bearish':
+                condition_text = f"BEARISH (Strength: {market['strength']:.2f})"
+                color = "red"
+            elif market['state'] == 'bullish':
+                condition_text = f"BULLISH (Strength: {market['strength']:.2f})"
+                color = "green"
+            else:
+                condition_text = f"NEUTRAL (Strength: {market['strength']:.2f})"
+                color = "yellow"
+                
+            # Update the market condition label
+            if hasattr(self, 'market_condition_label'):
+                self.market_condition_label.config(text=f"Market: {condition_text}", foreground=color)
+            
+            # Update BTC movement if available
+            if hasattr(self, 'btc_movement_label') and 'btc_changes' in market:
+                btc_changes = market['btc_changes']
+                btc_text = f"BTC: 5m: {btc_changes['5min']:.2f}%, 15m: {btc_changes['15min']:.2f}%, 1h: {btc_changes['1hour']:.2f}%"
+                
+                # Color based on 15-minute change
+                if btc_changes['15min'] > 0.5:
+                    btc_color = "green"
+                elif btc_changes['15min'] < -0.5:
+                    btc_color = "red"
+                else:
+                    btc_color = "black"
+                    
+                self.btc_movement_label.config(text=btc_text, foreground=btc_color)
+                
+        except Exception as e:
+            self.log_trade(f"Error updating market info: {str(e)}")
+
+    def update_ml_info(self):
+        """Update ML model performance information"""
+        try:
+            if not hasattr(self, 'ml_accuracy_label') or not hasattr(self, 'prediction_service'):
+                return
+                
+            # Get ML model performance metrics if available
+            if hasattr(self.prediction_service, 'get_performance_metrics'):
+                metrics = self.prediction_service.get_performance_metrics()
+                
+                if metrics:
+                    # Update accuracy label
+                    accuracy_text = f"Accuracy: {metrics['accuracy']:.1f}%, Precision: {metrics['precision']:.1f}%"
+                    self.ml_accuracy_label.config(text=accuracy_text)
+                    
+                    # Update recent predictions
+                    if 'recent_predictions' in metrics:
+                        recent = metrics['recent_predictions']
+                        predictions_text = f"Recent: {recent['correct']}/{recent['total']} correct ({recent['success_rate']:.1f}%)"
+                        self.ml_predictions_label.config(text=predictions_text)
+                    
+                    # Update features importance if available
+                    if 'top_features' in metrics:
+                        features_text = f"Key features: {', '.join(metrics['top_features'][:3])}"
+                        self.ml_features_label.config(text=features_text)
+                else:
+                    # Default values if metrics not available
+                    self.ml_accuracy_label.config(text="Accuracy: Not available")
+                    self.ml_predictions_label.config(text="Recent predictions: N/A")
+            else:
+                # If ML model is being used but no metrics available
+                if hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get():
+                    self.ml_accuracy_label.config(text="ML model active - metrics unavailable")
+                else:
+                    self.ml_accuracy_label.config(text="ML predictions disabled")
+                    
+        except Exception as e:
+            self.log_trade(f"Error updating ML info: {str(e)}")
+
+    def update_metrics(self):
+        """Update performance metrics display"""
+        try:
+            if not hasattr(self, 'metrics_labels'):
+                return
+
+            # Update market and ML information first
+            self.update_market_info()
+            self.update_ml_info()
+
+            # Get the correct metrics based on trading mode
+            if self.is_paper_trading:
+                metrics = self.paper_metrics
+            else:
+                metrics = self.real_metrics
+                
+            # Update instance variables for backward compatibility
+            self.total_profit = metrics['total_profit']
+            self.total_fees = metrics['total_fees']
+            self.winning_trades = metrics['winning_trades']
+            self.losing_trades = metrics['losing_trades']
+            self.total_trades = metrics['total_trades']
+
+            # Calculate win rate (avoid division by zero)
+            if metrics['total_trades'] > 0:
+                win_rate = (metrics['winning_trades'] / metrics['total_trades']) * 100
+            else:
+                win_rate = 0.0
+
+            # Get balance text
+            if self.is_paper_trading:
+                balance_text = f"${self.paper_balance:.2f}"
+            else:
+                try:
+                    balance = float(self.exchange.fetch_balance()['USD']['free'])
+                    balance_text = f"${balance:.2f}"
+                except Exception as e:
+                    self.log_trade(f"Error fetching balance: {str(e)}")
+                    balance_text = "Unavailable"
+
+            # Update all metrics
+            display_metrics = {
+                'total_profit': f"${metrics['total_profit']:.2f}",
+                'total_fees': f"${metrics['total_fees']:.2f}",
+                'net_profit': f"${(metrics['total_profit'] - metrics['total_fees']):.2f}",
+                'win_rate': f"{win_rate:.1f}% ({metrics['winning_trades']}/{metrics['total_trades']})",
+                'total_trades': str(metrics['total_trades']),
+                'balance': balance_text
+            }
+
+            # Update label widgets
+            for key, value in display_metrics.items():
+                if key in self.metrics_labels:
+                    self.metrics_labels[key].config(text=value)
+
+                    # Color coding for profit/loss
+                    if key in ['total_profit', 'net_profit']:
+                        try:
+                            value_num = float(value.replace('$', '').replace(',', ''))
+                            color = 'green' if value_num > 0 else 'red' if value_num < 0 else 'black'
+                            self.metrics_labels[key].config(foreground=color)
+                        except ValueError:
+                            pass
+
+            # Save metrics to file
+            self.save_metrics()
+                
+        except Exception as e:
+            self.log_trade(f"Error updating metrics: {str(e)}")
+
+    def setup_performance_metrics(self, parent):
+        """Setup performance metric displays with enhanced market information"""
+        try:
+            # Create a frame for market conditions
+            market_frame = ttk.LabelFrame(parent, text="Market Conditions")
+            market_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            # Market state indicator
+            self.market_condition_label = ttk.Label(
+                market_frame, 
+                text="Market: Analyzing...",
+                font=("Arial", 10, "bold")
+            )
+            self.market_condition_label.pack(fill=tk.X, padx=5, pady=2)
+            
+            # Bitcoin movement indicator
+            self.btc_movement_label = ttk.Label(
+                market_frame,
+                text="BTC: Loading...",
+                font=("Arial", 10)
+            )
+            self.btc_movement_label.pack(fill=tk.X, padx=5, pady=2)
+            
+            # ML model performance - ENSURE THIS IS BEFORE THE TRADING PERFORMANCE FRAME
+            ml_frame = ttk.LabelFrame(parent, text="ML Model Performance")
+            ml_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            # ML accuracy indicator
+            self.ml_accuracy_label = ttk.Label(
+                ml_frame,
+                text="Accuracy: Not available",
+                font=("Arial", 10)
+            )
+            self.ml_accuracy_label.pack(fill=tk.X, padx=5, pady=2)
+            
+            # ML recent predictions
+            self.ml_predictions_label = ttk.Label(
+                ml_frame,
+                text="Recent predictions: N/A",
+                font=("Arial", 10)
+            )
+            self.ml_predictions_label.pack(fill=tk.X, padx=5, pady=2)
+            
+            # ML features used
+            self.ml_features_label = ttk.Label(
+                ml_frame,
+                text="Key features: momentum, volume, RSI, volatility",
+                font=("Arial", 9),
+                wraplength=250
+            )
+            self.ml_features_label.pack(fill=tk.X, padx=5, pady=2)
+            
+            # Create a grid layout for metrics - THIS COMES AFTER THE ML FRAME
+            metrics_frame = ttk.LabelFrame(parent, text="Trading Performance")
+            metrics_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            self.metrics_labels = {}
+            metrics_data = [
+                ('total_profit', 'Total Profit:'),
+                ('total_fees', 'Total Fees:'),
+                ('net_profit', 'Net Profit:'),
+                ('win_rate', 'Win Rate:'),
+                ('total_trades', 'Total Trades:'),
+                ('balance', 'Available Balance:')
+            ]
+            
+            # Create labels for each metric
+            for i, (key, label_text) in enumerate(metrics_data):
+                label = ttk.Label(metrics_frame, text=label_text)
+                label.grid(row=i, column=0, sticky="w", padx=5, pady=2)
+                
+                value_label = ttk.Label(metrics_frame, text="Loading...")
+                value_label.grid(row=i, column=1, sticky="e", padx=5, pady=2)
+                self.metrics_labels[key] = value_label
+            
+            self.log_trade("Enhanced performance metrics setup complete")
+            
+        except Exception as e:
+            self.log_trade(f"Error setting up performance metrics: {str(e)}")
+
     def close_trade(self, trade_id, trade, current_price, reason="closed"):
         """Close a trade and update performance metrics"""
         try:
@@ -4101,82 +4623,144 @@ class CryptoScalpingBot:
 
             # Calculate profit percentage before closing
             profit_pct = ((current_price - entry_price) / entry_price) * 100
-
-            # Execute real sell order if not paper trading
+            
+            # Log closing reason
+            self.log_trade(f"Closing trade {trade_id} ({symbol}) - {reason}")
+            self.log_trade(f"Entry: ${entry_price:.8f}, Exit: ${current_price:.8f}, P/L: {profit_pct:.2f}%")
+            
+            # Different handling for real vs paper trading
             if not self.is_paper_trading:
                 try:
-                    # Get the base currency (e.g., 'BTC' from 'BTC/USD')
-                    base_currency = symbol.split('/')[0]
-                    
-                    # Calculate quantity
-                    quantity = position_size / entry_price
-                    
-                    # Check if we have enough balance
-                    balance = self.exchange.fetch_balance()
-                    available = float(balance[base_currency]['free']) if base_currency in balance else 0
-                    
-                    if available < quantity * 0.98:  # Allow for small discrepancies
-                        self.log_trade(f"Insufficient balance to close trade: {available} {base_currency} < {quantity} {base_currency}")
-                        return False
-                    
-                    # Execute sell order
-                    use_limit_orders = hasattr(self, 'using_limit_orders') and self.using_limit_orders
-                    
+                    # Real trading - execute sell order on exchange
                     try:
-                        if use_limit_orders:
-                            # Create limit sell order
-                            order = self.exchange.create_limit_sell_order(symbol, quantity, current_price)
-                            self.log_trade(f"Created limit sell order for {quantity} {symbol} at ${current_price}")
-                        else:
-                            # Create market sell order
-                            order = self.exchange.create_market_sell_order(symbol, quantity)
-                            self.log_trade(f"Created market sell order for {quantity} {symbol}")
+                        # First, try to get the actual position size from the exchange
+                        actual_quantity = None
+                        try:
+                            # Try to fetch actual position from exchange
+                            positions = self.exchange.fetch_positions()
+                            for position in positions:
+                                if position['symbol'] == symbol and position['side'] == 'long':
+                                    actual_quantity = float(position['contracts'])
+                                    self.log_trade(f"Using actual position size from exchange: {actual_quantity} {symbol}")
+                                    break
+                        except Exception as e:
+                            self.log_trade(f"Could not fetch position from exchange: {str(e)}")
                         
-                        # Update metrics if order was successful
-                        if order and order.get('status') in ['closed', 'filled']:
-                            actual_price = float(order['price']) if 'price' in order else current_price
-                            profit = (actual_price - entry_price) * quantity
+                        # If we couldn't get the actual position, try to get balance
+                        if actual_quantity is None:
+                            try:
+                                # Get the base currency (e.g., "BTC" from "BTC/USD")
+                                base_currency = symbol.split('/')[0]
+                                balance = self.exchange.fetch_balance()
+                                if base_currency in balance and 'free' in balance[base_currency]:
+                                    actual_quantity = float(balance[base_currency]['free'])
+                                    self.log_trade(f"Using balance for {base_currency}: {actual_quantity}")
+                            except Exception as e:
+                                self.log_trade(f"Could not fetch balance: {str(e)}")
+                        
+                        # If we still don't have a quantity, use the calculated one
+                        if actual_quantity is None or actual_quantity <= 0:
+                            actual_quantity = position_size / entry_price
+                            self.log_trade(f"Using calculated quantity: {actual_quantity} {symbol}")
+                        
+                        # Execute the sell order
+                        if actual_quantity > 0:
+                            # Get minimum order size for this symbol
+                            min_order_size = self.get_min_order_size(symbol)
                             
-                            # Calculate and add fees
-                            fee_rate = self.maker_fee if use_limit_orders else self.taker_fee
-                            total_fee = (position_size * fee_rate * 2)  # Entry and exit fees
+                            # Check if we need to sell all to avoid dust
+                            base_currency = symbol.split('/')[0]
+                            balance = self.exchange.fetch_balance()
+                            total_balance = float(balance[base_currency]['total']) if base_currency in balance else 0
                             
-                            # Update real trading metrics
+                            # If total balance is close to actual_quantity, sell all to avoid dust
+                            if abs(total_balance - actual_quantity) / total_balance < 0.05:  # Within 5%
+                                self.log_trade(f"Selling entire {base_currency} balance to avoid dust")
+                                actual_quantity = total_balance
+                            
+                            use_limit_orders = hasattr(self, 'using_limit_orders') and self.using_limit_orders
+                            
+                            if use_limit_orders:
+                                # Create limit sell order
+                                order = self.exchange.create_limit_sell_order(symbol, actual_quantity, current_price)
+                                self.log_trade(f"Created limit sell order for {actual_quantity} {symbol} at ${current_price}")
+                            else:
+                                # Create market sell order with the 'reduceOnly' option if supported
+                                params = {}
+                                if hasattr(self.exchange, 'has') and self.exchange.has.get('reduceOnly'):
+                                    params['reduceOnly'] = True
+                                
+                                # Use createOrder with custom params to sell entire position
+                                if hasattr(self.exchange, 'has') and self.exchange.has.get('createMarketOrder'):
+                                    order = self.exchange.create_market_sell_order(
+                                        symbol, 
+                                        actual_quantity,
+                                        params=params
+                                    )
+                                    self.log_trade(f"Created market sell order for {actual_quantity} {symbol}")
+                                else:
+                                    # Fallback to standard order
+                                    order = self.exchange.create_market_sell_order(symbol, actual_quantity)
+                                    self.log_trade(f"Created standard market sell order for {actual_quantity} {symbol}")
+                            
+                            # Update metrics based on actual trade
+                            profit = (current_price - entry_price) * actual_quantity
                             self.real_metrics['total_profit'] += profit
-                            self.real_metrics['total_fees'] += total_fee
-                            self.real_metrics['total_trades'] += 1
                             
                             if profit > 0:
                                 self.real_metrics['winning_trades'] += 1
                             else:
                                 self.real_metrics['losing_trades'] += 1
+                                
+                            self.real_metrics['total_trades'] += 1
                             
-                            # Update trade history
-                            profit_pct = ((actual_price - entry_price) / entry_price) * 100
-                            self.update_trade_history(symbol, profit_pct, profit)
+                            # Calculate fees
+                            fee_rate = self.maker_fee if trade.get('is_limit_order', False) else self.taker_fee
+                            total_fee = position_size * fee_rate * 2  # Entry and exit
+                            self.real_metrics['total_fees'] += total_fee
                             
                             # Log the trade result
                             self.log_trade(f"""
-                            Real trade closed:
+                            Trade closed:
                             Symbol: {symbol}
                             Entry: ${entry_price:.6f}
-                            Exit: ${actual_price:.6f}
+                            Exit: ${current_price:.6f}
                             Change: {profit_pct:.2f}%
                             Profit: ${profit:.2f}
                             Fees: ${total_fee:.2f}
                             Net: ${(profit - total_fee):.2f}
                             """)
-                            
-                            # Update metrics display
-                            self.update_metrics()
-                            
+                        else:
+                            self.log_trade(f"No position found for {symbol}, removing from tracking")
+                        
                     except Exception as e:
                         self.log_trade(f"Error executing sell order: {str(e)}")
-                        return False
+                        
+                        # Check if this is a known Kraken error
+                        error_str = str(e)
+                        if "volume minimum not met" in error_str or "Insufficient funds" in error_str:
+                            self.log_trade(f"Kraken error: {error_str}")
+                            self.log_trade(f"Position may already be closed. Removing from tracking.")
+                            
+                            # Update metrics as if we closed at current price
+                            profit = (current_price - entry_price) * (position_size / entry_price)
+                            self.real_metrics['total_profit'] += profit
+                            
+                            if profit > 0:
+                                self.real_metrics['winning_trades'] += 1
+                            else:
+                                self.real_metrics['losing_trades'] += 1
+                                
+                            self.real_metrics['total_trades'] += 1
+                        else:
+                            # For other errors, log but still remove from tracking
+                            self.log_trade(f"Unknown error closing trade: {error_str}")
+                            self.log_trade(f"Removing from tracking anyway to prevent stale trades")
                         
                 except Exception as e:
                     self.log_trade(f"Error closing trade: {str(e)}")
-                    return False
+                    # Still remove from tracking to prevent stale trades
+                    self.log_trade(f"Removing from tracking despite error")
             else:
                 # Paper trading - simpler close process
                 profit = (current_price - entry_price) * (position_size / entry_price)
@@ -4194,21 +4778,9 @@ class CryptoScalpingBot:
                     self.paper_metrics['winning_trades'] += 1
                 else:
                     self.paper_metrics['losing_trades'] += 1
-                
+                    
                 # Update paper balance
                 self.paper_balance += position_size + profit - total_fee
-                
-                # Add to exclusion list if closed at a loss
-                if profit_pct < 0:
-                    duration = 600 if profit_pct < -1.0 else 300
-                    self.add_to_exclusion_list(
-                        symbol=symbol,
-                        reason=f"Paper loss of {profit_pct:.2f}% - {reason}",
-                        duration=duration
-                    )
-                
-                # Update trade history
-                self.update_trade_history(symbol, profit_pct, profit)
                 
                 # Log the trade result
                 self.log_trade(f"""
@@ -4220,10 +4792,12 @@ class CryptoScalpingBot:
                 Profit: ${profit:.2f}
                 Fees: ${total_fee:.2f}
                 Net: ${(profit - total_fee):.2f}
-                New Balance: ${self.paper_balance:.2f}
                 """)
-
-            # Remove from active trades
+                
+                # Update trade history
+                self.update_trade_history(symbol, profit_pct, profit)
+            
+            # Always remove from active trades to prevent stale trades
             del self.active_trades[trade_id]
             
             # Update displays
@@ -4231,12 +4805,103 @@ class CryptoScalpingBot:
             self.update_balance_display()
             self.update_metrics()
             self.update_chart()
-
+            
             return True
-
+            
         except Exception as e:
-            self.log_trade(f"Error in close_trade: {str(e)}")
+            self.log_trade(f"Error closing trade: {str(e)}")
+            # Still remove from active trades to prevent stale trades
+            if trade_id in self.active_trades:
+                del self.active_trades[trade_id]
+                self.log_trade(f"Removed trade {trade_id} from tracking despite error")
+                self.update_active_trades_display()
             return False
+
+    def get_min_order_size(self, symbol):
+        """Get minimum order size for a symbol"""
+        try:
+            markets = self.exchange.load_markets()
+            if symbol in markets:
+                market = markets[symbol]
+                if 'limits' in market and 'amount' in market['limits'] and 'min' in market['limits']['amount']:
+                    min_amount = market['limits']['amount']['min']
+                    self.log_trade(f"Minimum order size for {symbol}: {min_amount}")
+                    return min_amount
+            self.log_trade(f"Could not determine minimum order size for {symbol}, using default")
+            return 0.001  # Default minimum for most exchanges
+        except Exception as e:
+            self.log_trade(f"Error getting minimum order size: {str(e)}")
+            return 0.001  # Default fallback
+
+    def cleanup_dust_balances(self):
+        """Clean up dust balances by converting small amounts to USD"""
+        try:
+            if self.is_paper_trading:
+                return  # No need to clean up dust in paper trading
+                
+            self.log_trade("Checking for dust balances to clean up...")
+            
+            # Fetch balances
+            balances = self.exchange.fetch_balance()
+            
+            # Get minimum notional value (typically around $5-10 for most exchanges)
+            min_notional = 10  # Default to $10
+            
+            # Check each currency
+            dust_found = False
+            for currency, amount in balances['total'].items():
+                # Skip USD and zero balances
+                if currency == 'USD' or amount <= 0:
+                    continue
+                    
+                # Check if this is a small balance
+                try:
+                    # Try to get ticker for this currency/USD pair
+                    symbol = f"{currency}/USD"
+                    ticker = None
+                    
+                    try:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                    except:
+                        # If direct USD pair doesn't exist, try USDT
+                        try:
+                            symbol = f"{currency}/USDT"
+                            ticker = self.exchange.fetch_ticker(symbol)
+                        except:
+                            continue  # Skip if we can't get a price
+                    
+                    if ticker:
+                        # Calculate USD value
+                        price = ticker['last']
+                        usd_value = price * amount
+                        
+                        # If this is dust (small value), log it
+                        if 0 < usd_value < min_notional:
+                            dust_found = True
+                            self.log_trade(f"Found dust: {amount} {currency} (${usd_value:.2f})")
+                            
+                            # Try to sell if it's above minimum order size
+                            try:
+                                # Check minimum order size
+                                market = self.exchange.market(symbol)
+                                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+                                
+                                if amount > min_amount:
+                                    self.log_trade(f"Attempting to sell {amount} {currency}")
+                                    order = self.exchange.create_market_sell_order(symbol, amount)
+                                    self.log_trade(f"Dust cleanup order executed: {order}")
+                                else:
+                                    self.log_trade(f"Cannot sell {currency}: below minimum order size")
+                            except Exception as e:
+                                self.log_trade(f"Error selling dust {currency}: {str(e)}")
+                except Exception as e:
+                    self.log_trade(f"Error processing {currency} dust: {str(e)}")
+            
+            if not dust_found:
+                self.log_trade("No dust balances found to clean up")
+                
+        except Exception as e:
+            self.log_trade(f"Error in dust cleanup: {str(e)}")
 
     def validate_settings(self):
         try:
@@ -4395,6 +5060,86 @@ class CryptoScalpingBot:
         except:
             return False
 
+    def verify_exchange_positions(self):
+        """Verify and sync active trades with actual exchange positions"""
+        try:
+            if self.is_paper_trading:
+                return  # No need to verify paper trades
+                
+            self.log_trade("Verifying trades with exchange positions...")
+            
+            # Fetch all open positions from exchange
+            try:
+                positions = self.exchange.fetch_positions()
+                exchange_positions = {}
+                
+                # Process positions into a more usable format
+                for position in positions:
+                    if float(position.get('contracts', 0)) > 0:
+                        symbol = position['symbol']
+                        size = float(position['contracts'])
+                        entry_price = float(position.get('entryPrice', 0))
+                        exchange_positions[symbol] = {
+                            'size': size,
+                            'entry_price': entry_price
+                        }
+                        
+                self.log_trade(f"Found {len(exchange_positions)} open positions on exchange")
+                
+                # Check for positions on exchange that we're not tracking
+                for symbol, position_data in exchange_positions.items():
+                    if not any(t['symbol'] == symbol for t in self.active_trades.values()):
+                        self.log_trade(f"Found untracked position for {symbol} on exchange - adding to tracking")
+                        
+                        # Create a new trade entry for this position
+                        trade_id = f"sync_{int(time.time())}_{symbol.replace('/', '')}"
+                        
+                        # Get current price
+                        try:
+                            ticker = self.exchange.fetch_ticker(symbol)
+                            current_price = float(ticker['last'])
+                        except:
+                            current_price = position_data['entry_price']
+                        
+                        # Calculate position size in USD
+                        position_size = position_data['size'] * position_data['entry_price']
+                        
+                        # Add to active trades
+                        self.active_trades[trade_id] = {
+                            'symbol': symbol,
+                            'entry_price': position_data['entry_price'],
+                            'current_price': current_price,
+                            'position_size': position_size,
+                            'entry_time': datetime.now() - timedelta(minutes=10),  # Estimate
+                            'order_id': 'synced',
+                            'status': 'active',
+                            'highest_profit_percentage': 0.0
+                        }
+                        
+                        # Initialize price history for this symbol
+                        if symbol not in self.price_history:
+                            self.price_history[symbol] = []
+                        self.price_history[symbol].append((datetime.now(), current_price))
+                
+                # Check for trades in our tracking that don't exist on exchange
+                for trade_id, trade in list(self.active_trades.items()):
+                    symbol = trade['symbol']
+                    
+                    # If we don't have a position for this symbol, remove it from active trades
+                    if symbol not in exchange_positions:
+                        self.log_trade(f"Position already closed for {symbol}. Removing from tracking.")
+                        del self.active_trades[trade_id]
+                
+                # Update displays
+                self.update_active_trades_display()
+                self.update_chart()
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching positions: {str(e)}")
+                
+        except Exception as e:
+            self.log_trade(f"Error verifying exchange positions: {str(e)}")
+
     def verify_exchange_connection(self):
         """Verify connection to exchange"""
         try:
@@ -4450,102 +5195,86 @@ class CryptoScalpingBot:
             self.log_trade(f"Error formatting Kraken symbol: {str(e)}")
             return None
 
+    def is_fiat(self, symbol):
+        """Return True if the symbol is a fiat currency."""
+        # Add or remove fiat codes as needed for your exchange
+        fiat_currencies = {
+            'USD', 'USDT', 'USDC', 'EUR', 'GBP', 'CAD', 'JPY', 'CHF', 'AUD', 'NZD', 'HKD', 'SGD', 'CNY', 'TRY', 'RUB', 'MXN', 'BRL', 'PLN', 'SEK', 'DKK', 'NOK', 'CZK', 'HUF', 'ZAR'
+        }
+        return symbol.upper() in fiat_currencies
+
     def get_market_pairs(self):
-        """Get market pairs with improved filtering for top volume pairs under $5"""
+        """Get market pairs with improved filtering for top volume crypto pairs under $5"""
         try:
             self.log_trade("Fetching market pairs...")
-            
-            # Get top_pairs parameter from GUI
+
             max_price = float(self.max_price.get()) if hasattr(self, 'max_price') else 5.0
             top_pairs = int(self.top_list_size.get()) if hasattr(self, 'top_list_size') else 20
             min_volume = float(self.min_volume_entry.get()) if hasattr(self, 'min_volume_entry') else 150
-            
-            self.log_trade(f"Filtering for top {top_pairs} pairs by volume under ${max_price:.2f}")
-            
-            # Fetch all tickers
+
+            self.log_trade(f"Filtering for top {top_pairs} crypto pairs by volume under ${max_price:.2f}")
+
             tickers = self.fetch_tickers_with_retry()
             if not tickers:
                 self.log_trade("Failed to fetch tickers")
                 return []
-                
+
             self.log_trade(f"Fetched {len(tickers)} tickers, filtering...")
-            
-            # Process tickers and filter for USD pairs under max_price
+
             usd_pairs = []
-            
             for symbol, ticker in tickers.items():
                 try:
-                    # Skip non-USD pairs
                     if not symbol.endswith('/USD'):
                         continue
-                        
-                    # Skip stablecoins
-                    base_symbol = symbol.split('/')[0]
-                    if base_symbol in ['USDT', 'USDC', 'DAI', 'BUSD']:
+                    base, quote = symbol.split('/')
+                    # Only allow if quote is USD and base is NOT fiat
+                    if quote != 'USD':
                         continue
-                        
-                    # Get price and volume
+                    if self.is_fiat(base):
+                        continue
+                    # Exclude stablecoins as base
+                    if base in ['USDT', 'USDC', 'DAI', 'BUSD']:
+                        continue
                     price = float(ticker['last']) if ticker.get('last') else 0
                     volume = float(ticker['quoteVolume']) if ticker.get('quoteVolume') else 0
-                    
-                    # Skip if price is too high
-                    if price > max_price:
+                    if price > max_price or volume < min_volume:
                         continue
-                    
-                    # Skip if volume is too low
-                    if volume < min_volume:
-                        continue
-                    
-                    # Add to list of valid pairs
                     usd_pairs.append({
                         'symbol': symbol,
                         'ticker': ticker,
                         'price': price,
                         'volume': volume
                     })
-                    
-                except Exception as e:
-                    # Skip logging errors for every ticker to reduce log spam
+                except Exception:
                     continue
-                    
-            # Sort by volume (highest first)
+
             usd_pairs.sort(key=lambda x: x['volume'], reverse=True)
-            
-            # Take only the top N pairs
             top_usd_pairs = usd_pairs[:top_pairs]
-            
-            self.log_trade(f"Found {len(top_usd_pairs)} top volume pairs under ${max_price:.2f}")
-            
-            # Process each pair to get price data
+
+            self.log_trade(f"Found {len(top_usd_pairs)} top volume crypto pairs under ${max_price:.2f}")
+
             valid_pairs = []
             for pair_data in top_usd_pairs:
                 try:
                     symbol = pair_data['symbol']
-                    
-                    # Check if we have enough data, if not initialize it
                     df = self.data_manager.get_price_data(symbol)
-                    if df is None or len(df) < 20:  # Not enough data points
+                    if df is None or len(df) < 20:
                         self.log_trade(f"Evaluating {symbol}...")
                         if not self.initialize_pair_data(symbol):
                             self.log_trade(f"Insufficient data for {symbol}")
                             continue
-                    
-                    # Get updated price data after initialization
                     df = self.data_manager.get_price_data(symbol)
                     if df is None:
                         continue
-                        
-                    # Update pair data with dataframe
                     pair_data['df'] = df
                     valid_pairs.append(pair_data)
-                    
                 except Exception as e:
                     self.log_trade(f"Error processing {pair_data['symbol']}: {str(e)}")
                     continue
-                    
-            self.log_trade(f"Found {len(valid_pairs)} valid pairs with sufficient data")
+
+            self.log_trade(f"Found {len(valid_pairs)} valid crypto pairs with sufficient data")
             return valid_pairs
-            
+
         except Exception as e:
             self.log_trade(f"Error getting market pairs: {str(e)}")
             return []
@@ -4569,87 +5298,84 @@ class CryptoScalpingBot:
         return {}
 
     def scan_opportunities(self):
-        """Scan for trading opportunities with improved error handling"""
         try:
             if not self.running:
                 return False
-            
-            # Check if we're already at max trades
+
             max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
+            self.enforce_max_trades_limit()
             available_slots = max_trades - len(self.active_trades)
-            
             if available_slots <= 0:
                 self.log_trade(f"Already at maximum trades ({len(self.active_trades)}/{max_trades}), skipping scan")
                 return False
-            
-            # Set scanning flag
+
             self.is_scanning = True
-            self.update_status("Scanning for opportunities...")
-            
-            # Get market pairs
+            self.root.after(0, lambda: self.update_status("Scanning for opportunities..."))
+
             pairs = self.get_market_pairs()
             if not pairs:
                 self.log_trade("No valid pairs found for trading")
                 self.is_scanning = False
                 return False
-            
-            self.log_trade(f"Found {len(pairs)} potential pairs to analyze. Looking to fill {available_slots} available slots")
-            
-            # Track pairs we've analyzed and trades executed
+
+            now = time.time()
+            try:
+                self.log_trade("Fetching open orders and balances...")
+                self.log_trade("Fetching open orders...")
+                self._cached_open_orders = self.exchange.fetch_open_orders() if not self.is_paper_trading else []
+                time.sleep(0.7)  # Add delay to avoid rate limit
+                self.log_trade("Fetching balances...")
+                self._cached_balances = self.exchange.fetch_balance() if not self.is_paper_trading else {}
+                time.sleep(0.7)  # Add delay to avoid rate limit
+                self._last_open_orders_time = now
+                open_orders = self._cached_open_orders
+                balances = self._cached_balances
+                self.log_trade("Fetched open orders and balances successfully.")
+            except Exception as e:
+                self.log_trade(f"Error fetching open orders or balances: {str(e)}")
+                self.is_scanning = False
+                return False
+
+            currently_trading = set(trade['symbol'] for trade in self.active_trades.values())
             analyzed_pairs = []
             trades_executed = 0
-            
-            # Analyze each pair
+
+            self.log_trade(f"About to analyze {len(pairs)} pairs for opportunities")
+
             for pair_data in pairs:
                 try:
                     if not self.running or trades_executed >= available_slots:
                         break
-                    
                     symbol = pair_data['symbol']
-                
-                    # Skip if we're already trading this symbol
-                    if self.is_already_trading(symbol):
+                    self.log_trade(f"Checking {symbol} for opportunity...")
+                    if symbol in currently_trading or self.is_already_trading(symbol, open_orders, balances):
+                        self.log_trade(f"Already trading {symbol}, skipping analysis")
                         continue
-                    
-                    # Get current ticker
-                    ticker = self.exchange.fetch_ticker(symbol)
+
+                    ticker = self.get_cached_price(symbol)
+                    time.sleep(0.5)  # Add delay between ticker fetches
                     volume = float(ticker['quoteVolume']) if 'quoteVolume' in ticker else 0
-                    
-                    # Add to analyzed pairs
                     analyzed_pairs.append(symbol)
-                    
-                    # Analyze opportunity
-                    if self.analyze_opportunity(ticker, volume, pair_data):
+                    if self.analyze_opportunity(ticker, volume, pair_data, open_orders, balances):
                         self.log_trade(f"Found opportunity in {symbol}")
-                        
-                        # Execute trade with proper error handling
-                        try:
-                            if self.execute_trade(symbol, ticker):
-                                self.log_trade(f"Successfully executed trade for {symbol}")
-                                trades_executed += 1
-                            else:
-                                self.log_trade(f"Failed to execute trade for {symbol}")
-                        except Exception as trade_error:
-                            self.log_trade(f"Error executing trade for {symbol}: {str(trade_error)}")
-                
+                        # Example: Uncomment and implement your trade execution logic here
+                        # if self.execute_trade(symbol, ticker):
+                        #     trades_executed += 1
                 except Exception as e:
-                    self.log_trade(f"Error analyzing {pair_data['symbol']}: {str(e)}")
+                    self.log_trade(f"Error analyzing pair {pair_data['symbol']}: {str(e)}")
                     continue
-                
-            # Log summary of scan
-            self.log_trade(f"Scan complete. Analyzed {len(analyzed_pairs)} pairs, executed {trades_executed} trades")
-            
-            # Reset scanning flag
+
+            self.log_trade(f"Scan complete: Analyzed {len(analyzed_pairs)} pairs, executed {trades_executed} trades")
             self.is_scanning = False
-            self.update_status("Monitoring trades")
-            
+            self.enforce_max_trades_limit()
+            self.root.after(0, self.update_active_trades_display)
             return trades_executed > 0
-        
+
         except Exception as e:
             self.log_trade(f"Error in scan_opportunities: {str(e)}")
             self.is_scanning = False
             return False
-
+    
     def quick_filter(self, ticker: dict) -> bool:
         """Fast initial filtering of pairs"""
         try:
@@ -4685,6 +5411,21 @@ class CryptoScalpingBot:
             'time': current_time
         }
         return ticker
+
+    def periodic_sync_active_trades(self):
+        def sync_task():
+            try:
+                with self.kraken_lock:
+                    self.sync_active_trades_with_exchange()
+                # GUI updates must be scheduled on the main thread
+                self.root.after(0, self.update_active_trades_display)
+                self.root.after(0, self.update_chart)
+            except Exception as e:
+                self.log_trade(f"Error in periodic sync: {str(e)}")
+            finally:
+                if hasattr(self, 'root') and self.root.winfo_exists():
+                    self.root.after(30000, self.periodic_sync_active_trades)
+        threading.Thread(target=sync_task, daemon=True).start()
 
     def process_ticker(self, symbol, ticker):
         """Process a single ticker with data collection tracking"""
@@ -4830,222 +5571,424 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in cleanup: {str(e)}")
 
-    def is_already_trading(self, symbol):
-        """Check if we're already trading a specific symbol"""
+    def is_already_trading(self, symbol, open_orders, balances):
+        """
+        Return True only if we are actually in a trade or have a significant open order for this symbol.
+        Do NOT block just because of dust or tiny balances.
+        """
         try:
-            # Check if the symbol exists in any active trade
+            # 1. Check active trades
             for trade_id, trade in self.active_trades.items():
                 if trade['symbol'] == symbol:
+                    self.log_trade(f"Already trading {symbol} (ID: {trade_id})")
                     return True
+
+            # 2. Check open orders for this symbol (ignore tiny orders)
+            min_order_size = self.get_min_order_size(symbol)
+            for order in open_orders:
+                if order['symbol'] == symbol:
+                    order_amount = float(order.get('amount', 0))
+                    if order_amount >= min_order_size:
+                        self.log_trade(f"Open order found for {symbol} on exchange (amount: {order_amount})")
+                        return True
+
+            # 3. Only block if free balance is above min order size (ignore dust)
+            base, quote = symbol.split('/')
+            if not self.is_paper_trading:
+                # For BUY orders, check quote (USD) balance, not base (coin) balance
+                usd_balance = balances[quote]['free'] if quote in balances else 0
+                min_cost = min_order_size * float(self.get_cached_price(symbol)['last'])
+                self.log_trade(f"USD balance check: free={usd_balance}, min_cost={min_cost}")
+                if usd_balance < min_cost:
+                    self.log_trade(f"Insufficient USD balance to buy {symbol}: need at least ${min_cost:.2f}")
+                    return True  # Block trade if not enough USD
+
+            self.log_trade(f"Not already trading {symbol}")
             return False
+
         except Exception as e:
-            self.log_trade(f"Error checking if already trading {symbol}: {str(e)}")
-            # Default to False if there's an error
-            return False
+            self.log_trade(f"Error in is_already_trading: {str(e)}")
+            return False  # Be permissive on error
+
+
+    def set_ml_prediction(self, enabled=True):
+        """Directly set ML prediction state"""
+        if not hasattr(self, 'use_ml_prediction_var'):
+            self.use_ml_prediction_var = tk.BooleanVar(self.root, value=enabled)
+        else:
+            self.use_ml_prediction_var.set(enabled)
+        
+        self.log_trade(f"ML prediction state set to: {enabled}")
+        
+        # Call toggle function to apply the change
+        self.toggle_ml_prediction()
+
+    # Add this to the UI creation section where the checkboxes are defined
+    def create_control_panel(self, parent_frame):
+        """Create the control panel with checkboxes"""
+        control_frame = ttk.Frame(parent_frame)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # First row of controls
+        first_row = ttk.Frame(control_frame)
+        first_row.pack(fill=tk.X, pady=5)
+        
+        # Market override checkbox
+        self.market_override_var = tk.BooleanVar(value=False)
+        self.market_override_check = ttk.Checkbutton(
+            first_row, 
+            text="Market Override", 
+            variable=self.market_override_var,
+            command=self.toggle_market_override
+        )
+        self.market_override_check.pack(side=tk.LEFT, padx=5)
+
+        # ML prediction checkbox - NEW IMPLEMENTATION
+        self.use_ml_prediction_var = tk.BooleanVar(self.root, value=False)
+        self.ml_prediction_check = ttk.Checkbutton(
+            first_row, 
+            text="Use ML Prediction", 
+            variable=self.use_ml_prediction_var,
+            command=self.toggle_ml_prediction,
+            onvalue=True,
+            offvalue=False
+        )
+        self.ml_prediction_check.pack(side=tk.LEFT, padx=5)
+        
+        # Log the creation
+        self.log_trade("Control panel created with explicit ML prediction checkbox")
+        
+        return control_frame
 
     def toggle_ml_prediction(self):
-        """Toggle ML prediction feature"""
+        """Toggle ML prediction feature with explicit state tracking"""
+        # Get current state
         ml_enabled = self.use_ml_prediction_var.get()
+        self.log_trade(f"ML prediction toggle called - Raw state: {ml_enabled}")
+        
+        # Force explicit state update
         if ml_enabled:
+            self.log_trade("Setting ML prediction to ENABLED")
+            self.use_ml_prediction_var.set(True)
+            
+            # Initialize prediction service if not already done
+            if not hasattr(self, 'prediction_service'):
+                try:
+                    from trade_prediction import prediction_service
+                    self.prediction_service = prediction_service
+                    self.log_trade("ML prediction service initialized")
+                except ImportError as e:
+                    self.log_trade(f"Error importing prediction service: {str(e)}")
+                    # Reset the checkbox if import fails
+                    self.use_ml_prediction_var.set(False)
+                    messagebox.showerror("ML Error", f"Could not enable ML predictions: {str(e)}")
+                    return
+                    
             self.log_trade("ML PREDICTION ENABLED: Bot will use machine learning to filter trades")
             messagebox.showinfo("ML Prediction", "Machine learning prediction is now enabled. The bot will use historical patterns to filter trades.")
+            
+            # Update ML info display
+            if hasattr(self, 'ml_accuracy_label'):
+                self.update_ml_info()
         else:
+            self.log_trade("Setting ML prediction to DISABLED")
+            self.use_ml_prediction_var.set(False)
             self.log_trade("ML PREDICTION DISABLED: Bot will use standard conditions only")
+            
+            # Update ML info display to show disabled state
+            if hasattr(self, 'ml_accuracy_label'):
+                self.ml_accuracy_label.config(text="ML predictions disabled")
+                if hasattr(self, 'ml_predictions_label'):
+                    self.ml_predictions_label.config(text="ML predictions disabled")
+        
+        # Verify the state was set correctly
+        current_state = self.use_ml_prediction_var.get()
+        self.log_trade(f"ML prediction state after toggle: {current_state}")
 
-    def analyze_opportunity(self, ticker, volume, pair_data):
-        """Enhanced opportunity analysis with configurable confirmation factors and ML prediction"""
+    def calculate_ml_score(self, df, symbol):
+        """
+        Calculate ML prediction score for a potential trade
+        Args:
+            df: DataFrame with price data
+            symbol: Trading pair symbol
+        Returns:
+            score: 0-100 prediction score (higher is better)
+        """
         try:
-            symbol = pair_data['symbol']
-            
-            # Skip if we're already trading this symbol
-            if self.is_already_trading(symbol):
-                return False
-            
-            # Skip if we've reached max trades
-            max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
-            if len(self.active_trades) >= max_trades:
-                return False
-            
-            # Skip if price is above maximum allowed
-            price = float(ticker['last'])
-            max_price = float(self.max_price.get()) if hasattr(self, 'max_price') else 5.0
-            if price > max_price:
-                self.log_trade(f"Price too high for {symbol}: ${price:.6f} > ${max_price:.2f}")
-                return False
-            
+            # Import prediction service if not already imported
+            if not hasattr(self, 'prediction_service'):
+                try:
+                    from trade_prediction import prediction_service
+                    self.prediction_service = prediction_service
+                    self.log_trade("ML prediction service initialized")
+                except ImportError as e:
+                    self.log_trade(f"Error importing prediction service: {str(e)}")
+                    return 50  # Return neutral score on import error
+
+            # Extract features needed for prediction
+            if len(df) < 10:
+                self.log_trade(f"Insufficient data for ML prediction for {symbol}")
+                return 50  # Return neutral score
+
+            # === MATCH FEATURE NAMES TO TRAINED MODEL ===
+            features = {}
+
+            # These names must match your model's training features exactly!
+            features['momentum'] = ((df['price'].iloc[-1] - df['price'].iloc[-10]) / df['price'].iloc[-10]) * 100 if 'price' in df.columns and len(df) >= 10 else 0
+            features['volume_change'] = ((df['volume'].iloc[-1] / df['volume'].iloc[-10:-1].mean() - 1) * 100) if 'volume' in df.columns and len(df) >= 10 and df['volume'].iloc[-10:-1].mean() > 0 else 0
+            features['rsi'] = df['rsi_14'].iloc[-1] if 'rsi_14' in df.columns else 50
+            features['spread'] = df['spread'].iloc[-1] if 'spread' in df.columns else 0.1
+            features['volatility'] = self.calculate_volatility(df)
+            features['ema_ratio'] = (df['ema_5'].iloc[-1] / df['ema_15'].iloc[-1]) if 'ema_5' in df.columns and 'ema_15' in df.columns else 1
+
+            # Add any missing features with default values (adjust as needed for your model)
+            features['high_volatility'] = 1 if features['volatility'] > 2 else 0
+            features['momentum_volatility'] = features['momentum'] * features['volatility']
+            features['optimal_volatility'] = 1 if 0.5 < features['volatility'] < 2 else 0
+            features['rsi_extremes'] = 1 if features['rsi'] > 70 or features['rsi'] < 30 else 0
+            features['rsi_volatility'] = features['rsi'] * features['volatility']
+
+            # Create features DataFrame
+            features_df = pd.DataFrame([features])
+
+            self.log_trade(f"ML features for {symbol}: {features}")
+
+            # Get prediction from service
+            try:
+                probability, prediction, threshold, confidence = self.prediction_service.predict(features_df)
+                score = int(probability * 100)
+                self.log_trade(f"ML prediction for {symbol}: Score={score}, Confidence={confidence:.1f}%, Threshold={threshold:.2f}")
+                return score
+            except Exception as e:
+                self.log_trade(f"Error getting ML prediction: {str(e)}")
+                return 50  # Return neutral score on error
+
+        except Exception as e:
+            self.log_trade(f"Error calculating ML score: {str(e)}")
+            return 50  # Return neutral score on error
+
+    def should_enter_trade(self, symbol, price, volume, pair_data=None):
+        """Determine if we should enter a trade based on technical analysis and ML prediction"""
+        try:
             # Get price data
-            df = pair_data.get('df')
-            
+            df = None
+            if pair_data is not None and 'df' in pair_data:
+                df = pair_data['df']
+            else:
+                df = self.data_manager.get_price_data(symbol)
             if df is None or len(df) < 20:
                 self.log_trade(f"Insufficient data for {symbol}")
                 return False
-            
-            # Log the pair we're analyzing
+
             self.log_trade(f"Analyzing {symbol} at ${price:.6f} with volume ${volume:.2f}")
-            
+
             # Get trading parameters from GUI
-            required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 3
-            price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.5
-            volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 20
-            
-            # Check if ML prediction is enabled
+            required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 2
+            price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.3
+            volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 10
+
+            # Check if market override is active
+            market_override = hasattr(self, 'market_override_var') and self.market_override_var.get()
+
+            # ML prediction logic
             use_ml = hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get()
-            
-            # Apply ML prediction if enabled
+            ml_score = None
+            ml_threshold = 55  # Lowered threshold for more trades
+
+            if use_ml:
+                if not hasattr(self, 'prediction_service'):
+                    try:
+                        from trade_prediction import prediction_service
+                        self.prediction_service = prediction_service
+                        self.log_trade("ML prediction service initialized")
+                    except ImportError as e:
+                        self.log_trade(f"Error importing prediction service: {str(e)}")
+                        use_ml = False
+
+                if use_ml:
+                    ml_score = self.calculate_ml_score(df, symbol)
+                    if ml_score >= ml_threshold:
+                        self.log_trade(f"✓ ML prediction favorable: Score {ml_score}/100")
+                    else:
+                        self.log_trade(f"✗ ML prediction unfavorable: Score {ml_score}/100")
+                        if ml_score < 40:
+                            self.log_trade(f"Rejected {symbol}: Low ML prediction score ({ml_score}/100)")
+                            return False
+                        # Only increase required_conditions by 1 for moderate scores
+                        required_conditions += 1
+                        self.log_trade(f"Increasing required conditions to {required_conditions} due to ML score")
+
+            # Count conditions met
+            conditions_met = 0
+            conditions = []
+
+            # CONDITION 1: Price Rise
+            if 'price' in df.columns and len(df) >= 5:
+                price_change = ((df['price'].iloc[-1] - df['price'].iloc[-5]) / df['price'].iloc[-5]) * 100
+                if price_change > price_rise_threshold:
+                    conditions_met += 1
+                    conditions.append("Price Rise")
+                    self.log_trade(f"✓ Price rise: {price_change:.2f}% > {price_rise_threshold:.2f}%")
+                else:
+                    self.log_trade(f"✗ Price rise: {price_change:.2f}% < {price_rise_threshold:.2f}%")
+
+            # CONDITION 2: Volume Increase
+            if 'volume' in df.columns and len(df) >= 5:
+                avg_volume = df['volume'].iloc[-5:].mean()
+                if avg_volume > 0:
+                    volume_change = ((df['volume'].iloc[-1] - avg_volume) / avg_volume) * 100
+                    if volume_change > volume_increase:
+                        conditions_met += 1
+                        conditions.append("Volume Surge")
+                        self.log_trade(f"✓ Volume surge: {volume_change:.2f}% > {volume_increase:.2f}%")
+                    else:
+                        self.log_trade(f"✗ Volume surge: {volume_change:.2f}% < {volume_increase:.2f}%")
+                else:
+                    self.log_trade("✗ Volume surge: average volume is zero")
+
+            # CONDITION 3: EMA Crossover
+            if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
+                ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
+                            (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+                if market_override:
+                    ema_ratio = df['ema_5'].iloc[-1] / df['ema_15'].iloc[-1]
+                    ema_cross = ema_cross or (ema_ratio > 0.98)
+                if ema_cross:
+                    conditions_met += 1
+                    conditions.append("EMA Crossover")
+                    self.log_trade(f"✓ EMA crossover detected")
+                else:
+                    self.log_trade(f"✗ No EMA crossover")
+
+            # CONDITION 4: RSI
+            rsi_column = 'rsi_14'
+            if rsi_column in df.columns:
+                rsi_value = df[rsi_column].iloc[-1]
+                rsi_oversold = 30
+                rsi_overbought = 70
+                if rsi_value > rsi_oversold and rsi_value < 50:
+                    conditions_met += 1
+                    conditions.append("RSI Bullish")
+                    self.log_trade(f"✓ RSI bullish: {rsi_value:.2f}")
+                else:
+                    self.log_trade(f"✗ RSI not bullish: {rsi_value:.2f}")
+
+            # CONDITION 5: Advanced checks
+            if not self.advanced_checks(symbol, df):
+                self.log_trade(f"Rejected {symbol}: Advanced checks failed")
+                return False
+
+            self.log_trade(f"Conditions met ({conditions_met}/{required_conditions}): {', '.join(conditions)}")
+
+            if conditions_met >= required_conditions:
+                self.log_trade(f"Trade conditions met for {symbol}: {conditions_met}/{required_conditions}")
+                return True
+            else:
+                self.log_trade(f"Insufficient conditions for {symbol}: {conditions_met}/{required_conditions}")
+                return False
+
+        except Exception as e:
+            self.log_trade(f"Error in should_enter_trade: {str(e)}")
+            return False
+
+    def analyze_opportunity(self, ticker, volume, pair_data, open_orders, balances):
+        """Enhanced opportunity analysis with configurable confirmation factors and ML prediction"""
+        try:
+            symbol = pair_data['symbol']
+            self.log_trade(f"Analyzing opportunity for {symbol}")
+
+            if self.is_already_trading(symbol, open_orders, balances):
+                self.log_trade(f"Skipping {symbol}: already trading")
+                return False
+
+            max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
+            if len(self.active_trades) >= max_trades:
+                self.log_trade(f"Skipping {symbol}: max trades reached")
+                return False
+
+            price = float(ticker['last'])
+            max_price = float(self.max_price.get()) if hasattr(self, 'max_price') else 5.0
+            if price > max_price:
+                self.log_trade(f"Skipping {symbol}: price ${price:.6f} > max ${max_price:.2f}")
+                return False
+
+            df = pair_data.get('df')
+            if df is None or len(df) < 20:
+                self.log_trade(f"Skipping {symbol}: insufficient data ({0 if df is None else len(df)} points)")
+                return False
+
+            self.log_trade(f"Analyzing {symbol} at ${price:.6f} with volume ${volume:.2f}")
+
+            required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 1  # Loosen for testing
+            price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.1
+            volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 1
+
+            use_ml = hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get()
+            ml_score = None
+            ml_threshold = 60
+
             if use_ml:
                 ml_score = self.calculate_ml_score(df, symbol)
-                ml_threshold = 60  # Minimum score to consider (0-100)
-                
                 if ml_score >= ml_threshold:
                     self.log_trade(f"✓ ML prediction favorable: Score {ml_score}/100")
                 else:
                     self.log_trade(f"✗ ML prediction unfavorable: Score {ml_score}/100")
-                    
-                    # If ML score is very low, reject the trade
                     if ml_score < 40:
                         self.log_trade(f"Rejected {symbol}: Low ML prediction score ({ml_score}/100)")
                         return False
-                    
-                    # If ML score is moderate but below threshold, require more conditions
                     elif ml_score < ml_threshold:
                         required_conditions += 1
                         self.log_trade(f"Increasing required conditions to {required_conditions} due to ML score")
-            
-            # Track conditions met
+
             conditions_met = 0
             conditions = []
-            
+
             # CONDITION 1: Price above moving averages
             if 'sma_50' in df.columns and 'sma_200' in df.columns:
                 sma_50 = df['sma_50'].iloc[-1]
                 sma_200 = df['sma_200'].iloc[-1]
-                
                 if price > sma_50:
                     conditions_met += 1
                     conditions.append(f"Price above SMA50 ({price:.6f} > {sma_50:.6f})")
-                    
                 if price > sma_200:
                     conditions_met += 1
                     conditions.append(f"Price above SMA200 ({price:.6f} > {sma_200:.6f})")
-            
+
             # CONDITION 2: Recent price rise
             if len(df) >= 10:
                 recent_price = df['price'].iloc[-1]
                 previous_price = df['price'].iloc[-10]
                 recent_change = ((recent_price - previous_price) / previous_price) * 100
-                
                 if recent_change >= price_rise_threshold:
                     conditions_met += 1
                     conditions.append(f"Price rise ({recent_change:.2f}% >= {price_rise_threshold:.2f}%)")
-            
+
             # CONDITION 3: Volume increase
             if 'volume_ratio' in df.columns and not df['volume_ratio'].isna().all():
                 vol_ratio = df['volume_ratio'].iloc[-1] if not pd.isna(df['volume_ratio'].iloc[-1]) else 1
                 if vol_ratio >= (volume_increase / 100) + 1:
                     conditions_met += 1
                     conditions.append(f"Volume surge ({(vol_ratio-1)*100:.2f}% >= {volume_increase:.2f}%)")
-            
-            # CONDITION 4: Trend Strength Check (if enabled)
-            use_trend_filter = self.use_trend_filter.get() if hasattr(self, 'use_trend_filter') else False
-            
-            if use_trend_filter:
-                trend_min = float(self.trend_strength_min.get()) if hasattr(self, 'trend_strength_min') else 15
-                trend_direction, trend_strength = self.detect_trend_strength(df)
-                
-                if trend_direction > 0 and trend_strength >= trend_min:
-                    conditions_met += 1
-                    conditions.append(f"Strong uptrend (strength: {trend_strength:.2f} >= {trend_min})")
-                    
-                self.log_trade(f"Trend analysis: direction={trend_direction}, strength={trend_strength:.2f}, min={trend_min}")
-            
-            # CONDITION 5: Support/Resistance Check (if enabled)
-            use_sr = self.use_support_resistance.get() if hasattr(self, 'use_support_resistance') else False
-            
-            if use_sr:
-                sr_lookback = int(self.sr_lookback.get()) if hasattr(self, 'sr_lookback') else 50
-                sr_threshold = float(self.sr_threshold.get()) if hasattr(self, 'sr_threshold') else 0.2
-                
-                sr_levels = self.detect_support_resistance_levels(df, lookback=sr_lookback, threshold_pct=sr_threshold)
-                supports = sr_levels['supports']
-                
-                # Check if price is near support
-                near_support = False
-                support_level = 0
-                
-                for support in supports:
-                    # Check if price is within the threshold percentage of a support level
-                    if price >= support * (1 - sr_threshold/100) and price <= support * (1 + sr_threshold/100):
-                        near_support = True
-                        support_level = support
-                        break
-                
-                if near_support:
-                    conditions_met += 1
-                    conditions.append(f"Price near support level (${support_level:.6f})")
-                
-                # Log support/resistance info
-                self.log_trade(f"S/R Analysis: Found {len(supports)} support levels")
-            
-            # CONDITION 6: Candlestick Pattern Recognition (if enabled)
-            use_patterns = self.use_candlestick_patterns.get() if hasattr(self, 'use_candlestick_patterns') else False
-            
-            if use_patterns:
-                min_confidence = float(self.pattern_confidence_min.get()) if hasattr(self, 'pattern_confidence_min') else 70
-                patterns = self.detect_candlestick_patterns(df)
-                
-                if patterns:
-                    # Get the highest confidence pattern
-                    best_pattern = max(patterns.items(), key=lambda x: x[1])
-                    pattern_name = best_pattern[0].replace('_', ' ').title()
-                    confidence = best_pattern[1]
-                    
-                    if confidence >= min_confidence:
-                        conditions_met += 1
-                        conditions.append(f"Bullish pattern: {pattern_name} ({confidence}% confidence)")
-                        
-                    # Log all detected patterns
-                    self.log_trade(f"Patterns detected: {', '.join([f'{k}({v}%)' for k,v in patterns.items()])}")
-            
-            # CONDITION 7: Volume Profile Analysis (if enabled)
-            use_vol_profile = self.use_volume_profile.get() if hasattr(self, 'use_volume_profile') else False
-            
-            if use_vol_profile:
-                min_quality = float(self.volume_quality_min.get()) if hasattr(self, 'volume_quality_min') else 60
-                volume_analysis = self.analyze_volume_profile(df)
-                
-                if volume_analysis['volume_quality'] >= min_quality:
-                    conditions_met += 1
-                    conditions.append(f"Healthy volume profile (quality: {volume_analysis['volume_quality']:.1f})")
-                    
-                # Log volume profile details
-                self.log_trade(f"Volume Profile: Quality={volume_analysis['volume_quality']:.1f}, Trend={volume_analysis['volume_trend']}")
-            
-            # CONDITION 8: ML Prediction (if enabled and favorable)
-            if use_ml and ml_score >= ml_threshold:
-                conditions_met += 1
-                conditions.append(f"ML prediction score: {ml_score}/100")
-            
-            # Log conditions summary
+
+            # Add more conditions as needed...
+
             self.log_trade(f"Analysis for {symbol}: {conditions_met}/{required_conditions} conditions met")
             for condition in conditions:
                 self.log_trade(f"✓ {condition}")
-            
-            # Log any conditions that were checked but not met
+
             if conditions_met < required_conditions:
-                self.log_trade(f"Insufficient conditions: Need {required_conditions - conditions_met} more")
-            
-            # Final decision - using actual required conditions from GUI
-            if conditions_met >= required_conditions:
-                self.log_trade(f"OPPORTUNITY FOUND: {symbol} meets {conditions_met}/{required_conditions} conditions")
-                return True
-            else:
+                self.log_trade(f"No opportunity for {symbol}: only {conditions_met}/{required_conditions} conditions met")
                 return False
-            
+
+            self.log_trade(f"OPPORTUNITY FOUND: {symbol} meets {conditions_met}/{required_conditions} conditions")
+            return True
+
         except Exception as e:
             self.log_trade(f"Error analyzing opportunity for {pair_data['symbol']}: {str(e)}")
             import traceback
             self.log_trade(traceback.format_exc())
             return False
+        
     def analyze_pairs(self, pairs):
         """Analyze pairs for trading opportunities"""
         try:
@@ -5217,34 +6160,53 @@ class CryptoScalpingBot:
             if use_limit_orders:
                 self.total_fee_percentage = self.maker_fee * 2
                 fee_type = "maker"
+                fee_pct = self.maker_fee * 100
             else:
                 self.total_fee_percentage = self.taker_fee * 2
                 fee_type = "taker"
+                fee_pct = self.taker_fee * 100
             
             # Update the total fees label
             total_fee_pct = self.total_fee_percentage * 100
             if hasattr(self, 'total_fees_label'):
                 self.total_fees_label.config(text=f"Total Round-Trip Fee: {total_fee_pct:.2f}%")
-            
-            # Log the update
+                
+            # Update any other fee-related displays
+            if hasattr(self, 'fee_type_label'):
+                self.fee_type_label.config(text=f"Fee Type: {fee_type.capitalize()}")
+                
+            # Log the update for debugging
             self.log_trade(f"Fee calculations force-updated: Using {fee_type} fees ({fee_type}*2 = {total_fee_pct:.2f}%)")
             
             # Update tooltips
             if hasattr(self, 'profit_target'):
+                min_profit = max(total_fee_pct, 1.0)  # At least 1% to be worthwhile
                 self.add_tooltip(self.profit_target, 
-                    f"Target profit percentage for trades (min: {total_fee_pct:.2f}% to cover fees)")
-            
+                    f"Target profit percentage for trades (min: {min_profit:.2f}% to cover fees)")
+                    
+            # Update profit target minimum if needed
+            if hasattr(self, 'profit_target') and hasattr(self, 'profit_target_var'):
+                current_target = float(self.profit_target_var.get())
+                if current_target < total_fee_pct:
+                    # Automatically increase profit target to cover fees
+                    new_target = max(total_fee_pct + 0.2, 1.0)  # Add 0.2% margin over fees
+                    self.profit_target_var.set(f"{new_target:.2f}")
+                    self.log_trade(f"Increased profit target to {new_target:.2f}% to cover fees")
+                    
             return True
+            
         except Exception as e:
             self.log_trade(f"Error updating fee calculations: {str(e)}")
             return False
-
+        
     def execute_trade(self, symbol, ticker):
-        """Execute a trade with proper error handling"""
+        """Execute a trade with enhanced duplicate prevention and min trade size check"""
         try:
-            # Check if already trading
-            if self.is_already_trading(symbol):
-                self.log_trade(f"Already in a trade for {symbol}")
+            self.log_trade(f"Attempting to execute trade for {symbol}...")
+
+            # CRITICAL CHECK 1: Verify we're not already trading this symbol
+            if self.is_already_trading(symbol, self._cached_open_orders, self._cached_balances):
+                self.log_trade(f"DUPLICATE PREVENTION: Already trading {symbol}, skipping execution")
                 return False
 
             # Get current price
@@ -5259,29 +6221,25 @@ class CryptoScalpingBot:
                     self.log_trade(f"Invalid ticker format for {symbol}")
                     return False
 
-            # Check max trades limit
+            # CRITICAL CHECK 2: Verify max trades limit before proceeding
             max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
             if len(self.active_trades) >= max_trades:
-                self.log_trade(f"Max trades limit reached ({max_trades})")
+                self.log_trade(f"CRITICAL: Max trades limit reached ({len(self.active_trades)}/{max_trades}). Trade for {symbol} rejected.")
                 return False
 
-            # Calculate position size and check balance
-            position_size = float(self.position_size.get()) if hasattr(self, 'position_size') else 50.0
-            
-            if self.is_paper_trading:
-                available_balance = self.paper_balance
-            else:
-                available_balance = float(self.exchange.fetch_balance()['USD']['free'])
+            # Calculate position size
+            position_size = float(self.position_size.get()) if hasattr(self, 'position_size') else 10.0
 
-            if position_size > available_balance:
-                self.log_trade(f"Insufficient balance: ${available_balance:.2f} < ${position_size:.2f}")
+            # === MINIMUM TRADE SIZE CHECK ===
+            if position_size < self.MIN_TRADE_SIZE:
+                self.log_trade(f"Trade size ${position_size:.2f} is below minimum (${self.MIN_TRADE_SIZE:.2f}), skipping trade for {symbol}")
                 return False
 
             # Generate trade ID
-            trade_id = f"{'paper' if self.is_paper_trading else 'live'}_{int(time.time())}"
+            trade_id = f"{'paper' if self.is_paper_trading else 'live'}_{int(time.time())}_{symbol.replace('/', '_')}"
 
-            # Check for limit orders
-            use_limit_orders = self.use_limit_orders_var.get() if hasattr(self, 'use_limit_orders_var') else False
+            # Check for limit orders - use the instance variable that's synced with the checkbox
+            use_limit_orders = self.using_limit_orders if hasattr(self, 'using_limit_orders') else False
 
             # Calculate quantity
             quantity = position_size / price
@@ -5289,8 +6247,11 @@ class CryptoScalpingBot:
             # Execute real or paper trade
             if not self.is_paper_trading:
                 try:
-                    order = self.execute_real_trade(symbol, quantity)
-                    if order and 'price' in order and order['price']:
+                    order = self.execute_real_trade(symbol, quantity, price, use_limit_orders)
+                    if not order:
+                        self.log_trade(f"Failed to execute real order for {symbol}")
+                        return False
+                    if 'price' in order and order['price']:
                         price = float(order['price'])
                 except Exception as e:
                     self.log_trade(f"Failed to execute real order: {str(e)}")
@@ -5298,48 +6259,40 @@ class CryptoScalpingBot:
 
             # Create trade object
             trade = {
-                'id': trade_id,
                 'symbol': symbol,
                 'entry_price': price,
+                'current_price': price,
+                'amount': quantity,
                 'position_size': position_size,
                 'entry_time': datetime.now(),
-                'status': 'open',
                 'highest_price': price,
-                'highest_profit_percentage': 0.0,
-                'stop_loss_pct': float(self.stop_loss.get()) / 100 if hasattr(self, 'stop_loss') else 0.008,
-                'profit_target_pct': float(self.profit_target.get()) / 100 if hasattr(self, 'profit_target') else 0.015,
-                'trailing_stop_pct': float(self.trailing_stop.get()) / 100 if hasattr(self, 'trailing_stop') else 0.003,
-                'is_limit_order': use_limit_orders,
-                'market_condition': self.analyze_market_conditions()['state']
+                'highest_profit': 0.0,
+                'status': 'open',
+                'is_limit_order': use_limit_orders
             }
 
             # Add to active trades
             self.active_trades[trade_id] = trade
 
-            # Update paper balance
-            if self.is_paper_trading:
-                self.paper_balance -= position_size
+            # Initialize price history for this symbol
+            if symbol not in self.price_history:
+                self.price_history[symbol] = []
+            self.price_history[symbol].append((datetime.now(), price))
 
-            # Log trade execution
-            self.log_trade(
-                f"{'PAPER' if self.is_paper_trading else 'LIVE'} TRADE EXECUTED:\n"
-                f"Symbol: {symbol}\n"
-                f"Entry: ${price:.8f}\n"
-                f"Size: ${position_size:.2f}\n"
-                f"Type: {'LIMIT' if use_limit_orders else 'MARKET'}"
-            )
-
-            # Update displays
+            self.log_trade(f"Opened trade for {symbol} at ${price:.6f} (ID: {trade_id})")
             self.update_active_trades_display()
-            self.update_balance_display()
-            self.update_chart()
 
-            return True
+            # FINAL VERIFICATION: Verify we haven't exceeded max trades (double-check)
+            if len(self.active_trades) > max_trades:
+                self.log_trade(f"WARNING: Max trades limit exceeded after adding {symbol}. Enforcing limit...")
+                self.enforce_max_trades_limit()
+
+            return trade_id
 
         except Exception as e:
             self.log_trade(f"Error executing trade: {str(e)}")
             return False
-        
+            
     def verify_paper_balance(self):
         """Verify and fix paper balance if it's incorrect"""
         try:
@@ -5441,41 +6394,232 @@ class CryptoScalpingBot:
             self.log_trade(f"Error checking exclusion: {str(e)}")
             return False
 
-    def verify_active_trades(self):
-        """Verify all active trades against actual exchange positions"""
-        if self.is_paper_trading:
-            return
-            
+    def sync_active_trades_with_exchange(self):
+        """Sync active_trades with actual open positions on the exchange (spot) and ignore tiny trades"""
         try:
-            self.log_trade("Verifying active trades with exchange...")
-            
-            # Fetch current positions from exchange
-            exchange_positions = {}
-            try:
-                balance = self.exchange.fetch_balance()
-                # Get all non-zero balances
-                for currency, data in balance.items():
-                    if currency != 'USD' and float(data.get('free', 0)) > 0:
-                        exchange_positions[f"{currency}/USD"] = float(data['free'])
-            except Exception as e:
-                self.log_trade(f"Error fetching positions: {str(e)}")
+            if self.is_paper_trading:
                 return
 
-            # Check each active trade
-            for trade_id, trade in list(self.active_trades.items()):
-                symbol = trade['symbol']
-                
-                # If we don't have a position for this symbol, remove it from active trades
-                if symbol not in exchange_positions or exchange_positions[symbol] <= 0:
-                    self.log_trade(f"No active position found for {symbol}, removing from tracking")
-                    del self.active_trades[trade_id]
+            # Check open orders
+            open_orders = self.exchange.fetch_open_orders()
+            for order in open_orders:
+                symbol = order['symbol']
+                position_size = float(order.get('cost', 0))
+                if position_size < self.MIN_TRADE_SIZE:
+                    self.log_trade(f"Skipping tiny open order for {symbol} (${position_size:.2f} < ${self.MIN_TRADE_SIZE:.2f})")
                     continue
+                if not any(t['symbol'] == symbol for t in self.active_trades.values()):
+                    trade_id = f"sync_{int(time.time())}_{symbol.replace('/', '')}"
+                    self.active_trades[trade_id] = {
+                        'symbol': symbol,
+                        'entry_price': float(order.get('price', 0)),
+                        'current_price': float(order.get('price', 0)),
+                        'amount': float(order.get('amount', 0)),
+                        'position_size': position_size,
+                        'entry_time': datetime.now(),
+                        'status': 'open',
+                        'order_id': order['id'],
+                        'is_limit_order': order['type'] == 'limit'
+                    }
+                    self.log_trade(f"Synced open order for {symbol} into active_trades.")
 
-            # Update displays
+            # Check balances for spot positions
+            balance = self.exchange.fetch_balance()
+            for symbol in self.exchange.markets:
+                base = symbol.split('/')[0]
+                amount = balance[base]['free'] if base in balance else 0
+                try:
+                    price = float(self.exchange.fetch_ticker(symbol)['last'])
+                except Exception:
+                    price = 0
+                position_size = amount * price
+                if position_size < self.MIN_TRADE_SIZE:
+                    continue
+                if amount > 0 and not any(t['symbol'] == symbol for t in self.active_trades.values()):
+                    trade_id = f"sync_{int(time.time())}_{symbol.replace('/', '')}"
+                    self.active_trades[trade_id] = {
+                        'symbol': symbol,
+                        'entry_price': price,
+                        'current_price': price,
+                        'amount': amount,
+                        'position_size': position_size,
+                        'entry_time': datetime.now(),
+                        'status': 'open',
+                        'order_id': None,
+                        'is_limit_order': False
+                    }
+                    self.log_trade(f"Synced spot balance for {symbol} into active_trades.")
+
             self.update_active_trades_display()
-            self.update_balance_display()
-            self.update_metrics()
+
+        except Exception as e:
+            self.log_trade(f"Error syncing active trades: {str(e)}")
+
+
+    def sync_metrics_with_exchange(self):
+        """Sync performance metrics with exchange data"""
+        try:
+            if self.is_paper_trading:
+                return  # No need to sync paper metrics
+                
+            self.log_trade("Syncing metrics with exchange data...")
             
+            # Verify active trades first
+            self.verify_active_trades()
+            
+            # Fetch recent trades from exchange to update metrics
+            try:
+                # Get trades from the last 24 hours
+                since = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+                trades = self.exchange.fetch_my_trades(since=since)
+                
+                if not trades:
+                    self.log_trade("No recent trades found on exchange")
+                    return
+                    
+                self.log_trade(f"Found {len(trades)} recent trades on exchange")
+                
+                # Process trades to update metrics
+                for trade in trades:
+                    # Skip trades we've already processed
+                    if trade['id'] in self.processed_trade_ids:
+                        continue
+                        
+                    # Add to processed IDs
+                    self.processed_trade_ids.add(trade['id'])
+                    
+                    # Process trade data
+                    symbol = trade['symbol']
+                    side = trade['side']
+                    price = float(trade['price'])
+                    amount = float(trade['amount'])
+                    cost = float(trade['cost'])
+                    fee = float(trade['fee']['cost']) if trade['fee'] else 0
+                    
+                    # We're only interested in completed trades
+                    if side == 'sell':
+                        # Find matching buy trade if possible
+                        buy_trades = [t for t in trades if t['symbol'] == symbol and t['side'] == 'buy']
+                        if buy_trades:
+                            # Use the most recent buy trade as entry
+                            buy_trade = max(buy_trades, key=lambda t: t['timestamp'])
+                            entry_price = float(buy_trade['price'])
+                            
+                            # Calculate profit
+                            profit_pct = ((price - entry_price) / entry_price) * 100
+                            profit = (price - entry_price) * amount
+                            
+                            # Update metrics
+                            self.real_metrics['total_trades'] += 1
+                            self.real_metrics['total_profit'] += profit
+                            self.real_metrics['total_fees'] += fee
+                            
+                            if profit > 0:
+                                self.real_metrics['winning_trades'] += 1
+                            else:
+                                self.real_metrics['losing_trades'] += 1
+                                
+                            # Log the trade
+                            self.log_trade(f"Synced trade: {symbol} - Entry: ${entry_price:.6f}, Exit: ${price:.6f}, P/L: {profit_pct:.2f}%")
+                            
+                            # Update trade history
+                            self.update_trade_history(symbol, profit_pct, profit)
+                
+                # Update displays
+                self.update_metrics()
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching trades from exchange: {str(e)}")
+                
+        except Exception as e:
+            self.log_trade(f"Error syncing metrics: {str(e)}")
+
+    def verify_active_trades(self):
+        """Verify active trades against exchange positions and update accordingly"""
+        try:
+            if self.is_paper_trading:
+                return  # No need to verify paper trades
+                
+            self.log_trade("Verifying active trades with exchange...")
+            
+            # Fetch all open positions from exchange
+            try:
+                positions = self.exchange.fetch_positions()
+                exchange_positions = {}
+                
+                # Process positions into a more usable format
+                for position in positions:
+                    if position['side'] == 'long' and float(position['contracts']) > 0:
+                        symbol = position['symbol']
+                        exchange_positions[symbol] = float(position['contracts'])
+                        
+                self.log_trade(f"Found {len(exchange_positions)} open positions on exchange")
+                
+                # Check for trades in our tracking that don't exist on exchange
+                for trade_id, trade in list(self.active_trades.items()):
+                    symbol = trade['symbol']
+                    
+                    # If we don't have a position for this symbol, remove it from active trades
+                    if symbol not in exchange_positions:
+                        self.log_trade(f"Position already closed for {symbol}. Removing from tracking.")
+                        
+                        # Calculate approximate profit based on last known price
+                        try:
+                            current_price = self.exchange.fetch_ticker(symbol)['last']
+                            entry_price = trade['entry_price']
+                            position_size = trade['position_size']
+                            
+                            # Calculate profit
+                            profit_pct = ((current_price - entry_price) / entry_price) * 100
+                            profit = position_size * (profit_pct / 100)
+                            
+                            # Update real metrics
+                            self.real_metrics['total_trades'] += 1
+                            if profit > 0:
+                                self.real_metrics['winning_trades'] += 1
+                                self.real_metrics['total_profit'] += profit
+                            else:
+                                self.real_metrics['losing_trades'] += 1
+                                self.real_metrics['total_profit'] += profit
+                                
+                            # Calculate fees
+                            fee_rate = self.maker_fee if trade.get('is_limit_order', False) else self.taker_fee
+                            total_fee = position_size * fee_rate * 2  # Entry and exit
+                            self.real_metrics['total_fees'] += total_fee
+                            
+                            # Update trade history
+                            self.update_trade_history(symbol, profit_pct, profit)
+                            
+                            self.log_trade(f"""
+                            External trade close detected:
+                            Symbol: {symbol}
+                            Entry: ${entry_price:.6f}
+                            Exit: ${current_price:.6f}
+                            Change: {profit_pct:.2f}%
+                            Profit: ${profit:.2f}
+                            Fees: ${total_fee:.2f}
+                            Net: ${(profit - total_fee):.2f}
+                            """)
+                        except Exception as e:
+                            self.log_trade(f"Error calculating metrics for externally closed trade: {str(e)}")
+                        
+                        # Remove from active trades
+                        del self.active_trades[trade_id]
+                
+                # Check for positions on exchange that we're not tracking
+                for symbol, amount in exchange_positions.items():
+                    if not any(t['symbol'] == symbol for t in self.active_trades.values()):
+                        self.log_trade(f"Found untracked position for {symbol} on exchange")
+                        # You could add code here to add it to tracking if desired
+                
+                # Update displays
+                self.update_active_trades_display()
+                self.update_balance_display()
+                self.update_metrics()
+                
+            except Exception as e:
+                self.log_trade(f"Error fetching positions: {str(e)}")
+                
         except Exception as e:
             self.log_trade(f"Error verifying active trades: {str(e)}")
         
@@ -5589,8 +6733,9 @@ class CryptoScalpingBot:
             self.log_trade(f"Error in advanced checks for {symbol}: {str(e)}")
             return False
             
+
     def update_active_trades_display(self):
-        """Update the active trades display with current trade information"""
+        """Update the active trades display with current trade information, filtering out tiny trades"""
         try:
             # Skip if trades_text widget doesn't exist
             if not hasattr(self, 'trades_text'):
@@ -5600,14 +6745,16 @@ class CryptoScalpingBot:
             self.trades_text.config(state=tk.NORMAL)
             self.trades_text.delete(1.0, tk.END)
             
-            if not self.active_trades:
+            # === FILTER OUT TINY TRADES ===
+            filtered_trades = {tid: t for tid, t in self.active_trades.items() if t.get('position_size', 0) >= self.MIN_TRADE_SIZE}
+            if not filtered_trades:
                 self.trades_text.insert(tk.END, "No active trades\n")
                 self.trades_text.config(state=tk.DISABLED)
                 return
                 
-            self.trades_text.insert(tk.END, f"Active Trades: {len(self.active_trades)}\n\n")
+            self.trades_text.insert(tk.END, f"Active Trades: {len(filtered_trades)}\n\n")
             
-            for trade_id, trade in list(self.active_trades.items()):
+            for trade_id, trade in filtered_trades.items():
                 try:
                     symbol = trade.get('symbol', 'Unknown')
                     entry_price = trade.get('entry_price', 0.0)
@@ -5616,7 +6763,7 @@ class CryptoScalpingBot:
                     current_price = trade.get('current_price', entry_price)
                     
                     # Calculate profit percentage
-                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    profit_pct = trade.get('current_profit_percentage', 0.0)
                     
                     # Get entry time and calculate time in trade
                     entry_time_str = "Unknown"
@@ -5664,11 +6811,12 @@ class CryptoScalpingBot:
                     self.log_trade(f"Error updating display for trade {trade_id}: {str(e)}")
                     continue
             
-            # Disable text widget after updating
+            # Ensure the display is scrolled to show the latest information
+            self.trades_text.see(tk.END)
             self.trades_text.config(state=tk.DISABLED)
             
         except Exception as e:
-            self.log_trade(f"Error updating active trades display: {str(e)}")
+            self.log_trade(f"Error updating trades display: {str(e)}")
 
     def validate_trade(self, pair_data, entry_price):
         """Validate a trade before execution"""
@@ -5804,60 +6952,74 @@ class CryptoScalpingBot:
             # Check for market override
             if hasattr(self, 'market_override_var') and self.market_override_var.get():
                 self.log_trade("Market override active - reporting neutral market regardless of conditions")
-                return {'state': 'neutral', 'strength': 0}
+                return {'state': 'neutral', 'strength': 0, 'btc_changes': {'5min': 0.0, '15min': 0.0, '1hour': 0.0}}
 
             # Get BTC/USD data
             df = self.data_manager.get_price_data('BTC/USD')
             if df is None or len(df) < 20:
                 self.log_trade("Insufficient BTC data for market analysis")
-                return {'state': 'bearish', 'strength': -5}  # Default to bearish if no data
+                return {'state': 'bearish', 'strength': -5, 'btc_changes': {'5min': 0.0, '15min': 0.0, '1hour': 0.0}}
 
-            # 1. Calculate multiple timeframe momentum
+            # Calculate BTC price changes over different timeframes
+            current_price = df['price'].iloc[-1]
             btc_changes = {
-                '5min': (df['price'].iloc[-1] / df['price'].iloc[-5] - 1) * 100,
-                '15min': (df['price'].iloc[-1] / df['price'].iloc[-15] - 1) * 100,
-                '1hour': (df['price'].iloc[-1] / df['price'].iloc[-60] - 1) * 100 if len(df) >= 60 else 0
+                '5min': 0.0,
+                '15min': 0.0,
+                '1hour': 0.0
             }
-
-            # 2. Check for consecutive red candles in BTC
-            red_candles = sum(1 for i in range(-6, -1) if df['price'].iloc[i] < df['price'].iloc[i-1])
             
-            # 3. Calculate volume profile
-            recent_volume = df['volume'].iloc[-5:].mean()
-            earlier_volume = df['volume'].iloc[-20:-5].mean()
-            volume_trend = recent_volume / earlier_volume if earlier_volume > 0 else 1
+            # 5-minute change
+            if len(df) >= 5:
+                price_5min_ago = df['price'].iloc[-5]
+                btc_changes['5min'] = ((current_price - price_5min_ago) / price_5min_ago) * 100
+            
+            # 15-minute change
+            if len(df) >= 15:
+                price_15min_ago = df['price'].iloc[-15]
+                btc_changes['15min'] = ((current_price - price_15min_ago) / price_15min_ago) * 100
+            
+            # 1-hour change
+            if len(df) >= 60:
+                price_1hour_ago = df['price'].iloc[-60]
+                btc_changes['1hour'] = ((current_price - price_1hour_ago) / price_1hour_ago) * 100
 
-            # 4. Calculate market strength (-10 to +10 scale)
+            # 1. Check for consecutive red/green candles
+            red_candles = 0
+            for i in range(min(5, len(df)-1)):
+                if df['price'].iloc[-(i+1)] < df['price'].iloc[-(i+2)]:
+                    red_candles += 1
+                else:
+                    break
+
+            # 2. Check volume trend
+            volume_trend = 1.0
+            if 'volume' in df.columns and len(df) >= 10:
+                recent_volume = df['volume'].iloc[-5:].mean()
+                previous_volume = df['volume'].iloc[-10:-5].mean()
+                if previous_volume > 0:
+                    volume_trend = recent_volume / previous_volume
+
+            # 3. Determine market state
             market_strength = 0
-            
-            # Add momentum components
-            market_strength += btc_changes['5min'] * 0.3
-            market_strength += btc_changes['15min'] * 0.4
-            market_strength += btc_changes['1hour'] * 0.3
+            state = 'neutral'
+            trading_allowed = True
 
-            # Penalize for consecutive red candles
-            if red_candles >= 4:
-                market_strength -= (red_candles - 3) * 2  # -2 points per extra red candle
-
-            # Volume consideration
-            if volume_trend < 0.7:  # Volume declining
-                market_strength -= 2
-            elif volume_trend > 1.3:  # Volume increasing
-                market_strength += 1
-
-            # 5. Determine market state with stricter thresholds
-            if market_strength <= -3:
-                state = 'bearish'
-                trading_allowed = False  # No trading in bearish conditions
-            elif market_strength <= -1:
-                state = 'cautious'
-                trading_allowed = True  # Allow trading but with strict conditions
-            elif market_strength >= 3:
+            # Bullish conditions
+            if btc_changes['1hour'] > 1.0 and btc_changes['15min'] > 0.2:
                 state = 'bullish'
-                trading_allowed = True  # Normal trading
-            else:
-                state = 'neutral'
-                trading_allowed = True  # Trading with moderate conditions
+                market_strength = min(10, btc_changes['1hour'])
+            # Bearish conditions
+            elif btc_changes['1hour'] < -1.0 or (red_candles >= 4 and btc_changes['15min'] < -0.5):
+                state = 'bearish'
+                market_strength = -min(10, abs(btc_changes['1hour']))
+                
+                # Only allow trading in severe bearish conditions if explicitly overridden
+                if btc_changes['1hour'] < -2.0 and btc_changes['15min'] < -1.0:
+                    trading_allowed = False
+            # Cautious conditions
+            elif (btc_changes['15min'] < -0.3 and red_candles >= 3) or volume_trend < 0.8:
+                state = 'cautious'
+                market_strength = -min(5, abs(btc_changes['15min']))
 
             # 6. Add warning flags
             warnings = []
@@ -5895,7 +7057,7 @@ class CryptoScalpingBot:
 
         except Exception as e:
             self.log_trade(f"Error analyzing market conditions: {str(e)}")
-            return {'state': 'bearish', 'strength': -5}  # Default to bearish on error
+            return {'state': 'bearish', 'strength': -5, 'btc_changes': {'5min': 0.0, '15min': 0.0, '1hour': 0.0}}
 
     def initialize_market_data(self):
         """Initialize market data for BTC/USD to enable market analysis"""
@@ -6455,23 +7617,21 @@ class CryptoScalpingBot:
             # Get the correct metrics based on trading mode
             if self.is_paper_trading:
                 metrics = self.paper_metrics
-                # Update instance variables for backward compatibility
-                self.total_profit = metrics['total_profit']
-                self.total_fees = metrics['total_fees']
-                self.winning_trades = metrics['winning_trades']
-                self.losing_trades = metrics['losing_trades']
-                self.total_trades = metrics['total_trades']
             else:
                 metrics = self.real_metrics
-                # Update instance variables for backward compatibility
-                self.total_profit = metrics['total_profit']
-                self.total_fees = metrics['total_fees']
-                self.winning_trades = metrics['winning_trades']
-                self.losing_trades = metrics['losing_trades']
-                self.total_trades = metrics['total_trades']
+                
+            # Update instance variables for backward compatibility
+            self.total_profit = metrics['total_profit']
+            self.total_fees = metrics['total_fees']
+            self.winning_trades = metrics['winning_trades']
+            self.losing_trades = metrics['losing_trades']
+            self.total_trades = metrics['total_trades']
 
-            # Calculate win rate
-            win_rate = (metrics['winning_trades'] / max(1, metrics['total_trades'])) * 100
+            # Calculate win rate (avoid division by zero)
+            if metrics['total_trades'] > 0:
+                win_rate = (metrics['winning_trades'] / metrics['total_trades']) * 100
+            else:
+                win_rate = 0.0
 
             # Get appropriate balance based on trading mode
             if self.is_paper_trading:
@@ -6487,9 +7647,6 @@ class CryptoScalpingBot:
 
                     # Calculate allocated amount in active trades
                     allocated = sum(trade.get('position_size', 0) for trade in self.active_trades.values())
-
-                    # Update total balance to include allocated funds
-                    total_balance = available_balance + allocated
 
                     # Append allocated amount to balance text
                     if allocated > 0:
@@ -6572,46 +7729,14 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error initializing trade data collection: {str(e)}")
 
-
-    def update_btc_data(self):
-        """Update BTC/USD market data for market analysis"""
-        try:
-            self.log_trade("Updating BTC/USD market data...")
-            
-            # Skip if no exchange connection
-            if not hasattr(self, 'exchange') or self.exchange is None:
-                self.log_trade("No exchange connection available for BTC data update")
-                return False
-            
-            # Fetch BTC/USD ticker
-            try:
-                btc_ticker = self.exchange.fetch_ticker('BTC/USD')
-                if not btc_ticker:
-                    self.log_trade("Failed to fetch BTC/USD ticker")
-                    return False
-                
-                # Update price data for BTC/USD
-                self.data_manager.update_price_data('BTC/USD', btc_ticker)
-                
-                # Log success
-                btc_price = float(btc_ticker['last'])
-                self.log_trade(f"Updated BTC/USD price: ${btc_price:.2f}")
-                
-                # Calculate market indicators if we have enough data
-                df = self.data_manager.get_price_data('BTC/USD')
-                if df is not None and len(df) >= 5:
-                    # Calculate indicators
-                    self.data_manager._calculate_indicators('BTC/USD')
-                    self.log_trade("BTC/USD indicators updated")
-                
-                return True
-                
-            except Exception as e:
-                self.log_trade(f"Error fetching BTC/USD data: {str(e)}")
-                return False
-            
-        except Exception as e:
-            self.log_trade(f"Error updating BTC/USD data: {str(e)}")
+    def check_ml_prediction_status(self):
+        """Check and log the current ML prediction status"""
+        if hasattr(self, 'use_ml_prediction_var'):
+            ml_enabled = self.use_ml_prediction_var.get()
+            self.log_trade(f"ML prediction status check: {'ENABLED' if ml_enabled else 'DISABLED'}")
+            return ml_enabled
+        else:
+            self.log_trade("ML prediction variable not found")
             return False
 
     def update_trade_history(self, symbol, percentage, profit, is_win=True):
@@ -7097,17 +8222,33 @@ class CryptoScalpingBot:
     def monitor_trades(self):
         """Monitor active trades and close them when conditions are met"""
         try:
+            # Update market condition display periodically
+            current_time = time.time()
+            if not hasattr(self, '_last_market_update') or (current_time - self._last_market_update) > 30:
+                if hasattr(self, 'market_condition_label'):
+                    self.update_market_info()
+                if hasattr(self, 'ml_accuracy_label'):
+                    self.update_ml_info()
+                self._last_market_update = current_time
+                
+            # Update chart with latest price data
+            if hasattr(self, 'ax') and hasattr(self, 'canvas'):
+                self.update_chart()
+                
             if not self.active_trades:
                 return
-                
+                    
             # First enforce max trades limit
             self.enforce_max_trades_limit()
             
             # Get parameters from GUI once
-            stop_loss = float(self.stop_loss.get())
-            profit_target = float(self.profit_target.get())
-            trailing_stop = float(self.trailing_stop.get())
-            trailing_activation = float(self.trailing_activation.get())
+            stop_loss = float(self.stop_loss.get()) if hasattr(self, 'stop_loss') else 1.0
+            profit_target = float(self.profit_target.get()) if hasattr(self, 'profit_target') else 1.5
+            trailing_stop = float(self.trailing_stop.get()) if hasattr(self, 'trailing_stop') else 0.5
+            trailing_activation = float(self.trailing_activation.get()) if hasattr(self, 'trailing_activation') else 1.0
+            
+            # Log the number of trades being monitored
+            self.log_trade(f"Monitoring {len(self.active_trades)} active trades...")
             
             # Check each active trade
             for trade_id in list(self.active_trades.keys()):
@@ -7120,8 +8261,14 @@ class CryptoScalpingBot:
                     ticker = self.exchange.fetch_ticker(symbol)
                     current_price = float(ticker['last'])
                     
+                    # Update the current price in the trade object
+                    trade['current_price'] = current_price
+                    
                     # Calculate profit percentage
                     profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    
+                    # Log current P/L for monitoring
+                    self.log_trade(f"Trade {symbol}: Current P/L: {profit_pct:.2f}%, Entry: ${entry_price:.8f}, Current: ${current_price:.8f}")
                     
                     # Update highest price and profit if needed
                     if current_price > trade.get('highest_price', 0):
@@ -7137,95 +8284,160 @@ class CryptoScalpingBot:
                     # CASE 2: Take Profit
                     if profit_pct >= profit_target:
                         self.log_trade(f"Profit target reached on {symbol} at {profit_pct:.2f}%")
-                        self.close_trade(trade_id, trade, current_price, "profit target")
+                        self.close_trade(trade_id, trade, current_price, "take profit")
                         continue
                     
                     # CASE 3: Trailing Stop
-                    highest_profit = trade.get('highest_profit', 0)
-                    if highest_profit >= trailing_activation:
+                    if profit_pct >= trailing_activation:
+                        # Calculate drop from highest profit
+                        highest_profit = trade.get('highest_profit', profit_pct)
                         drop_from_high = highest_profit - profit_pct
+                        
                         if drop_from_high >= trailing_stop:
-                            self.log_trade(f"Trailing stop triggered on {symbol}")
+                            self.log_trade(f"Trailing stop triggered on {symbol} at {profit_pct:.2f}% (drop from high: {drop_from_high:.2f}%)")
                             self.close_trade(trade_id, trade, current_price, "trailing stop")
                             continue
-                    
-                    # Update trade data
-                    trade['current_price'] = current_price
-                    trade['current_profit_percentage'] = profit_pct
-                    trade['last_update'] = datetime.now()
-                    
-                    # Update price history for charting
-                    if symbol in self.price_history:
-                        self.price_history[symbol].append((datetime.now(), current_price))
-                        self.price_history[symbol] = self.price_history[symbol][-100:]
                     
                 except Exception as e:
                     self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
                     continue
-            
+                    
             # Update displays
             self.update_active_trades_display()
-            self.update_chart()
-            self.update_balance_display()
             
         except Exception as e:
             self.log_trade(f"Error in monitor_trades: {str(e)}")
 
     def run_bot(self):
-        """Main bot loop"""
+        """Main bot loop with improved error handling and metrics syncing"""
         try:
-            self.running = True
+            self.log_trade("Bot running...")
             self.update_status("Running")
-            self.log_trade("=== BOT STARTED ===")
             
-            # Start trading thread
-            self.trading_thread = threading.Thread(target=self.trading_loop)
-            self.trading_thread.daemon = True
-            self.trading_thread.start()
-            
-        except Exception as e:
-            self.log_trade(f"Error starting bot: {str(e)}")
-            self.update_status("Error")
-
-    def trading_loop(self):
-        """Main trading loop running in a separate thread"""
-        try:
-            # Initialize last scan time
-            self.last_scan_time = 0
+            # Initialize processed trade IDs set if not exists
+            if not hasattr(self, 'processed_trade_ids'):
+                self.processed_trade_ids = set()
             
             # Main loop
+            last_metrics_sync = time.time()
+            
             while self.running:
                 try:
-                    # Monitor active trades (do this first to ensure quick response to exit conditions)
+                    # Verify active trades and sync metrics periodically (every 5 minutes)
+                    current_time = time.time()
+                    if current_time - last_metrics_sync > 300:  # 5 minutes
+                        self.verify_active_trades()
+                        self.sync_metrics_with_exchange()
+                        last_metrics_sync = current_time
+                    
+                    # Rest of your existing run_bot code...
+                    
+                    # Monitor active trades
                     self.monitor_trades()
                     
-                    # Monitor limit orders (check if any need to be canceled/adjusted)
-                    if not self.is_paper_trading:
-                        self.monitor_limit_orders()
+                    # Check for new opportunities
+                    self.scan_opportunities_async()
                     
-                    # Scan for new opportunities (only if we have room for more trades)
-                    max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
-                    current_time = time.time()
-                    
-                    # Force a scan every 30 seconds if we're not at max trades and not currently scanning
-                    if len(self.active_trades) < max_trades and not self.is_scanning:
-                        if (current_time - self.last_scan_time) > 10:
-                            self.log_trade(f"Initiating scheduled scan (active: {len(self.active_trades)}, max: {max_trades})")
-                            self.is_scanning = True  # Set flag to prevent multiple scans
-                            self.scan_opportunities()
-                            self.is_scanning = False  # Reset flag after scan completes
-                            self.last_scan_time = current_time
-                    
-                    # Sleep to avoid high CPU usage
+                    # Sleep to avoid excessive API calls
                     time.sleep(1)
-                
+                    
+                except Exception as e:
+                    self.log_trade(f"Error in bot loop: {str(e)}")
+                    time.sleep(5)  # Sleep longer on error
+                    
+            self.update_status("Stopped")
+            self.log_trade("Bot stopped")
+            
+        except Exception as e:
+            self.log_trade(f"Fatal error in run_bot: {str(e)}")
+            self.update_status("Error")
+
+    def analyze_and_trade(self):
+        """Analyze market conditions and execute trades if conditions are met (threaded)"""
+        try:
+            if hasattr(self, 'is_scanning') and self.is_scanning:
+                return False
+
+            max_trades = int(self.max_trades.get()) if hasattr(self, 'max_trades') else 3
+            if len(self.active_trades) >= max_trades:
+                return False
+
+            self.is_scanning = True
+            self.root.after(0, lambda: self.update_status("Scanning markets..."))
+
+            market_data = self.analyze_market_conditions()
+            trading_allowed = market_data.get('trading_allowed', False)
+
+            if hasattr(self, 'market_override') and self.market_override.get():
+                trading_allowed = True
+                self.log_trade("MARKET OVERRIDE ENABLED: Bot will ignore bearish market conditions")
+
+            if not trading_allowed:
+                self.log_trade("Trading paused due to market conditions")
+                self.is_scanning = False
+                self.root.after(0, lambda: self.update_status("Paused - Unfavorable market"))
+                return False
+
+            # Start scanning in a background thread
+            self.scan_opportunities_async()
+            return True
+
+        except Exception as e:
+            self.log_trade(f"Error in analyze_and_trade: {str(e)}")
+            self.is_scanning = False
+            return False
+        finally:
+            self.is_scanning = False
+
+    def trading_loop(self):
+        """Main trading loop with enhanced safety checks"""
+        try:
+            # Initialize loop variables
+            last_cleanup_time = time.time()
+            last_verify_time = time.time()
+            last_enforce_time = time.time()
+            cleanup_interval = 3600  # Clean up dust every hour
+            verify_interval = 60     # Verify positions every minute
+            enforce_interval = 30    # Enforce trade limits every 30 seconds
+            
+            self.log_trade("Trading loop started")
+            
+            while self.running:
+                try:
+                    # CRITICAL: Enforce max trades limit frequently
+                    current_time = time.time()
+                    if (current_time - last_enforce_time) > enforce_interval:
+                        self.enforce_max_trades_limit()
+                        last_enforce_time = current_time
+                    
+                    # Main trading logic
+                    self.root.after(0, self.analyze_and_trade)
+                    
+                    # Monitor active trades
+                    self.monitor_trades()
+                    
+                    # Check if it's time to verify positions
+                    if not self.is_paper_trading and (current_time - last_verify_time) > verify_interval:
+                        self.verify_exchange_positions()
+                        last_verify_time = current_time
+                    
+                    # Check if it's time to clean up dust
+                    if not self.is_paper_trading and (current_time - last_cleanup_time) > cleanup_interval:
+                        if hasattr(self, 'cleanup_dust_balances'):
+                            self.cleanup_dust_balances()
+                        last_cleanup_time = current_time
+                    
+                    # Sleep to avoid overloading
+                    time.sleep(5)
+                    
                 except Exception as e:
                     self.log_trade(f"Error in trading loop: {str(e)}")
-                    time.sleep(5)
+                    time.sleep(10)  # Longer sleep on error
+                    
+            self.log_trade("Trading loop stopped")
                 
         except Exception as e:
             self.log_trade(f"Fatal error in trading loop: {str(e)}")
-            self.stop_bot()
 
     def run(self):
         """Main run method"""
@@ -7259,6 +8471,7 @@ class CryptoScalpingBot:
                             continue
             finally:
                 self.log_trade("Bot shutdown complete.")
+
 if __name__ == "__main__":
     try:
         bot = CryptoScalpingBot()
