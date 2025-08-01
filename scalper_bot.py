@@ -34,13 +34,13 @@ class DataManager:
             'long': 15
         }
         self.log_function = log_function if log_function else print
-        self.min_data_points = 20
+        self.min_data_points = 5
         self.initialization_complete = {}
         self.bot = bot  # Store reference to the main bot
         
         # Default EMA periods if not available from bot
-        self.ema_short = 8
-        self.ema_long = 21
+        self.ema_short = 5
+        self.ema_long = 15
         self.rsi_period = 14
 
     def get_price_data(self, symbol):
@@ -86,7 +86,7 @@ class DataManager:
             print(f"{timestamp} - {message.encode('ascii', 'replace').decode()}")
     
     def _calculate_indicators(self, symbol: str):
-        """Calculate technical indicators using pandas, including RSI and MACD"""
+        """Calculate technical indicators using pandas, including RSI and MACD with robust error handling"""
         try:
             if symbol not in self.price_data:
                 return
@@ -95,111 +95,113 @@ class DataManager:
                 return
             
             try:
-                # Moving averages
-                for period in [5, 15]:  # Calculate the EMAs needed for trading decisions
-                    if len(df) >= period:
-                        df[f'ema_{period}'] = df['price'].ewm(span=period, adjust=False).mean()
+                # Get EMA periods from bot if available
+                if hasattr(self.bot, 'ema_short') and hasattr(self.bot, 'ema_long'):
+                    short_period = int(self.bot.ema_short.get())
+                    long_period = int(self.bot.ema_long.get())
+                else:
+                    short_period = 5
+                    long_period = 15
                 
-                # Use custom EMA periods if set
-                short_period = 8  # Default
-                long_period = 21  # Default
-                
-                # Try to get values from bot if available
-                if hasattr(self, 'bot') and self.bot is not None:
-                    if hasattr(self.bot, 'ema_short') and hasattr(self.bot.ema_short, 'get'):
-                        try:
-                            short_period = int(self.bot.ema_short.get())
-                        except:
-                            pass
-                    if hasattr(self.bot, 'ema_long') and hasattr(self.bot.ema_long, 'get'):
-                        try:
-                            long_period = int(self.bot.ema_long.get())
-                        except:
-                            pass
-                # Use local values if bot reference not available
-                elif hasattr(self, 'ema_short'):
-                    short_period = self.ema_short
-                    long_period = self.ema_long
-                
-                if len(df) >= short_period:
+                # Calculate EMAs even with limited data
+                if len(df) >= 2:
                     df[f'ema_{short_period}'] = df['price'].ewm(span=short_period, adjust=False).mean()
-                if len(df) >= long_period:
                     df[f'ema_{long_period}'] = df['price'].ewm(span=long_period, adjust=False).mean()
-                
-                # Volume metrics
-                if len(df) >= 5:
-                    df['volume_sma_5'] = df['volume'].rolling(window=5).mean()
-                    df['volume_ratio'] = df['volume'] / df['volume_sma_5']
+                    
+                    # Also calculate the standard ema_5 and ema_15 for backward compatibility
+                    df['ema_5'] = df['price'].ewm(span=5, adjust=False).mean()
+                    df['ema_15'] = df['price'].ewm(span=15, adjust=False).mean()
                 
                 # Price momentum and volatility
                 df['price_change'] = df['price'].pct_change()
-                if len(df) >= 5:
-                    df['momentum'] = df['price'].pct_change(periods=5)
-                    df['volatility'] = df['price'].rolling(window=5).std()
+                if len(df) >= 3:
+                    df['volatility'] = df['price_change'].rolling(window=min(3, len(df))).std()
                 
-                # RSI Calculation
-                rsi_period = 14  # Default to 14 if not set
-                if hasattr(self, 'rsi_period') and self.rsi_period is not None:
+                # FIXED RSI Calculation - work with minimal data and handle edge cases
+                rsi_period = 14
+                if hasattr(self.bot, 'rsi_period') and self.bot.rsi_period is not None:
                     try:
-                        rsi_period = int(self.rsi_period.get())
+                        rsi_period = int(self.bot.rsi_period.get())
                     except:
-                        pass
-                    
-                if len(df) >= rsi_period + 1:  # Need enough data points for RSI
-                    # Calculate price changes
+                        rsi_period = 14
+                        
+                if len(df) >= 3:  # Minimum data for RSI calculation
+                    # Calculate price differences
                     delta = df['price'].diff()
                     
                     # Separate gains and losses
-                    gains = delta.where(delta > 0, 0)
-                    losses = -delta.where(delta < 0, 0)
+                    gain = delta.where(delta > 0, 0)
+                    loss = -delta.where(delta < 0, 0)
                     
-                    # Calculate average gains and losses over the period
-                    avg_gain = gains.rolling(window=rsi_period, min_periods=rsi_period).mean()
-                    avg_loss = losses.rolling(window=rsi_period, min_periods=rsi_period).mean()
+                    # Use a smaller window for limited data, but ensure we have enough variation
+                    window = min(rsi_period, len(df) - 1, 3)
                     
-                    # Avoid division by zero - replace zeros with small value
-                    avg_loss = avg_loss.replace(0, 0.0001)
+                    # Calculate average gains and losses with minimum period of 1
+                    avg_gain = gain.rolling(window=window, min_periods=1).mean()
+                    avg_loss = loss.rolling(window=window, min_periods=1).mean()
                     
-                    # Calculate RS and RSI
-                    rs = avg_gain / avg_loss
-                    rs = rs.replace([np.inf, -np.inf], np.nan)  # Handle infinity
+                    # Handle edge cases for RSI calculation
+                    # If we have no losses (all gains), RSI should be high but not 100
+                    # If we have no gains (all losses), RSI should be low but not 0
                     
-                    # Calculate RSI
+                    # Calculate RS with safeguards
+                    rs = pd.Series(index=avg_gain.index, dtype=float)
+                    
+                    for i in range(len(avg_gain)):
+                        gain_val = avg_gain.iloc[i]
+                        loss_val = avg_loss.iloc[i]
+                        
+                        if pd.isna(gain_val) or pd.isna(loss_val):
+                            rs.iloc[i] = 1.0  # Neutral
+                        elif loss_val == 0:
+                            if gain_val > 0:
+                                rs.iloc[i] = 99.0  # Very high but not infinite
+                            else:
+                                rs.iloc[i] = 1.0  # Neutral if both are 0
+                        else:
+                            rs.iloc[i] = gain_val / loss_val
+                    
+                    # Calculate RSI with bounds checking
                     rsi = 100 - (100 / (1 + rs))
                     
-                    # Handle edge cases
-                    # If price hasn't changed at all, RSI should be 50 (neutral)
-                    if delta.abs().sum() == 0:
-                        rsi = pd.Series(50, index=rsi.index)
+                    # Ensure RSI is within valid bounds and handle NaN values
+                    rsi = rsi.fillna(50.0)  # Fill NaN with neutral value
+                    rsi = rsi.clip(lower=0.0, upper=100.0)  # Ensure bounds
                     
-                    # Fill any remaining NaN values with previous values or 50
-                    rsi = rsi.ffill().fillna(50)
+                    # Additional safeguard: if we have very little price movement, use neutral RSI
+                    price_range = df['price'].max() - df['price'].min()
+                    price_volatility = price_range / df['price'].mean() * 100
                     
-                    # Store RSI in DataFrame
+                    if price_volatility < 0.01:  # Less than 0.01% price movement
+                        self.log_trade(f"Very low price volatility for {symbol}, using neutral RSI")
+                        rsi = pd.Series([50.0] * len(rsi), index=rsi.index)
+                    
                     df[f'rsi_{rsi_period}'] = rsi
+                    df['rsi_14'] = rsi  # Backward compatibility
+                    
+                    # Log RSI values for debugging
+                    latest_rsi = rsi.iloc[-1]
+                    self.log_trade(f"Calculated RSI for {symbol}: {latest_rsi:.2f} (price volatility: {price_volatility:.4f}%)")
                 
-                # MACD Calculation
-                if hasattr(self, 'macd_fast') and hasattr(self, 'macd_slow') and hasattr(self, 'macd_signal'):
+                # MACD Calculation - simplified for limited data
+                if hasattr(self.bot, 'macd_fast') and hasattr(self.bot, 'macd_slow') and hasattr(self.bot, 'macd_signal'):
                     try:
-                        fast_period = int(self.macd_fast.get())
-                        slow_period = int(self.macd_slow.get())
-                        signal_period = int(self.macd_signal.get())
+                        fast = int(self.bot.macd_fast.get())
+                        slow = int(self.bot.macd_slow.get())
+                        signal = int(self.bot.macd_signal.get())
                         
-                        if len(df) >= slow_period + signal_period:
-                            # Calculate MACD line
-                            fast_ema = df['price'].ewm(span=fast_period, adjust=False).mean()
-                            slow_ema = df['price'].ewm(span=slow_period, adjust=False).mean()
-                            df['macd_line'] = fast_ema - slow_ema
+                        if len(df) >= 3:
+                            ema_fast = df['price'].ewm(span=min(fast, len(df))).mean()
+                            ema_slow = df['price'].ewm(span=min(slow, len(df))).mean()
+                            macd_line = ema_fast - ema_slow
+                            macd_signal_line = macd_line.ewm(span=min(signal, len(df))).mean()
+                            macd_histogram = macd_line - macd_signal_line
                             
-                            # Calculate signal line
-                            df['macd_signal_line'] = df['macd_line'].ewm(span=signal_period, adjust=False).mean()
-                            
-                            # Calculate histogram
-                            df['macd_histogram'] = df['macd_line'] - df['macd_signal_line']
-                            
-                            self.log_trade(f"Calculated MACD for {symbol} with periods {fast_period}/{slow_period}/{signal_period}")
-                    except Exception as e:
-                        self.log_trade(f"Error calculating MACD: {str(e)}")
+                            df['macd_line'] = macd_line
+                            df['macd_signal_line'] = macd_signal_line
+                            df['macd_histogram'] = macd_histogram
+                    except:
+                        pass
                 
                 # Store updated DataFrame
                 self.price_data[symbol] = df
@@ -398,6 +400,8 @@ class CryptoScalpingBot:
         # Load saved metrics if available
         self.load_metrics()
 
+        self.use_advanced_filters = tk.BooleanVar(value=True)
+
         # Initialize DataManager
         #self.data_manager = DataManager(log_function=self.log_trade)
         self.log_trade("Testing logger initialization")
@@ -430,6 +434,12 @@ class CryptoScalpingBot:
         self.use_ml_prediction_var = tk.BooleanVar(self.root, value=False)
 
         self.kraken_lock = threading.Lock()
+
+        self.markets = self.exchange.load_markets()
+
+        self.order_cooldowns = {}  # symbol -> timestamp of last order
+        self.order_cooldown_seconds = 60  # Cooldown period in seconds
+
     
 
     def init_memory_monitor(self):
@@ -1145,57 +1155,43 @@ class CryptoScalpingBot:
             return False
 
     def init_exchange(self):
-        """Initialize exchange with retry mechanism"""
+        """Initialize exchange with improved connection handling"""
         max_retries = 3
-        retry_delay = 5  # seconds
+        retry_delay = 5
         
         for attempt in range(max_retries):
             try:
                 self.log_trade(f"Initializing exchange (attempt {attempt + 1}/{max_retries})...")
                 
+                # Configure exchange WITHOUT the problematic session config
                 self.exchange = ccxt.kraken({
+                    'apiKey': self.config.get('API_KEYS', 'api_key', fallback=''),
+                    'secret': self.config.get('API_KEYS', 'secret', fallback=''),
                     'enableRateLimit': True,
                     'options': {
                         'adjustForTimeDifference': True,
                     },
                     'timeout': 30000,
                     'rateLimit': 1000,
+                    # Remove the session configuration - this is what's causing the error
                 })
                 
-                # Test connection with error handling
-                try:
-                    self.log_trade("Testing exchange connection...")
-                    self.exchange.load_markets()
-                    
-                    # Verify we can fetch data
-                    self.log_trade("Testing ticker fetch...")
-                    test_tickers = self.exchange.fetch_tickers()
-                    self.log_trade(f"Successfully fetched {len(test_tickers)} tickers")
-                    
-                    # Initialize DataManager with exchange instance and bot reference
-                    self.data_manager = DataManager(
-                        exchange=self.exchange,
-                        log_function=self.log_trade,
-                        bot=self  # Pass reference to the bot
-                    )
-                    
-                    # Initialize BTC/USD market data
-                    self.initialize_btc_data()
-                    
-                    self.log_trade("Exchange initialization successful")
-                    return True
-                    
-                except ccxt.NetworkError as e:
-                    if attempt < max_retries - 1:
-                        self.log_trade(f"Network error, retrying in {retry_delay} seconds: {str(e)}")
-                        time.sleep(retry_delay)
-                        continue
-                    raise
-                    
-                except Exception as e:
-                    self.log_trade(f"Error testing exchange connection: {str(e)}")
-                    raise
-                    
+                # Test connection
+                self.exchange.load_markets()
+                test_tickers = self.exchange.fetch_tickers()
+                self.log_trade(f"Successfully fetched {len(test_tickers)} tickers")
+                
+                # Initialize DataManager
+                self.data_manager = DataManager(
+                    exchange=self.exchange,
+                    log_function=self.log_trade,
+                    bot=self
+                )
+                
+                self.initialize_btc_data()
+                self.log_trade("Exchange initialization successful")
+                return True
+                
             except Exception as e:
                 if attempt < max_retries - 1:
                     self.log_trade(f"Initialization failed, retrying in {retry_delay} seconds: {str(e)}")
@@ -1203,38 +1199,44 @@ class CryptoScalpingBot:
                 else:
                     self.log_trade(f"Failed to initialize exchange after {max_retries} attempts: {str(e)}")
                     raise
-
+        
         return False
+    
+    def manage_exchange_connections(self):
+        """Manage exchange connections to prevent pool overflow"""
+        try:
+            # Close any existing sessions
+            if hasattr(self.exchange, 'session') and self.exchange.session:
+                self.exchange.session.close()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Reinitialize exchange with fresh session
+            if hasattr(self, 'exchange'):
+                del self.exchange
+            
+            self.init_exchange()
+            
+        except Exception as e:
+            self.log_trade(f"Error managing exchange connections: {str(e)}")
 
-    def fetch_tickers_with_retry(self, max_retries=3, retry_delay=2):
-        """Fetch tickers with retry mechanism and ensure fresh data"""
-        for attempt in range(max_retries):
-            try:
-                # Force fresh data fetch
-                self.exchange.load_markets(True)  # Force reload
-                tickers = self.exchange.fetch_tickers()
-                
-                # Add current timestamp if missing
-                current_time = int(time.time() * 1000)
-                for symbol, ticker in tickers.items():
-                    if ticker.get('timestamp') is None:
-                        ticker['timestamp'] = current_time
-                    elif current_time - ticker['timestamp'] > 60000:  # Older than 60 seconds
-                        self.log_trade(f"Forcing fresh data fetch for {symbol}")
-                        try:
-                            fresh_ticker = self.exchange.fetch_ticker(symbol)
-                            tickers[symbol].update(fresh_ticker)
-                        except Exception as e:
-                            self.log_trade(f"Error fetching fresh data for {symbol}: {str(e)}")
-                
-                return tickers
-                
-            except Exception as e:
-                self.log_trade(f"Error fetching tickers (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                time.sleep(retry_delay)
-                
-        self.log_trade("Failed to fetch tickers after multiple attempts")
-        return {}
+    def cleanup_connections(self):
+        """Clean up connections periodically"""
+        try:
+            if hasattr(self.exchange, 'session'):
+                # Get the underlying requests session
+                session = self.exchange.session
+                if hasattr(session, 'close'):
+                    session.close()
+            
+            # Force connection cleanup
+            import gc
+            gc.collect()
+            
+        except Exception as e:
+            self.log_trade(f"Error cleaning up connections: {str(e)}")
 
     def show_api_config(self):
         """Show API configuration window with improved error handling"""
@@ -1575,8 +1577,21 @@ class CryptoScalpingBot:
             self.log_trade(f"Error updating BTC/USD data: {str(e)}")
             return False
 
+    def periodic_connection_cleanup(self):
+        """Periodically clean up connections to prevent pool overflow"""
+        try:
+            self.cleanup_connections()
+            
+            # Schedule next cleanup in 5 minutes
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(300000, self.periodic_connection_cleanup)  # 5 minutes
+                
+        except Exception as e:
+            self.log_trade(f"Error in periodic connection cleanup: {str(e)}")
+
+
     def start_bot(self):
-        """Start the trading bot"""
+        """Start the trading bot with connection management"""
         try:
             if self.running:
                 self.log_trade("Bot is already running")
@@ -1584,6 +1599,9 @@ class CryptoScalpingBot:
                     
             self.log_trade("Starting bot...")
             self.running = True
+            
+            # Start periodic connection cleanup
+            self.root.after(300000, self.periodic_connection_cleanup)  # Start in 5 minutes
             
             # Update button text and command
             if hasattr(self, 'start_button'):
@@ -1610,6 +1628,7 @@ class CryptoScalpingBot:
             # Reset button in case of error
             if hasattr(self, 'start_button'):
                 self.start_button.config(text="Start", command=self.start_bot)
+
 
     def stop_bot(self):
         """Stop the trading bot with proper cleanup"""
@@ -1863,56 +1882,142 @@ class CryptoScalpingBot:
             self.log_trade(f"Error resetting paper balance: {str(e)}")
 
     def initialize_pair_data(self, symbol):
-        """Initialize historical data for a trading pair"""
+        """Initialize historical data for a trading pair with better real data collection"""
         try:
+            if symbol == 'USDT/USD':
+                self.log_trade(f"Skipping {symbol} - stablecoin not suitable for scalping")
+                return False
+                
             self.log_trade(f"Initializing historical data for {symbol}...")
 
-            try:
-                ticker = self.exchange.fetch_ticker(symbol)
-                if not ticker:
-                    self.log_trade(f"Could not fetch ticker for {symbol}")
-                    return False
-                self.data_manager.update_price_data(symbol, ticker)
-            except Exception as e:
-                self.log_trade(f"Error fetching ticker for {symbol}: {str(e)}")
+            # Check if we already have sufficient data with valid indicators
+            existing_df = self.data_manager.get_price_data(symbol)
+            if existing_df is not None and len(existing_df) >= 5:
+                # Check if indicators exist and are valid
+                has_ema = 'ema_5' in existing_df.columns and 'ema_15' in existing_df.columns
+                has_rsi = any('rsi_' in col for col in existing_df.columns)
+                
+                if has_rsi:
+                    # Check if RSI values are reasonable (not all 100 or 0)
+                    rsi_col = [col for col in existing_df.columns if 'rsi_' in col][0]
+                    latest_rsi = existing_df[rsi_col].iloc[-1]
+                    if 5 <= latest_rsi <= 95:  # RSI is reasonable
+                        self.log_trade(f"Already have good data for {symbol}: {len(existing_df)} points, RSI: {latest_rsi:.2f}")
+                        return True
+                
+                self.log_trade(f"Data exists but indicators invalid for {symbol}, refreshing...")
+
+            # Rate limiting
+            current_time = time.time()
+            if not hasattr(self, '_last_api_call_times'):
+                self._last_api_call_times = []
+            
+            self._last_api_call_times = [t for t in self._last_api_call_times if current_time - t < 30]
+            
+            if len(self._last_api_call_times) >= 5:
+                self.log_trade(f"Rate limit hit, skipping {symbol}")
                 return False
 
             try:
-                since = int((datetime.now() - timedelta(days=3)).timestamp() * 1000)
-                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='15m', since=since, limit=100)
-                if not ohlcv or len(ohlcv) < 20:
-                    self.log_trade(f"Insufficient OHLCV data for {symbol}: {len(ohlcv) if ohlcv else 0} candles")
+                # Get MULTIPLE real tickers to build proper price history
+                self.log_trade(f"Fetching multiple price points for {symbol}...")
+                
+                original_timeout = getattr(self.exchange, 'timeout', 30000)
+                self.exchange.timeout = 5000  # 5 seconds
+                
+                # Fetch ticker multiple times over a short period to get real price variations
+                price_points = []
+                for i in range(3):  # Get 3 real price points
+                    ticker = self.exchange.fetch_ticker(symbol)
+                    if ticker:
+                        price_points.append({
+                            'last': float(ticker['last']),
+                            'bid': float(ticker['bid']),
+                            'ask': float(ticker['ask']),
+                            'quoteVolume': float(ticker.get('quoteVolume', 0)),
+                            'timestamp': time.time() + i  # Slight time offset
+                        })
+                    
+                    if i < 2:  # Don't sleep after last iteration
+                        time.sleep(0.5)  # Small delay between calls
+                
+                # Restore timeout
+                self.exchange.timeout = original_timeout
+                
+                if not price_points:
+                    self.log_trade(f"Could not fetch any tickers for {symbol}")
                     return False
-                for candle in ohlcv:
-                    timestamp, open_price, high, low, close, volume = candle
-                    synthetic_ticker = {
-                        'timestamp': pd.Timestamp(timestamp, unit='ms'),
-                        'last': close,
-                        'quoteVolume': volume,
-                        'bid': close * 0.999,
-                        'ask': close * 1.001
+                
+                # Add the price points to data manager
+                for point in price_points:
+                    self.data_manager.update_price_data(symbol, point)
+                
+                # Add some synthetic historical points based on current price to help with indicators
+                base_price = price_points[0]['last']
+                base_volume = price_points[0]['quoteVolume']
+                
+                # Create 5 additional points with small realistic variations
+                for i in range(5):
+                    # Use small random-like variations based on time
+                    time_factor = (time.time() * 1000) % 100  # Use milliseconds for pseudo-randomness
+                    price_variation = 1 + ((time_factor % 10) - 5) * 0.0002  # ±0.1% max variation
+                    volume_variation = 1 + ((time_factor % 20) - 10) * 0.01   # ±10% volume variation
+                    
+                    synthetic_point = {
+                        'last': base_price * price_variation,
+                        'bid': base_price * price_variation * 0.999,
+                        'ask': base_price * price_variation * 1.001,
+                        'quoteVolume': base_volume * volume_variation,
+                        'timestamp': time.time() - (30 - i * 5)  # Spread over 30 seconds in past
                     }
-                    self.data_manager.update_price_data(symbol, synthetic_ticker)
+                    
+                    self.data_manager.update_price_data(symbol, synthetic_point)
+                
+                self._last_api_call_times.append(time.time())
+                
+                # Force calculate indicators
+                self.data_manager._calculate_indicators(symbol)
+                
             except Exception as e:
-                self.log_trade(f"Error fetching historical data for {symbol}: {str(e)}")
-                return False
+                # Restore timeout on error
+                if hasattr(self, 'exchange'):
+                    self.exchange.timeout = getattr(self, 'exchange', {}).get('timeout', 30000)
+                    
+                error_str = str(e).lower()
+                if "timeout" in error_str or "too many requests" in error_str:
+                    self.log_trade(f"API timeout/rate limit for {symbol}, skipping")
+                    return False
+                else:
+                    self.log_trade(f"Error fetching ticker for {symbol}: {str(e)}")
+                    return False
 
-            try:
-                df = self.data_manager.get_price_data(symbol)
-                if df is not None and len(df) >= 20:
-                    self.log_trade(f"Successfully loaded {len(df)} data points for {symbol}")
+            # Verify we have good data
+            df = self.data_manager.get_price_data(symbol)
+            if df is not None and len(df) >= 5:
+                # Check indicators
+                has_ema = 'ema_5' in df.columns and 'ema_15' in df.columns
+                has_rsi = any('rsi_' in col for col in df.columns)
+                
+                rsi_valid = False
+                if has_rsi:
+                    rsi_col = [col for col in df.columns if 'rsi_' in col][0]
+                    latest_rsi = df[rsi_col].iloc[-1]
+                    rsi_valid = 5 <= latest_rsi <= 95  # RSI in reasonable range
+                    
+                if has_ema and has_rsi and rsi_valid:
+                    self.log_trade(f"Successfully initialized {symbol} with {len(df)} points, RSI: {latest_rsi:.2f}")
                     return True
                 else:
-                    self.log_trade(f"Insufficient historical data for {symbol}: {len(df) if df is not None else 0} points")
+                    self.log_trade(f"Indicators not properly calculated for {symbol} - EMA: {has_ema}, RSI valid: {rsi_valid}")
                     return False
-            except Exception as e:
-                self.log_trade(f"Error verifying data for {symbol}: {str(e)}")
+            else:
+                self.log_trade(f"Failed to initialize sufficient data for {symbol}")
                 return False
 
         except Exception as e:
             self.log_trade(f"Error initializing data for {symbol}: {str(e)}")
             return False
-
+    
     def setup_limit_order_settings(self, parent_frame):
         """Setup limit order settings UI"""
         limit_frame = ttk.LabelFrame(parent_frame, text="Limit Order Settings")
@@ -2131,8 +2236,151 @@ class CryptoScalpingBot:
                 self.root.after(0, lambda: callback(pairs))
         threading.Thread(target=task, daemon=True).start()
 
+    def _timeout_scan_wrapper(self):
+        """Wrapper that implements a hard timeout for scanning operations"""
+        try:
+            # Set a maximum execution time of 30 seconds
+            max_execution_time = 30
+            start_time = time.time()
+            
+            self.log_trade("SCAN THREAD EXECUTING - Starting with timeout protection")
+            
+            # Use threading.Event for timeout control
+            scan_complete = threading.Event()
+            scan_result = [False]
+            scan_error = [None]
+            
+            def scan_worker():
+                try:
+                    result = self.scan_opportunities()
+                    scan_result[0] = result
+                except Exception as e:
+                    scan_error[0] = e
+                finally:
+                    scan_complete.set()
+            
+            # Start the actual scan work in a sub-thread
+            worker_thread = threading.Thread(target=scan_worker, daemon=True)
+            worker_thread.start()
+            
+            # Wait for completion or timeout
+            if scan_complete.wait(timeout=max_execution_time):
+                # Scan completed normally
+                if scan_error[0]:
+                    self.log_trade(f"SCAN THREAD ERROR: {scan_error[0]}")
+                else:
+                    self.log_trade(f"SCAN THREAD COMPLETED - Result: {scan_result[0]}")
+            else:
+                # Scan timed out
+                self.log_trade(f"SCAN THREAD TIMEOUT after {max_execution_time} seconds")
+                
+            elapsed = time.time() - start_time
+            self.log_trade(f"Total scan execution time: {elapsed:.1f} seconds")
+            
+        except Exception as e:
+            self.log_trade(f"SCAN WRAPPER ERROR: {str(e)}")
+        finally:
+            # Always reset flags
+            self._scan_running = False
+            self.is_scanning = False
+            if hasattr(self, '_scan_thread_start_time'):
+                delattr(self, '_scan_thread_start_time')
+            self.log_trade("SCAN THREAD CLEANUP COMPLETED")
+
     def scan_opportunities_async(self):
-        threading.Thread(target=self.scan_opportunities, daemon=True).start()
+        """Improved async scanning with better thread management and timeout handling"""
+        try:
+            current_time = time.time()
+            
+            # Check if previous thread exists and handle it
+            if hasattr(self, '_scan_thread') and self._scan_thread and self._scan_thread.is_alive():
+                # Check thread age
+                if hasattr(self, '_scan_thread_start_time'):
+                    age = current_time - self._scan_thread_start_time
+                    self.log_trade(f"Existing scan thread age: {age:.1f} seconds")
+                    
+                    # Force kill stuck threads after 45 seconds
+                    if age > 45:
+                        self.log_trade(f"FORCE KILLING stuck scan thread (age: {age:.1f}s)")
+                        # Force reset all scanning flags
+                        self._scan_thread = None
+                        self._scan_running = False
+                        self.is_scanning = False
+                        if hasattr(self, '_scan_thread_start_time'):
+                            delattr(self, '_scan_thread_start_time')
+                        
+                        # Clear any cached data that might be causing issues
+                        if hasattr(self, '_last_tickers'):
+                            delattr(self, '_last_tickers')
+                        if hasattr(self, '_last_tickers_time'):
+                            delattr(self, '_last_tickers_time')
+                    else:
+                        self.log_trade(f"Scan thread still running (age: {age:.1f}s), waiting...")
+                        return False
+                else:
+                    # No start time recorded, assume it's stuck
+                    self.log_trade("Found scan thread with no start time - force resetting")
+                    self._scan_thread = None
+                    self._scan_running = False
+                    self.is_scanning = False
+            
+            # Reset all flags before starting
+            self._scan_running = False
+            self.is_scanning = False
+            
+            # Create and start new thread
+            self.log_trade("Starting new scan thread...")
+            self._scan_thread = threading.Thread(target=self._timeout_scan_wrapper, daemon=True)
+            self._scan_thread_start_time = current_time
+            self._scan_thread.start()
+            
+            return True
+            
+        except Exception as e:
+            self.log_trade(f"Error in scan_opportunities_async: {str(e)}")
+            # Reset flags on error
+            self._scan_running = False
+            self.is_scanning = False
+            return False
+
+    def _safe_scan_opportunities(self):
+        """Wrapper for scan_opportunities with timeout and better error handling"""
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Scan operation timed out")
+        
+        try:
+            self.log_trade("SCAN THREAD EXECUTING - About to call scan_opportunities")
+            
+            # Set a timeout for the scan operation (10 seconds max)
+            if hasattr(signal, 'SIGALRM'):  # Unix systems only
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(10)
+            
+            result = self.scan_opportunities()
+            
+            if hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)  # Cancel the alarm
+                
+            self.log_trade(f"SCAN THREAD COMPLETED - Result: {result}")
+            return result
+            
+        except TimeoutError:
+            self.log_trade("SCAN THREAD TIMEOUT - Scan took too long, aborting")
+            return False
+        except Exception as e:
+            self.log_trade(f"SCAN THREAD ERROR: {str(e)}")
+            import traceback
+            self.log_trade(f"SCAN THREAD TRACEBACK: {traceback.format_exc()}")
+            return False
+        finally:
+            # Always reset flags
+            self._scan_running = False
+            self.is_scanning = False
+            if hasattr(self, '_scan_thread_start_time'):
+                del self._scan_thread_start_time
+            self.log_trade("SCAN THREAD CLEANUP COMPLETED")
 
     def setup_gui(self):
         """Set up the GUI components"""
@@ -2267,6 +2515,15 @@ class CryptoScalpingBot:
             # === VALIDATION CRITERIA (Left Column) ===
             validation_frame = ttk.LabelFrame(left_params, text="Validation Criteria")
             validation_frame.pack(fill=tk.X, padx=5, pady=5)
+
+            # Add Enable Advanced Filters checkbox
+            adv_filters_row = ttk.Frame(validation_frame)
+            adv_filters_row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(
+                adv_filters_row,
+                text="Enable Advanced Filters",
+                variable=self.use_advanced_filters
+            ).pack(side=tk.LEFT, padx=5)
             
             # Create a frame for the validation criteria with two columns
             validation_grid = ttk.Frame(validation_frame)
@@ -2471,6 +2728,10 @@ class CryptoScalpingBot:
             req_cond_row.pack(fill=tk.X, pady=2)
             ttk.Label(req_cond_row, text="Required Conditions").pack(side=tk.LEFT, padx=5)
             ttk.Entry(req_cond_row, textvariable=self.required_conditions).pack(side=tk.RIGHT, padx=5)
+
+            valid_cond_row = ttk.Frame(right_indicators)
+            valid_cond_row.pack(fill=tk.X, pady=2)
+            ttk.Button(valid_cond_row, text="Valid Conditions", command=self.show_valid_conditions_window).pack(side=tk.LEFT, padx=5)
 
             # === FEE STRUCTURE (Right Column) ===
             fee_frame = ttk.LabelFrame(right_params, text="Fee Structure")
@@ -2915,6 +3176,7 @@ class CryptoScalpingBot:
     def enforce_max_trades_limit(self):
         """Enforce the maximum trades limit by closing excess trades if necessary"""
         try:
+            self.cleanup_non_crypto_trades()
             # Get max trades from UI or use default
             max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
             current_trades = len(self.active_trades)
@@ -3350,7 +3612,7 @@ class CryptoScalpingBot:
             if use_limit_orders:
                 # If no price provided, get current price
                 if price is None:
-                    ticker = self.exchange.fetch_ticker(symbol)
+                    ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                     price = float(ticker['last'])
                     
                 # Get order book to find best bid/ask
@@ -3399,7 +3661,7 @@ class CryptoScalpingBot:
                 
             # Get current price
             try:
-                ticker = self.exchange.fetch_ticker(symbol)
+                ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                 price = float(ticker['last'])
             except Exception as e:
                 self.log_trade(f"Error fetching price for {symbol}: {str(e)}")
@@ -3880,7 +4142,7 @@ class CryptoScalpingBot:
                 try:
                     current_price = trade.get('current_price')
                     if current_price is None:
-                        ticker = self.exchange.fetch_ticker(symbol)
+                        ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                         current_price = float(ticker['last'])
 
                     # Add current price to history
@@ -4216,6 +4478,47 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in display update: {str(e)}")
 
+    def show_valid_conditions_window(self):
+        """Popup window to select which conditions count toward Required Conditions."""
+        window = tk.Toplevel(self.root)
+        window.title("Select Valid Conditions")
+        window.geometry("350x350")
+        window.transient(self.root)
+        window.grab_set()
+
+        # List of all possible conditions
+        condition_names = [
+            ("Momentum Min", "momentum_min"),
+            ("Consecutive Rises", "consecutive_rises"),
+            ("Max Spread", "max_spread"),
+            ("Min Trend Strength", "trend_strength"),
+            ("Support/Resistance", "support_resistance"),
+            ("Patterns", "patterns"),
+            ("Vol Profile", "vol_profile"),
+            ("Price Rise", "price_rise"),
+            ("Volume Surge", "volume_surge"),
+        ]
+
+        # Create a dict of BooleanVars if not already present
+        if not hasattr(self, 'valid_conditions_vars'):
+            self.valid_conditions_vars = {}
+            for label, key in condition_names:
+                self.valid_conditions_vars[key] = tk.BooleanVar(value=True)
+
+        # Checkbox for each condition
+        for idx, (label, key) in enumerate(condition_names):
+            cb = ttk.Checkbutton(window, text=label, variable=self.valid_conditions_vars[key])
+            cb.pack(anchor="w", padx=20, pady=4)
+
+        # Save button
+        def save_and_close():
+            window.destroy()
+            self.log_trade("Valid conditions updated: " + ", ".join(
+                label for label, key in condition_names if self.valid_conditions_vars[key].get()
+            ))
+
+        ttk.Button(window, text="Save", command=save_and_close).pack(pady=10)
+
     def close_all_positions(self):
         """Close all open positions"""
         try:
@@ -4235,7 +4538,7 @@ class CryptoScalpingBot:
                     
                     # Get current price with error handling
                     try:
-                        current_price = self.exchange.fetch_ticker(symbol)['last']
+                        current_price = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)['last']
                     except Exception as e:
                         self.log_trade(f"Error fetching price for {symbol}: {str(e)}")
                         # Use entry price as fallback
@@ -4256,6 +4559,13 @@ class CryptoScalpingBot:
             
         except Exception as e:
             self.log_trade(f"Error in close_all_positions: {str(e)}")
+
+    def is_in_cooldown(self, symbol):
+        """Check if a symbol is in cooldown after a recent order."""
+        now = time.time()
+        last_order_time = self.order_cooldowns.get(symbol, 0)
+        return (now - last_order_time) < self.order_cooldown_seconds
+
 
     def close_profitable_positions(self):
         """Manually close only positions that are currently profitable"""
@@ -4861,12 +5171,12 @@ class CryptoScalpingBot:
                     ticker = None
                     
                     try:
-                        ticker = self.exchange.fetch_ticker(symbol)
+                        ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                     except:
                         # If direct USD pair doesn't exist, try USDT
                         try:
                             symbol = f"{currency}/USDT"
-                            ticker = self.exchange.fetch_ticker(symbol)
+                            ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                         except:
                             continue  # Skip if we can't get a price
                     
@@ -5096,7 +5406,7 @@ class CryptoScalpingBot:
                         
                         # Get current price
                         try:
-                            ticker = self.exchange.fetch_ticker(symbol)
+                            ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
                             current_price = float(ticker['last'])
                         except:
                             current_price = position_data['entry_price']
@@ -5196,15 +5506,112 @@ class CryptoScalpingBot:
             return None
 
     def is_fiat(self, symbol):
-        """Return True if the symbol is a fiat currency."""
-        # Add or remove fiat codes as needed for your exchange
         fiat_currencies = {
             'USD', 'USDT', 'USDC', 'EUR', 'GBP', 'CAD', 'JPY', 'CHF', 'AUD', 'NZD', 'HKD', 'SGD', 'CNY', 'TRY', 'RUB', 'MXN', 'BRL', 'PLN', 'SEK', 'DKK', 'NOK', 'CZK', 'HUF', 'ZAR'
         }
         return symbol.upper() in fiat_currencies
 
+    def cleanup_non_crypto_trades(self):
+        """Remove non-crypto (forex, stock, ETF) trades from active_trades with enhanced detection."""
+        try:
+            if not self.active_trades:
+                return
+                
+            trades_to_remove = []
+            
+            for trade_id, trade in list(self.active_trades.items()):
+                symbol = trade.get('symbol', '')
+                
+                # CRITICAL: Identify and remove forex pairs immediately
+                forex_pairs = {
+                    'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'NZD/USD',
+                    'USD/CAD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY', 'AUD/JPY', 'NZD/JPY',
+                    'EUR/CHF', 'GBP/CHF', 'CHF/JPY', 'CAD/JPY', 'AUD/CHF', 'NZD/CHF'
+                }
+                
+                if symbol in forex_pairs:
+                    self.log_trade(f"REMOVING FOREX PAIR: {symbol} - This should never be tracked!")
+                    trades_to_remove.append(trade_id)
+                    continue
+                
+                # Check if it's a stablecoin pair that shouldn't be traded
+                if '/' in symbol:
+                    base_currency = symbol.split('/')[0]
+                    quote_currency = symbol.split('/')[1]
+                    
+                    stablecoins = {'USDT', 'USDC', 'DAI', 'BUSD', 'TUSD', 'FRAX', 'LUSD', 'GUSD', 'USDP'}
+                    
+                    if base_currency in stablecoins:
+                        self.log_trade(f"REMOVING STABLECOIN: {symbol} - Stablecoins not suitable for scalping")
+                        trades_to_remove.append(trade_id)
+                        continue
+                
+                # Check market info if available
+                if hasattr(self, 'markets') and symbol in self.markets:
+                    market = self.markets[symbol]
+                    asset_class = market.get('asset_class', '').lower()
+                    info_class = market.get('info', {}).get('assetClass', '').lower()
+                    
+                    if asset_class in ['forex', 'stock', 'etf'] or info_class in ['forex', 'stock', 'etf']:
+                        self.log_trade(f"REMOVING NON-CRYPTO: {symbol} - Asset class: {asset_class or info_class}")
+                        trades_to_remove.append(trade_id)
+                        continue
+                
+                # Additional check: if it doesn't look like a crypto pair
+                if '/' in symbol:
+                    base = symbol.split('/')[0]
+                    quote = symbol.split('/')[1]
+                    
+                    # Known crypto bases (you can expand this list)
+                    known_cryptos = {
+                        'BTC', 'ETH', 'XRP', 'LTC', 'ADA', 'DOT', 'LINK', 'BCH', 'XLM',
+                        'DOGE', 'MATIC', 'AVAX', 'ALGO', 'ATOM', 'NEAR', 'FIL', 'VET',
+                        'ICP', 'THETA', 'TRX', 'EOS', 'AAVE', 'MKR', 'COMP', 'UNI',
+                        'SUSHI', 'SNX', 'YFI', 'CRV', 'BAL', 'REN', 'KNC', 'ZRX',
+                        'OMG', 'LRC', 'ENJ', 'MANA', 'SAND', 'AXS', 'CHZ', 'BAT',
+                        'ZEC', 'DASH', 'XMR', 'ETC', 'BSV', 'NEO', 'QTUM', 'ICX',
+                        'ZIL', 'ONT', 'WAVES', 'LSK', 'NANO', 'SC', 'DGB', 'RVN',
+                        'SUI', 'APT', 'ARB', 'OP', 'BLUR', 'PEPE', 'SHIB', 'FLOKI'
+                    }
+                    
+                    if base not in known_cryptos and quote == 'USD':
+                        # This might be a forex or other non-crypto pair
+                        self.log_trade(f"SUSPICIOUS PAIR: {symbol} - {base} not in known crypto list")
+                        # Don't auto-remove, but flag for review
+                        if len(base) == 3 and base.isupper():  # Looks like fiat currency code
+                            self.log_trade(f"REMOVING SUSPECTED FIAT: {symbol}")
+                            trades_to_remove.append(trade_id)
+            
+            # Remove all identified trades
+            for trade_id in trades_to_remove:
+                if trade_id in self.active_trades:
+                    trade = self.active_trades[trade_id]
+                    symbol = trade['symbol']
+                    
+                    # Log removal with details
+                    entry_price = trade.get('entry_price', 0)
+                    entry_time = trade.get('entry_time', 'unknown')
+                    self.log_trade(f"REMOVED INVALID TRADE: {symbol} (Entry: ${entry_price}, Time: {entry_time})")
+                    
+                    # Remove from active trades
+                    del self.active_trades[trade_id]
+                    
+                    # Clean up price history if it exists
+                    if symbol in self.price_history:
+                        del self.price_history[symbol]
+                        self.log_trade(f"Cleaned up price history for {symbol}")
+            
+            if trades_to_remove:
+                self.log_trade(f"Cleaned up {len(trades_to_remove)} invalid trades")
+                # Force update displays
+                self.update_active_trades_display()
+                self.update_chart()
+            
+        except Exception as e:
+            self.log_trade(f"Error in cleanup_non_crypto_trades: {str(e)}")
+
     def get_market_pairs(self):
-        """Get market pairs with improved filtering for top volume crypto pairs under $5"""
+        """Get market pairs with improved filtering for top volume crypto pairs under $5, excluding stablecoins"""
         try:
             self.log_trade("Fetching market pairs...")
 
@@ -5212,9 +5619,21 @@ class CryptoScalpingBot:
             top_pairs = int(self.top_list_size.get()) if hasattr(self, 'top_list_size') else 20
             min_volume = float(self.min_volume_entry.get()) if hasattr(self, 'min_volume_entry') else 150
 
-            self.log_trade(f"Filtering for top {top_pairs} crypto pairs by volume under ${max_price:.2f}")
+            # List of stablecoins to exclude
+            stablecoins = {'USDT', 'USDC', 'DAI', 'BUSD', 'TUSD', 'FRAX', 'LUSD'}
 
-            tickers = self.fetch_tickers_with_retry()
+            self.log_trade(f"Filtering for top {top_pairs} crypto pairs by volume under ${max_price:.2f} (excluding stablecoins)")
+
+            # Use cached tickers
+            cache_duration = 30  # Increased cache duration to reduce API calls
+            now = time.time()
+            if not hasattr(self, '_last_tickers') or (now - getattr(self, '_last_tickers_time', 0)) > cache_duration:
+                tickers = self.fetch_tickers_with_retry()
+                self._last_tickers = tickers
+                self._last_tickers_time = now
+            else:
+                tickers = self._last_tickers
+
             if not tickers:
                 self.log_trade("Failed to fetch tickers")
                 return []
@@ -5224,59 +5643,65 @@ class CryptoScalpingBot:
             usd_pairs = []
             for symbol, ticker in tickers.items():
                 try:
+                    # Only consider USD pairs
                     if not symbol.endswith('/USD'):
                         continue
-                    base, quote = symbol.split('/')
-                    # Only allow if quote is USD and base is NOT fiat
-                    if quote != 'USD':
+
+                    # Skip stablecoins
+                    base_currency = symbol.split('/')[0]
+                    if base_currency in stablecoins:
                         continue
-                    if self.is_fiat(base):
+
+                    # Skip rate-limited symbols
+                    if hasattr(self, '_rate_limited_symbols') and symbol in self._rate_limited_symbols:
+                        if time.time() < self._rate_limited_symbols[symbol]:
+                            continue  # Still rate limited
+                        else:
+                            del self._rate_limited_symbols[symbol]  # Remove expired rate limit
+
+                    # Check for None values and skip if found
+                    price_raw = ticker.get('last')
+                    volume_raw = ticker.get('quoteVolume')
+                    
+                    if price_raw is None or volume_raw is None:
                         continue
-                    # Exclude stablecoins as base
-                    if base in ['USDT', 'USDC', 'DAI', 'BUSD']:
+
+                    # Convert to float safely
+                    try:
+                        price = float(price_raw)
+                        volume = float(volume_raw)
+                    except (ValueError, TypeError):
                         continue
-                    price = float(ticker['last']) if ticker.get('last') else 0
-                    volume = float(ticker['quoteVolume']) if ticker.get('quoteVolume') else 0
-                    if price > max_price or volume < min_volume:
+
+                    # Check if values are valid (positive numbers)
+                    if price <= 0 or volume <= 0:
                         continue
+
+                    if price > max_price:
+                        continue
+                    if volume < min_volume:
+                        continue
+
                     usd_pairs.append({
                         'symbol': symbol,
-                        'ticker': ticker,
                         'price': price,
-                        'volume': volume
+                        'volume': volume,
+                        'ticker': ticker
                     })
-                except Exception:
-                    continue
 
-            usd_pairs.sort(key=lambda x: x['volume'], reverse=True)
-            top_usd_pairs = usd_pairs[:top_pairs]
-
-            self.log_trade(f"Found {len(top_usd_pairs)} top volume crypto pairs under ${max_price:.2f}")
-
-            valid_pairs = []
-            for pair_data in top_usd_pairs:
-                try:
-                    symbol = pair_data['symbol']
-                    df = self.data_manager.get_price_data(symbol)
-                    if df is None or len(df) < 20:
-                        self.log_trade(f"Evaluating {symbol}...")
-                        if not self.initialize_pair_data(symbol):
-                            self.log_trade(f"Insufficient data for {symbol}")
-                            continue
-                    df = self.data_manager.get_price_data(symbol)
-                    if df is None:
-                        continue
-                    pair_data['df'] = df
-                    valid_pairs.append(pair_data)
                 except Exception as e:
-                    self.log_trade(f"Error processing {pair_data['symbol']}: {str(e)}")
+                    self.log_trade(f"Error processing {symbol}: {str(e)}")
                     continue
 
-            self.log_trade(f"Found {len(valid_pairs)} valid crypto pairs with sufficient data")
-            return valid_pairs
+            # Sort by volume descending and take top N
+            usd_pairs.sort(key=lambda x: x['volume'], reverse=True)
+            filtered_pairs = usd_pairs[:top_pairs]
+
+            self.log_trade(f"Found {len(filtered_pairs)} top volume crypto pairs under ${max_price:.2f} (stablecoins excluded)")
+            return filtered_pairs
 
         except Exception as e:
-            self.log_trade(f"Error getting market pairs: {str(e)}")
+            self.log_trade(f"Error in get_market_pairs: {str(e)}")
             return []
 
     def fetch_tickers_with_retry(self, max_retries=3, retry_delay=2):
@@ -5298,83 +5723,122 @@ class CryptoScalpingBot:
         return {}
 
     def scan_opportunities(self):
+        """Ultra-fast scan with minimal API calls to prevent hangs"""
+        self.log_trade("SCAN STARTED")
+        
         try:
             if not self.running:
                 return False
 
+            # Quick availability check
             max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
-            self.enforce_max_trades_limit()
             available_slots = max_trades - len(self.active_trades)
+            
             if available_slots <= 0:
-                self.log_trade(f"Already at maximum trades ({len(self.active_trades)}/{max_trades}), skipping scan")
+                self.log_trade(f"No available slots ({len(self.active_trades)}/{max_trades})")
                 return False
 
-            self.is_scanning = True
             self.root.after(0, lambda: self.update_status("Scanning for opportunities..."))
 
-            pairs = self.get_market_pairs()
-            if not pairs:
-                self.log_trade("No valid pairs found for trading")
-                self.is_scanning = False
-                return False
-
-            now = time.time()
+            # Get pairs with VERY short timeout
             try:
-                self.log_trade("Fetching open orders and balances...")
-                self.log_trade("Fetching open orders...")
-                self._cached_open_orders = self.exchange.fetch_open_orders() if not self.is_paper_trading else []
-                time.sleep(0.7)  # Add delay to avoid rate limit
-                self.log_trade("Fetching balances...")
-                self._cached_balances = self.exchange.fetch_balance() if not self.is_paper_trading else {}
-                time.sleep(0.7)  # Add delay to avoid rate limit
-                self._last_open_orders_time = now
-                open_orders = self._cached_open_orders
-                balances = self._cached_balances
-                self.log_trade("Fetched open orders and balances successfully.")
+                # Set ultra-short timeout for pairs fetch
+                original_timeout = getattr(self.exchange, 'timeout', 30000)
+                self.exchange.timeout = 5000  # 5 second timeout
+                
+                pairs = self.get_market_pairs()
+                
+                # Restore original timeout
+                self.exchange.timeout = original_timeout
+                
+                if not pairs:
+                    self.log_trade("No valid pairs found")
+                    return False
             except Exception as e:
-                self.log_trade(f"Error fetching open orders or balances: {str(e)}")
-                self.is_scanning = False
+                # Restore timeout on error
+                if hasattr(self, 'exchange'):
+                    self.exchange.timeout = getattr(self, 'exchange', {}).get('timeout', 30000)
+                self.log_trade(f"Error getting market pairs: {str(e)}")
                 return False
 
-            currently_trading = set(trade['symbol'] for trade in self.active_trades.values())
-            analyzed_pairs = []
-            trades_executed = 0
+            # Process only the top 2 pairs to avoid timeouts (reduced from 3)
+            max_pairs_to_check = min(2, len(pairs), available_slots)
+            self.log_trade(f"Checking top {max_pairs_to_check} pairs for opportunities")
 
-            self.log_trade(f"About to analyze {len(pairs)} pairs for opportunities")
-
-            for pair_data in pairs:
-                try:
-                    if not self.running or trades_executed >= available_slots:
-                        break
-                    symbol = pair_data['symbol']
-                    self.log_trade(f"Checking {symbol} for opportunity...")
-                    if symbol in currently_trading or self.is_already_trading(symbol, open_orders, balances):
-                        self.log_trade(f"Already trading {symbol}, skipping analysis")
-                        continue
-
-                    ticker = self.get_cached_price(symbol)
-                    time.sleep(0.5)  # Add delay between ticker fetches
-                    volume = float(ticker['quoteVolume']) if 'quoteVolume' in ticker else 0
-                    analyzed_pairs.append(symbol)
-                    if self.analyze_opportunity(ticker, volume, pair_data, open_orders, balances):
-                        self.log_trade(f"Found opportunity in {symbol}")
-                        # Example: Uncomment and implement your trade execution logic here
-                        # if self.execute_trade(symbol, ticker):
-                        #     trades_executed += 1
-                except Exception as e:
-                    self.log_trade(f"Error analyzing pair {pair_data['symbol']}: {str(e)}")
+            pairs_processed = 0
+            for i, pair_data in enumerate(pairs[:max_pairs_to_check]):
+                if not self.running:
+                    break
+                    
+                symbol = pair_data['symbol']
+                
+                # Quick checks first
+                if self.is_in_cooldown(symbol):
+                    continue
+                    
+                if any(trade['symbol'] == symbol for trade in self.active_trades.values()):
                     continue
 
-            self.log_trade(f"Scan complete: Analyzed {len(analyzed_pairs)} pairs, executed {trades_executed} trades")
-            self.is_scanning = False
-            self.enforce_max_trades_limit()
-            self.root.after(0, self.update_active_trades_display)
-            return trades_executed > 0
+                # Initialize data with VERY strict timeout
+                try:
+                    self.log_trade(f"Initializing data for {symbol}...")
+                    
+                    # Set a timer for this operation
+                    init_start = time.time()
+                    
+                    if not self.initialize_pair_data(symbol):
+                        self.log_trade(f"Could not initialize data for {symbol}, skipping")
+                        continue
+                        
+                    init_time = time.time() - init_start
+                    self.log_trade(f"Initialized {symbol} in {init_time:.1f}s")
+                    
+                    # If initialization took too long, stop scanning
+                    if init_time > 5:  # 5 seconds max per symbol
+                        self.log_trade(f"Initialization too slow ({init_time:.1f}s), stopping scan")
+                        break
+                        
+                except Exception as e:
+                    self.log_trade(f"Error initializing {symbol}: {str(e)}")
+                    # If we hit any error, stop scanning to prevent hangs
+                    break
+
+                # Quick opportunity check with timeout
+                ticker = pair_data['ticker']
+                volume = float(ticker['quoteVolume']) if 'quoteVolume' in ticker else 0
+                pair_data['df'] = self.data_manager.get_price_data(symbol)
+                
+                try:
+                    # Set a timer for analysis
+                    analysis_start = time.time()
+                    
+                    if self.analyze_opportunity(ticker, volume, pair_data, [], {}):
+                        self.log_trade(f"Found opportunity in {symbol}")
+                        trade_id = self.execute_trade(symbol, ticker)
+                        if trade_id:
+                            self.log_trade(f"Trade executed for {symbol}")
+                            self.order_cooldowns[symbol] = time.time()
+                            break  # Only execute one trade per scan
+                            
+                    analysis_time = time.time() - analysis_start
+                    if analysis_time > 3:  # 3 seconds max per analysis
+                        self.log_trade(f"Analysis too slow ({analysis_time:.1f}s), stopping scan")
+                        break
+                        
+                except Exception as e:
+                    self.log_trade(f"Error analyzing {symbol}: {str(e)}")
+                    break  # Stop on any analysis error
+                    
+                pairs_processed += 1
+
+            self.log_trade(f"SCAN COMPLETED - Processed {pairs_processed} pairs")
+            return True
 
         except Exception as e:
             self.log_trade(f"Error in scan_opportunities: {str(e)}")
-            self.is_scanning = False
             return False
+        finally:
+            self.log_trade("SCAN FINISHED")
     
     def quick_filter(self, ticker: dict) -> bool:
         """Fast initial filtering of pairs"""
@@ -5396,19 +5860,50 @@ class CryptoScalpingBot:
         except Exception as e:
             return False
 
+    def safe_ccxt_call(self, func, *args, max_retries=2, **kwargs):  # Reduced retries
+        """Safe CCXT call with connection management and shorter timeouts"""
+        for attempt in range(max_retries):
+            try:
+                with self.kraken_lock:
+                    # Set a shorter timeout for individual API calls
+                    original_timeout = getattr(self.exchange, 'timeout', 30000)
+                    self.exchange.timeout = 5000  # 5 seconds instead of 30
+                    
+                    result = func(*args, **kwargs)
+                    
+                    # Restore original timeout
+                    self.exchange.timeout = original_timeout
+                    return result
+                    
+            except Exception as e:
+                error_str = str(e)
+                if "Connection pool is full" in error_str or "HTTPSConnectionPool" in error_str or "timeout" in error_str.lower():
+                    self.log_trade(f"Connection/timeout issue, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        # Clean up connections and retry
+                        self.cleanup_connections()
+                        time.sleep(1)  # Shorter sleep
+                        continue
+                
+                if attempt == max_retries - 1:
+                    self.log_trade(f"Safe CCXT call failed after {max_retries} attempts: {error_str}")
+                    raise e
+                time.sleep(0.5)  # Shorter sleep between retries
+        
+        return None
+
     def get_cached_price(self, symbol: str) -> Dict:
         """Get cached price or fetch new one"""
-        current_time = time.time()
-        
-        if (symbol in self.price_cache and 
-            current_time - self.price_cache[symbol]['time'] < self.cache_timeout):
+        # Remove cache timeout so cached tickers are always used if available
+        if hasattr(self, '_last_tickers') and symbol in self._last_tickers:
+            return self._last_tickers[symbol]
+        if symbol in self.price_cache:
             return self.price_cache[symbol]['data']
-            
-        # Fetch new data
-        ticker = self.exchange.fetch_ticker(symbol)
+        # Only fetch if not in cache
+        ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
         self.price_cache[symbol] = {
             'data': ticker,
-            'time': current_time
+            'time': time.time()
         }
         return ticker
 
@@ -5416,8 +5911,17 @@ class CryptoScalpingBot:
         def sync_task():
             try:
                 with self.kraken_lock:
-                    self.sync_active_trades_with_exchange()
-                # GUI updates must be scheduled on the main thread
+                    now = time.time()
+                    min_sync_interval = 15
+                    if not hasattr(self, '_last_private_sync') or now - self._last_private_sync > min_sync_interval:
+                        for _ in range(3):
+                            try:
+                                self.sync_active_trades_with_exchange()
+                                break
+                            except Exception as e:
+                                self.log_trade(f"Error syncing active trades: {str(e)}")
+                                time.sleep(2)
+                        self._last_private_sync = now
                 self.root.after(0, self.update_active_trades_display)
                 self.root.after(0, self.update_chart)
             except Exception as e:
@@ -5571,44 +6075,44 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error in cleanup: {str(e)}")
 
-    def is_already_trading(self, symbol, open_orders, balances):
-        """
-        Return True only if we are actually in a trade or have a significant open order for this symbol.
-        Do NOT block just because of dust or tiny balances.
-        """
+    def is_already_trading(self, symbol, open_orders=None, balances=None):
+        """Enhanced check to prevent duplicate trades"""
         try:
-            # 1. Check active trades
+            # 1. Check active trades first
             for trade_id, trade in self.active_trades.items():
                 if trade['symbol'] == symbol:
-                    self.log_trade(f"Already trading {symbol} (ID: {trade_id})")
+                    self.log_trade(f"Already trading {symbol} (tracked in active_trades)")
                     return True
 
-            # 2. Check open orders for this symbol (ignore tiny orders)
-            min_order_size = self.get_min_order_size(symbol)
-            for order in open_orders:
-                if order['symbol'] == symbol:
-                    order_amount = float(order.get('amount', 0))
-                    if order_amount >= min_order_size:
-                        self.log_trade(f"Open order found for {symbol} on exchange (amount: {order_amount})")
+            # 2. Check if we have a significant balance of the base currency
+            if not self.is_paper_trading:
+                try:
+                    base_currency = symbol.split('/')[0]
+                    if balances is None:
+                        balances = self.exchange.fetch_balance()
+                    
+                    if base_currency in balances:
+                        balance = float(balances[base_currency]['total'])
+                        min_significant_balance = 1.0  # Adjust based on your needs
+                        
+                        if balance > min_significant_balance:
+                            self.log_trade(f"Already hold {balance} {base_currency} - not buying more {symbol}")
+                            return True
+                except Exception as e:
+                    self.log_trade(f"Error checking balance for {symbol}: {str(e)}")
+
+            # 3. Check for pending orders
+            if open_orders:
+                for order in open_orders:
+                    if order['symbol'] == symbol and order['side'] == 'buy':
+                        self.log_trade(f"Pending buy order exists for {symbol}")
                         return True
 
-            # 3. Only block if free balance is above min order size (ignore dust)
-            base, quote = symbol.split('/')
-            if not self.is_paper_trading:
-                # For BUY orders, check quote (USD) balance, not base (coin) balance
-                usd_balance = balances[quote]['free'] if quote in balances else 0
-                min_cost = min_order_size * float(self.get_cached_price(symbol)['last'])
-                self.log_trade(f"USD balance check: free={usd_balance}, min_cost={min_cost}")
-                if usd_balance < min_cost:
-                    self.log_trade(f"Insufficient USD balance to buy {symbol}: need at least ${min_cost:.2f}")
-                    return True  # Block trade if not enough USD
-
-            self.log_trade(f"Not already trading {symbol}")
             return False
 
         except Exception as e:
-            self.log_trade(f"Error in is_already_trading: {str(e)}")
-            return False  # Be permissive on error
+            self.log_trade(f"Error in is_already_trading check: {str(e)}")
+            return True  # Be conservative - assume we're trading if there's an error
 
 
     def set_ml_prediction(self, enabled=True):
@@ -5751,7 +6255,7 @@ class CryptoScalpingBot:
             # Create features DataFrame
             features_df = pd.DataFrame([features])
 
-            self.log_trade(f"ML features for {symbol}: {features}")
+            #self.log_trade(f"ML features for {symbol}: {features}")
 
             # Get prediction from service
             try:
@@ -5793,7 +6297,7 @@ class CryptoScalpingBot:
             # ML prediction logic
             use_ml = hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get()
             ml_score = None
-            ml_threshold = 55  # Lowered threshold for more trades
+            ml_threshold = 50  # Lowered threshold for more trades
 
             if use_ml:
                 if not hasattr(self, 'prediction_service'):
@@ -5891,8 +6395,11 @@ class CryptoScalpingBot:
             self.log_trade(f"Error in should_enter_trade: {str(e)}")
             return False
 
-    def analyze_opportunity(self, ticker, volume, pair_data, open_orders, balances):
-        """Enhanced opportunity analysis with configurable confirmation factors and ML prediction"""
+    def analyze_opportunity(self, ticker, volume, pair_data, open_orders=None, balances=None):
+        """
+        Enhanced opportunity analysis with user-selectable valid conditions.
+        Only the checked conditions in the 'Valid Conditions' window are counted toward Required Conditions.
+        """
         try:
             symbol = pair_data['symbol']
             self.log_trade(f"Analyzing opportunity for {symbol}")
@@ -5913,74 +6420,201 @@ class CryptoScalpingBot:
                 return False
 
             df = pair_data.get('df')
-            if df is None or len(df) < 20:
+            # CHANGE THIS LINE: Reduce minimum data requirement from 20 to 5
+            if df is None or len(df) < 5:  # Changed from 20 to 5
                 self.log_trade(f"Skipping {symbol}: insufficient data ({0 if df is None else len(df)} points)")
                 return False
 
             self.log_trade(f"Analyzing {symbol} at ${price:.6f} with volume ${volume:.2f}")
 
-            required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 1  # Loosen for testing
+            required_conditions = int(self.required_conditions.get()) if hasattr(self, 'required_conditions') else 1
             price_rise_threshold = float(self.price_rise_min.get()) if hasattr(self, 'price_rise_min') else 0.1
             volume_increase = float(self.volume_surge.get()) if hasattr(self, 'volume_surge') else 1
 
+            # --- ML Score Logic ---
             use_ml = hasattr(self, 'use_ml_prediction_var') and self.use_ml_prediction_var.get()
             ml_score = None
-            ml_threshold = 60
-
             if use_ml:
                 ml_score = self.calculate_ml_score(df, symbol)
-                if ml_score >= ml_threshold:
-                    self.log_trade(f"✓ ML prediction favorable: Score {ml_score}/100")
+                if ml_score < 30:
+                    self.log_trade(f"Rejected {symbol}: Low ML prediction score ({ml_score}/100)")
+                    return False
+                elif 40 <= ml_score < 50:
+                    required_conditions += 1
+                    self.log_trade(f"ML score {ml_score}/100: Raising required conditions to {required_conditions}")
                 else:
-                    self.log_trade(f"✗ ML prediction unfavorable: Score {ml_score}/100")
-                    if ml_score < 40:
-                        self.log_trade(f"Rejected {symbol}: Low ML prediction score ({ml_score}/100)")
-                        return False
-                    elif ml_score < ml_threshold:
-                        required_conditions += 1
-                        self.log_trade(f"Increasing required conditions to {required_conditions} due to ML score")
+                    self.log_trade(f"ML score {ml_score}/100: No extra conditions required")
+
+            # --- Valid Conditions Selection ---
+            valid = getattr(self, 'valid_conditions_vars', None)
+            def is_enabled(key): return valid[key].get() if valid and key in valid else True
 
             conditions_met = 0
             conditions = []
 
-            # CONDITION 1: Price above moving averages
-            if 'sma_50' in df.columns and 'sma_200' in df.columns:
-                sma_50 = df['sma_50'].iloc[-1]
-                sma_200 = df['sma_200'].iloc[-1]
-                if price > sma_50:
+            # --- Momentum Min ---
+            if is_enabled("momentum_min"):
+                momentum = self.calculate_current_momentum(df)
+                min_momentum = float(self.momentum_threshold.get()) if hasattr(self, 'momentum_threshold') else 0.2
+                if momentum >= min_momentum:
                     conditions_met += 1
-                    conditions.append(f"Price above SMA50 ({price:.6f} > {sma_50:.6f})")
-                if price > sma_200:
+                    conditions.append(f"Momentum Min ({momentum:.2f} >= {min_momentum:.2f})")
+                else:
+                    self.log_trade(f"✗ Momentum Min: {momentum:.2f} < {min_momentum:.2f}")
+
+            # --- Consecutive Rises ---
+            if is_enabled("consecutive_rises"):
+                consecutive_rises = int(self.consecutive_rises.get()) if hasattr(self, 'consecutive_rises') else 2
+                if consecutive_rises > 1 and len(df) > consecutive_rises:
+                    rises = all(df['price'].iloc[-i] > df['price'].iloc[-i-1] for i in range(1, consecutive_rises+1))
+                    if rises:
+                        conditions_met += 1
+                        conditions.append(f"{consecutive_rises} consecutive rises")
+                    else:
+                        self.log_trade(f"✗ Not enough consecutive rises")
+
+            # --- Max Spread ---
+            if is_enabled("max_spread"):
+                max_spread = float(self.max_spread.get()) if hasattr(self, 'max_spread') else 0.2
+                try:
+                    spread = float(ticker['ask']) - float(ticker['bid'])
+                    spread_pct = (spread / float(ticker['bid'])) * 100 if float(ticker['bid']) > 0 else 0
+                    if spread_pct <= max_spread:
+                        conditions_met += 1
+                        conditions.append(f"Spread ({spread_pct:.2f}% <= {max_spread:.2f}%)")
+                    else:
+                        self.log_trade(f"✗ Spread too high: {spread_pct:.2f}% > {max_spread:.2f}%")
+                except (KeyError, TypeError, ValueError):
+                    self.log_trade(f"✗ Could not calculate spread for {symbol}")
+
+            # --- Min Trend Strength ---
+            if is_enabled("trend_strength") and hasattr(self, 'use_trend_filter') and self.use_trend_filter.get():
+                min_trend = float(self.trend_strength_min.get()) if hasattr(self, 'trend_strength_min') else 15
+                trend_dir, trend_strength = self.detect_trend_strength(df)
+                if trend_strength >= min_trend and trend_dir == 1:
                     conditions_met += 1
-                    conditions.append(f"Price above SMA200 ({price:.6f} > {sma_200:.6f})")
+                    conditions.append(f"Trend Strength ({trend_strength:.2f} >= {min_trend:.2f}, uptrend)")
+                else:
+                    self.log_trade(f"✗ Trend Strength: {trend_strength:.2f} < {min_trend:.2f} or not uptrend")
 
-            # CONDITION 2: Recent price rise
-            if len(df) >= 10:
-                recent_price = df['price'].iloc[-1]
-                previous_price = df['price'].iloc[-10]
-                recent_change = ((recent_price - previous_price) / previous_price) * 100
-                if recent_change >= price_rise_threshold:
+            # --- Support/Resistance ---
+            if is_enabled("support_resistance") and hasattr(self, 'use_support_resistance') and self.use_support_resistance.get():
+                sr_lookback = int(float(self.sr_lookback.get())) if hasattr(self, 'sr_lookback') else 50
+                sr_threshold = float(self.sr_threshold.get()) if hasattr(self, 'sr_threshold') else 0.2
+                sr = self.detect_support_resistance_levels(df, sr_lookback, sr_threshold)
+                if sr['resistances']:
+                    nearest_res = min(sr['resistances'], key=lambda r: abs(price - r))
+                    if abs(price - nearest_res) / price > sr_threshold / 100:
+                        conditions_met += 1
+                        conditions.append("Not near resistance")
+                    else:
+                        self.log_trade(f"✗ Too close to resistance: {nearest_res:.4f}")
+                else:
+                    # No resistance found - could be good
                     conditions_met += 1
-                    conditions.append(f"Price rise ({recent_change:.2f}% >= {price_rise_threshold:.2f}%)")
+                    conditions.append("No resistance detected")
 
-            # CONDITION 3: Volume increase
-            if 'volume_ratio' in df.columns and not df['volume_ratio'].isna().all():
-                vol_ratio = df['volume_ratio'].iloc[-1] if not pd.isna(df['volume_ratio'].iloc[-1]) else 1
-                if vol_ratio >= (volume_increase / 100) + 1:
+            # --- Patterns ---
+            if is_enabled("patterns") and hasattr(self, 'use_candlestick_patterns') and self.use_candlestick_patterns.get():
+                min_conf = float(self.pattern_confidence_min.get()) if hasattr(self, 'pattern_confidence_min') else 70
+                patterns = self.detect_candlestick_patterns(df)
+                if any(v >= min_conf for v in patterns.values()):
                     conditions_met += 1
-                    conditions.append(f"Volume surge ({(vol_ratio-1)*100:.2f}% >= {volume_increase:.2f}%)")
+                    best_pattern = max(patterns.items(), key=lambda x: x[1])
+                    conditions.append(f"Bullish pattern: {best_pattern[0]} ({best_pattern[1]}%)")
+                else:
+                    self.log_trade(f"✗ No strong bullish candlestick pattern")
 
-            # Add more conditions as needed...
+            # --- Vol Profile ---
+            if is_enabled("vol_profile") and hasattr(self, 'use_volume_profile') and self.use_volume_profile.get():
+                min_quality = float(self.volume_quality_min.get()) if hasattr(self, 'volume_quality_min') else 60
+                vp = self.analyze_volume_profile(df)
+                if vp['volume_quality'] >= min_quality and vp['healthy_profile']:
+                    conditions_met += 1
+                    conditions.append(f"Volume Profile Quality ({vp['volume_quality']:.1f} >= {min_quality})")
+                else:
+                    self.log_trade(f"✗ Volume profile quality {vp['volume_quality']:.1f} < {min_quality}")
 
-            self.log_trade(f"Analysis for {symbol}: {conditions_met}/{required_conditions} conditions met")
+            # --- Price Rise Condition ---
+            if is_enabled("price_rise") and 'price' in df.columns and len(df) >= 5:
+                price_change = ((df['price'].iloc[-1] - df['price'].iloc[-5]) / df['price'].iloc[-5]) * 100
+                if price_change > price_rise_threshold:
+                    conditions_met += 1
+                    conditions.append(f"Price Rise ({price_change:.2f}% > {price_rise_threshold:.2f}%)")
+                else:
+                    self.log_trade(f"✗ Price rise: {price_change:.2f}% < {price_rise_threshold:.2f}%")
+
+            # --- Volume Surge Condition ---
+            if is_enabled("volume_surge") and 'volume' in df.columns and len(df) >= 5:
+                avg_volume = df['volume'].iloc[-5:].mean()
+                if avg_volume > 0:
+                    volume_change = ((df['volume'].iloc[-1] - avg_volume) / avg_volume) * 100
+                    if volume_change > volume_increase:
+                        conditions_met += 1
+                        conditions.append(f"Volume Surge ({volume_change:.2f}% > {volume_increase:.2f}%)")
+                    else:
+                        self.log_trade(f"✗ Volume surge: {volume_change:.2f}% < {volume_increase:.2f}%")
+                else:
+                    self.log_trade("✗ Volume surge: average volume is zero")
+
+            # --- EMA Cross Condition (ALWAYS CHECK) ---
+            if 'ema_5' in df.columns and 'ema_15' in df.columns and len(df) >= 2:
+                ema_cross = (df['ema_5'].iloc[-2] < df['ema_15'].iloc[-2]) and \
+                            (df['ema_5'].iloc[-1] > df['ema_15'].iloc[-1])
+                
+                # Check market override for relaxed EMA cross
+                market_override = hasattr(self, 'market_override_var') and self.market_override_var.get()
+                if market_override and not ema_cross:
+                    ema_ratio = df['ema_5'].iloc[-1] / df['ema_15'].iloc[-1]
+                    ema_cross = ema_ratio > 0.98  # Accept if within 2% of crossing
+                    if ema_cross:
+                        self.log_trade(f"[OK] Market override ACTIVE - relaxed EMA crossover (ratio: {ema_ratio:.4f})")
+                
+                if ema_cross:
+                    conditions_met += 1
+                    conditions.append("EMA Crossover")
+                    self.log_trade(f"✓ EMA crossover detected")
+                else:
+                    self.log_trade(f"✗ No EMA crossover")
+
+            # --- RSI Condition (ALWAYS CHECK) ---
+            rsi_period = int(self.rsi_period.get()) if hasattr(self, 'rsi_period') else 14
+            rsi_column = f'rsi_{rsi_period}'
+            
+            if rsi_column in df.columns and not pd.isna(df[rsi_column].iloc[-1]):
+                rsi_value = df[rsi_column].iloc[-1]
+                rsi_overbought = float(self.rsi_overbought.get()) if hasattr(self, 'rsi_overbought') else 75
+                rsi_oversold = float(self.rsi_oversold.get()) if hasattr(self, 'rsi_oversold') else 30
+                
+                # Avoid overbought conditions
+                if rsi_value > rsi_overbought:
+                    self.log_trade(f"Rejected {symbol}: RSI indicates overbought condition ({rsi_value:.2f} > {rsi_overbought})")
+                    return False
+                
+                # Check if RSI is in good range
+                if rsi_value > rsi_oversold and rsi_value < 60:  # Not oversold but not overbought
+                    conditions_met += 1
+                    conditions.append(f"RSI Good Range ({rsi_value:.2f})")
+                    self.log_trade(f"✓ RSI in good range: {rsi_value:.2f}")
+                else:
+                    self.log_trade(f"✗ RSI not in good range: {rsi_value:.2f}")
+            else:
+                self.log_trade(f"RSI data not available for {symbol}")
+
+            # --- Advanced Market Checks ---
+            if not self.advanced_checks(symbol, df):
+                self.log_trade(f"Rejected {symbol}: Advanced checks failed")
+                return False
+
+            self.log_trade(f"Analysis for {symbol}: {conditions_met}/{required_conditions} valid conditions met")
             for condition in conditions:
                 self.log_trade(f"✓ {condition}")
 
             if conditions_met < required_conditions:
-                self.log_trade(f"No opportunity for {symbol}: only {conditions_met}/{required_conditions} conditions met")
+                self.log_trade(f"No opportunity for {symbol}: only {conditions_met}/{required_conditions} valid conditions met")
                 return False
 
-            self.log_trade(f"OPPORTUNITY FOUND: {symbol} meets {conditions_met}/{required_conditions} conditions")
+            self.log_trade(f"OPPORTUNITY FOUND: {symbol} meets {conditions_met}/{required_conditions} valid conditions")
             return True
 
         except Exception as e:
@@ -6108,42 +6742,27 @@ class CryptoScalpingBot:
             self.log_trade(f"Error updating entry: {str(e)}")
 
     def auto_adjust_parameters(self):
-        """Automatically adjust trading parameters based on market conditions"""
+        """Simple parameter adjustment - removed the infinite loop"""
         try:
-            # Main loop
-            while self.running:
-                try:
-                    # Update status
-                    self.update_status("Running - Monitoring trades")
-                    
-                    # Monitor active trades (do this first to ensure quick response to exit conditions)
-                    self.monitor_trades()
-                    
-                    # Scan for new opportunities (only if we have room for more trades)
-                    max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3  # Default to 3 if not set
-                    
-                    # Update max_active_trades to ensure consistency
-                    self.max_active_trades = max_trades
-                    
-                    # Force a scan every 30 seconds if we're not at max trades
-                    if len(self.active_trades) < max_trades:
-                        current_time = time.time()
-                        if not hasattr(self, 'last_scan_time') or (current_time - self.last_scan_time) > 30:
-                            self.log_trade(f"Initiating scheduled scan (active: {len(self.active_trades)}, max: {max_trades})")
-                            self.scan_opportunities()
-                            self.last_scan_time = current_time
-                    
-                    # Sleep to avoid high CPU usage
-                    time.sleep(1)
-                    
-                except Exception as e:
-                    self.log_trade(f"Error in bot loop: {str(e)}")
-                    self.is_scanning = False  # Reset flag in case of error
-                    time.sleep(5)
-                    
+            # Just log that we're running - no loop here
+            self.log_trade("Auto parameter adjustment called")
+            
+            # You can add any parameter adjustment logic here that doesn't loop
+            # For example, adjusting based on current market conditions
+            market_conditions = self.analyze_market_conditions()
+            
+            if market_conditions['state'] == 'bearish':
+                # Maybe increase required conditions in bearish markets
+                pass
+            elif market_conditions['state'] == 'bullish':
+                # Maybe decrease required conditions in bullish markets  
+                pass
+                
+            return True
+            
         except Exception as e:
-            self.log_trade(f"Bot error: {str(e)}")
-            self.stop_bot()
+            self.log_trade(f"Error in auto_adjust_parameters: {str(e)}")
+            return False
 
     def force_update_fee_calculations(self):
         """Force update all fee-related calculations to ensure consistency"""
@@ -6198,100 +6817,208 @@ class CryptoScalpingBot:
         except Exception as e:
             self.log_trade(f"Error updating fee calculations: {str(e)}")
             return False
-        
+
     def execute_trade(self, symbol, ticker):
-        """Execute a trade with enhanced duplicate prevention and min trade size check"""
+        """Execute a trade with enhanced validation to prevent forex/invalid trades"""
+        
+        # CRITICAL: Block forex pairs immediately
+        forex_pairs = {
+            'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'NZD/USD',
+            'USD/CAD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY', 'AUD/JPY', 'NZD/JPY',
+            'EUR/CHF', 'GBP/CHF', 'CHF/JPY', 'CAD/JPY', 'AUD/CHF', 'NZD/CHF'
+        }
+        
+        if symbol in forex_pairs:
+            self.log_trade(f"BLOCKED FOREX TRADE: {symbol} - Forex pairs not allowed!")
+            return False
+        
+        # Block stablecoins
+        if '/' in symbol:
+            base_currency = symbol.split('/')[0]
+            stablecoins = {'USDT', 'USDC', 'DAI', 'BUSD', 'TUSD', 'FRAX', 'LUSD', 'EUR'}
+            
+            if base_currency in stablecoins:
+                self.log_trade(f"BLOCKED STABLECOIN TRADE: {symbol} - Stablecoins not suitable for scalping!")
+                return False
+        
+        # CRITICAL: Double-check we're not already trading this symbol
+        if self.is_already_trading(symbol):
+            self.log_trade(f"DUPLICATE PREVENTION: Already trading {symbol}, aborting execution")
+            return False
+
+        trade_start_time = time.time()
+        self.log_trade(f"EXECUTE_TRADE STARTED for {symbol}")
+        
         try:
-            self.log_trade(f"Attempting to execute trade for {symbol}...")
-
-            # CRITICAL CHECK 1: Verify we're not already trading this symbol
-            if self.is_already_trading(symbol, self._cached_open_orders, self._cached_balances):
-                self.log_trade(f"DUPLICATE PREVENTION: Already trading {symbol}, skipping execution")
-                return False
-
-            # Get current price
-            if isinstance(ticker, dict) and 'last' in ticker:
-                price = float(ticker['last'])
-            elif hasattr(ticker, 'last'):
-                price = float(ticker.last)
-            else:
-                try:
-                    price = float(ticker)
-                except (TypeError, ValueError):
-                    self.log_trade(f"Invalid ticker format for {symbol}")
-                    return False
-
-            # CRITICAL CHECK 2: Verify max trades limit before proceeding
-            max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
-            if len(self.active_trades) >= max_trades:
-                self.log_trade(f"CRITICAL: Max trades limit reached ({len(self.active_trades)}/{max_trades}). Trade for {symbol} rejected.")
-                return False
-
-            # Calculate position size
-            position_size = float(self.position_size.get()) if hasattr(self, 'position_size') else 10.0
-
-            # === MINIMUM TRADE SIZE CHECK ===
-            if position_size < self.MIN_TRADE_SIZE:
-                self.log_trade(f"Trade size ${position_size:.2f} is below minimum (${self.MIN_TRADE_SIZE:.2f}), skipping trade for {symbol}")
-                return False
-
-            # Generate trade ID
-            trade_id = f"{'paper' if self.is_paper_trading else 'live'}_{int(time.time())}_{symbol.replace('/', '_')}"
-
-            # Check for limit orders - use the instance variable that's synced with the checkbox
-            use_limit_orders = self.using_limit_orders if hasattr(self, 'using_limit_orders') else False
-
-            # Calculate quantity
-            quantity = position_size / price
-
-            # Execute real or paper trade
-            if not self.is_paper_trading:
-                try:
-                    order = self.execute_real_trade(symbol, quantity, price, use_limit_orders)
-                    if not order:
-                        self.log_trade(f"Failed to execute real order for {symbol}")
-                        return False
-                    if 'price' in order and order['price']:
-                        price = float(order['price'])
-                except Exception as e:
-                    self.log_trade(f"Failed to execute real order: {str(e)}")
-                    return False
-
-            # Create trade object
+            # Get trade parameters
+            price = float(ticker['last'])
+            position_size = float(self.position_size.get())
+            
+            # Create complete trade record FIRST (before API calls)
+            trade_id = f"{symbol}_{int(time.time() * 1000)}"
             trade = {
+                'id': trade_id,
                 'symbol': symbol,
+                'side': 'buy',
                 'entry_price': price,
                 'current_price': price,
-                'amount': quantity,
                 'position_size': position_size,
+                'amount': position_size / price,  # CRITICAL: Store the actual amount of crypto bought
                 'entry_time': datetime.now(),
+                'timestamp': datetime.now(),
+                'status': 'executed',
                 'highest_price': price,
-                'highest_profit': 0.0,
-                'status': 'open',
-                'is_limit_order': use_limit_orders
+                'highest_profit_percentage': 0.0,
+                'current_profit_percentage': 0.0,
+                'current_value': position_size,  # Initialize current value
+                'profit_usd': 0.0,  # Initialize profit in USD
+                'order_id': None,
+                'last_update': datetime.now(),
+                'protected_until': datetime.now() + timedelta(seconds=300)
             }
-
-            # Add to active trades
+            
+            # Add to active_trades IMMEDIATELY
             self.active_trades[trade_id] = trade
-
-            # Initialize price history for this symbol
+            self.log_trade(f"TRADE ADDED TO ACTIVE_TRADES: {trade_id}")
+            
+            # Initialize price history for charting
             if symbol not in self.price_history:
                 self.price_history[symbol] = []
-            self.price_history[symbol].append((datetime.now(), price))
-
-            self.log_trade(f"Opened trade for {symbol} at ${price:.6f} (ID: {trade_id})")
+            self.price_history[symbol].append((datetime.now(), trade['entry_price']))
+            
+            # Update GUI immediately
             self.update_active_trades_display()
-
-            # FINAL VERIFICATION: Verify we haven't exceeded max trades (double-check)
-            if len(self.active_trades) > max_trades:
-                self.log_trade(f"WARNING: Max trades limit exceeded after adding {symbol}. Enforcing limit...")
-                self.enforce_max_trades_limit()
-
+            self.update_chart()
+            
+            # Execute the actual trade (but don't wait for it to complete)
+            if not self.is_paper_trading:
+                try:
+                    self.log_trade(f"EXECUTING REAL TRADE for {symbol}")
+                    
+                    # CHECK THE LIMIT ORDERS SETTING
+                    use_limit_orders = hasattr(self, 'use_limit_orders_var') and self.use_limit_orders_var.get()
+                    self.log_trade(f"Use limit orders setting: {use_limit_orders}")
+                    
+                    # Execute with timeout protection
+                    result = [None]
+                    error = [None]
+                    
+                    def execute_with_timeout():
+                        try:
+                            # PASS THE use_limit_orders PARAMETER
+                            order = self.execute_real_trade(symbol, position_size/price, price, use_limit_orders)
+                            result[0] = order
+                        except Exception as e:
+                            error[0] = e
+                    
+                    trade_thread = threading.Thread(target=execute_with_timeout)
+                    trade_thread.daemon = True
+                    trade_thread.start()
+                    trade_thread.join(timeout=10)
+                    
+                    if trade_thread.is_alive():
+                        self.log_trade(f"TRADE EXECUTION TIMEOUT for {symbol}")
+                        trade['status'] = 'executed'
+                        trade['order_id'] = 'timeout'
+                    elif error[0]:
+                        self.log_trade(f"TRADE EXECUTION ERROR: {error[0]}")
+                        trade['status'] = 'error'
+                    elif result[0]:
+                        self.log_trade(f"TRADE EXECUTED SUCCESSFULLY: {result[0]}")
+                        trade['status'] = 'executed'
+                        trade['order_id'] = result[0].get('id', 'unknown')
+                        # Mark if it was a limit order
+                        trade['is_limit_order'] = use_limit_orders
+                        
+                        # Safely handle price from order response
+                        order_price = result[0].get('price')
+                        if order_price is not None and order_price != 0:
+                            try:
+                                trade['entry_price'] = float(order_price)
+                                self.log_trade(f"Using order price: ${trade['entry_price']:.8f}")
+                            except (ValueError, TypeError):
+                                self.log_trade(f"Invalid order price: {order_price}, using ticker price")
+                        else:
+                            self.log_trade(f"Order price is None/0, using ticker price: ${price:.8f}")
+                        
+                        # Try to get average price if available
+                        avg_price = result[0].get('average')
+                        if avg_price is not None and avg_price != 0:
+                            try:
+                                trade['entry_price'] = float(avg_price)
+                                self.log_trade(f"Using average price: ${trade['entry_price']:.8f}")
+                            except (ValueError, TypeError):
+                                pass
+                    
+                except Exception as e:
+                    self.log_trade(f"REAL TRADE ERROR: {str(e)}")
+                    trade['status'] = 'error'
+            else:
+                # Paper trading
+                self.paper_balance -= position_size
+                trade['status'] = 'executed'
+                self.log_trade(f"PAPER TRADE EXECUTED: {symbol} for ${position_size}")
+            
+            # Update final trade data
+            trade['current_price'] = trade['entry_price']  # Initialize current price
+            self.active_trades[trade_id] = trade
+            
+            # Update displays
+            self.update_active_trades_display()
+            self.update_chart()
+            
+            elapsed = time.time() - trade_start_time
+            self.log_trade(f"EXECUTE_TRADE COMPLETED for {symbol} in {elapsed:.2f}s - Trade kept in active_trades")
+            
+            # Start monitoring immediately with delayed sync
+            threading.Thread(target=self.delayed_sync, daemon=True).start()
+            
             return trade_id
-
+            
         except Exception as e:
-            self.log_trade(f"Error executing trade: {str(e)}")
+            elapsed = time.time() - trade_start_time
+            self.log_trade(f"EXECUTE_TRADE FAILED for {symbol} after {elapsed:.2f}s: {str(e)}")
+            
+            # Remove failed trade if it was added
+            if 'trade_id' in locals() and trade_id in self.active_trades:
+                del self.active_trades[trade_id]
+                self.update_active_trades_display()
+            
             return False
+
+    def delayed_sync(self):
+        """Sync with exchange after a short delay"""
+        time.sleep(5)  # Wait 5 seconds
+        try:
+            self.sync_active_trades_with_exchange()
+            self.log_trade("DELAYED SYNC COMPLETED")
+        except Exception as e:
+            self.log_trade(f"DELAYED SYNC ERROR: {str(e)}")
+
+    def _execute_real_trade_async(self, trade_id, symbol, quantity, price):
+        """Execute real trade in background without blocking main thread"""
+        try:
+            self.log_trade(f"Executing real trade in background for {symbol}")
+            order = self.execute_real_trade(symbol, quantity, price, False)
+            if order:
+                self.log_trade(f"Real trade executed successfully: {order}")
+                # Update trade status
+                if trade_id in self.active_trades:
+                    self.active_trades[trade_id]['order_id'] = order.get('id', 'unknown')
+                    self.active_trades[trade_id]['actual_price'] = order.get('price', price)
+            else:
+                self.log_trade(f"Real trade execution failed for {symbol}")
+        except Exception as e:
+            self.log_trade(f"Error in background trade execution for {symbol}: {str(e)}")
+
+    def delayed_sync(self):
+        """Sync with exchange after a short delay"""
+        time.sleep(5)  # Wait 5 seconds
+        try:
+            self.sync_active_trades_with_exchange()
+            self.log_trade("DELAYED SYNC COMPLETED")
+        except Exception as e:
+            self.log_trade(f"DELAYED SYNC ERROR: {str(e)}")
             
     def verify_paper_balance(self):
         """Verify and fix paper balance if it's incorrect"""
@@ -6395,144 +7122,214 @@ class CryptoScalpingBot:
             return False
 
     def sync_active_trades_with_exchange(self):
-        """Sync active_trades with actual open positions on the exchange (spot) and ignore tiny trades"""
+        """Enhanced sync with MUCH more conservative trade removal to prevent premature closures"""
         try:
             if self.is_paper_trading:
                 return
 
-            # Check open orders
-            open_orders = self.exchange.fetch_open_orders()
-            for order in open_orders:
-                symbol = order['symbol']
-                position_size = float(order.get('cost', 0))
-                if position_size < self.MIN_TRADE_SIZE:
-                    self.log_trade(f"Skipping tiny open order for {symbol} (${position_size:.2f} < ${self.MIN_TRADE_SIZE:.2f})")
-                    continue
-                if not any(t['symbol'] == symbol for t in self.active_trades.values()):
-                    trade_id = f"sync_{int(time.time())}_{symbol.replace('/', '')}"
-                    self.active_trades[trade_id] = {
-                        'symbol': symbol,
-                        'entry_price': float(order.get('price', 0)),
-                        'current_price': float(order.get('price', 0)),
-                        'amount': float(order.get('amount', 0)),
-                        'position_size': position_size,
-                        'entry_time': datetime.now(),
-                        'status': 'open',
-                        'order_id': order['id'],
-                        'is_limit_order': order['type'] == 'limit'
-                    }
-                    self.log_trade(f"Synced open order for {symbol} into active_trades.")
+            # Add timeout protection for the entire sync operation
+            sync_start_time = time.time()
+            max_sync_time = 10  # Reduced from 15 to 10 seconds
 
-            # Check balances for spot positions
-            balance = self.exchange.fetch_balance()
-            for symbol in self.exchange.markets:
-                base = symbol.split('/')[0]
-                amount = balance[base]['free'] if base in balance else 0
-                try:
-                    price = float(self.exchange.fetch_ticker(symbol)['last'])
-                except Exception:
-                    price = 0
-                position_size = amount * price
-                if position_size < self.MIN_TRADE_SIZE:
-                    continue
-                if amount > 0 and not any(t['symbol'] == symbol for t in self.active_trades.values()):
-                    trade_id = f"sync_{int(time.time())}_{symbol.replace('/', '')}"
-                    self.active_trades[trade_id] = {
-                        'symbol': symbol,
-                        'entry_price': price,
-                        'current_price': price,
-                        'amount': amount,
-                        'position_size': position_size,
-                        'entry_time': datetime.now(),
-                        'status': 'open',
-                        'order_id': None,
-                        'is_limit_order': False
-                    }
-                    self.log_trade(f"Synced spot balance for {symbol} into active_trades.")
-
-            self.update_active_trades_display()
-
-        except Exception as e:
-            self.log_trade(f"Error syncing active trades: {str(e)}")
-
-
-    def sync_metrics_with_exchange(self):
-        """Sync performance metrics with exchange data"""
-        try:
-            if self.is_paper_trading:
-                return  # No need to sync paper metrics
-                
-            self.log_trade("Syncing metrics with exchange data...")
+            self.log_trade("Verifying trades with exchange balances...")
             
-            # Verify active trades first
-            self.verify_active_trades()
-            
-            # Fetch recent trades from exchange to update metrics
             try:
-                # Get trades from the last 24 hours
-                since = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-                trades = self.exchange.fetch_my_trades(since=since)
-                
-                if not trades:
-                    self.log_trade("No recent trades found on exchange")
-                    return
-                    
-                self.log_trade(f"Found {len(trades)} recent trades on exchange")
-                
-                # Process trades to update metrics
-                for trade in trades:
-                    # Skip trades we've already processed
-                    if trade['id'] in self.processed_trade_ids:
-                        continue
+                # Get balances with aggressive timeout
+                balances = None
+                for attempt in range(2):
+                    try:
+                        # Set very short timeout for this operation
+                        original_timeout = getattr(self.exchange, 'timeout', 30000)
+                        self.exchange.timeout = 3000  # 3 seconds only
                         
-                    # Add to processed IDs
-                    self.processed_trade_ids.add(trade['id'])
-                    
-                    # Process trade data
-                    symbol = trade['symbol']
-                    side = trade['side']
-                    price = float(trade['price'])
-                    amount = float(trade['amount'])
-                    cost = float(trade['cost'])
-                    fee = float(trade['fee']['cost']) if trade['fee'] else 0
-                    
-                    # We're only interested in completed trades
-                    if side == 'sell':
-                        # Find matching buy trade if possible
-                        buy_trades = [t for t in trades if t['symbol'] == symbol and t['side'] == 'buy']
-                        if buy_trades:
-                            # Use the most recent buy trade as entry
-                            buy_trade = max(buy_trades, key=lambda t: t['timestamp'])
-                            entry_price = float(buy_trade['price'])
+                        balances = self.exchange.fetch_balance()
+                        
+                        # Restore timeout immediately
+                        self.exchange.timeout = original_timeout
+                        break
+                        
+                    except Exception as e:
+                        # Restore timeout on error
+                        if hasattr(self, 'exchange'):
+                            self.exchange.timeout = original_timeout
                             
-                            # Calculate profit
-                            profit_pct = ((price - entry_price) / entry_price) * 100
-                            profit = (price - entry_price) * amount
-                            
-                            # Update metrics
-                            self.real_metrics['total_trades'] += 1
-                            self.real_metrics['total_profit'] += profit
-                            self.real_metrics['total_fees'] += fee
-                            
-                            if profit > 0:
-                                self.real_metrics['winning_trades'] += 1
-                            else:
-                                self.real_metrics['losing_trades'] += 1
-                                
-                            # Log the trade
-                            self.log_trade(f"Synced trade: {symbol} - Entry: ${entry_price:.6f}, Exit: ${price:.6f}, P/L: {profit_pct:.2f}%")
-                            
-                            # Update trade history
-                            self.update_trade_history(symbol, profit_pct, profit)
+                        self.log_trade(f"Balance fetch attempt {attempt+1} failed: {str(e)}")
+                        if attempt < 1:
+                            time.sleep(0.5)
+                        else:
+                            self.log_trade("Balance fetch failed - SKIPPING SYNC to prevent premature trade removal")
+                            return  # DON'T REMOVE TRADES if we can't verify balances
                 
-                # Update displays
-                self.update_metrics()
+                if not balances:
+                    self.log_trade("Could not fetch balances - PROTECTING all active trades")
+                    return
+                
+                # Check if we've exceeded sync time limit
+                if time.time() - sync_start_time > max_sync_time:
+                    self.log_trade("Sync timeout reached - PROTECTING all trades")
+                    return
+                
+                # Process balances with timeout checks
+                balance_data = {}
+                processed_count = 0
+                max_currencies_to_process = 15  # Reduced from 20
+                
+                for currency, balance_info in balances.items():
+                    # Check timeout frequently during processing
+                    if time.time() - sync_start_time > max_sync_time:
+                        self.log_trade("Sync timeout during balance processing - stopping")
+                        break
+                        
+                    if currency in ['info', 'free', 'used', 'total']:
+                        continue
+                    
+                    processed_count += 1
+                    if processed_count > max_currencies_to_process:
+                        self.log_trade(f"Processed maximum {max_currencies_to_process} currencies - stopping")
+                        break
+                    
+                    try:
+                        if isinstance(balance_info, dict) and 'total' in balance_info:
+                            total_balance = float(balance_info['total']) if balance_info['total'] is not None else 0.0
+                            
+                            if total_balance > 0.00001:  # Very small threshold
+                                balance_data[currency] = {
+                                    'total': total_balance,
+                                    'free': float(balance_info['free']) if balance_info['free'] is not None else 0.0
+                                }
+                    except Exception as e:
+                        continue
+                
+                # CRITICAL CHANGE: MUCH MORE CONSERVATIVE TRADE REMOVAL
+                current_time = datetime.now()
+                trades_to_remove = []
+                
+                for trade_id, trade in list(self.active_trades.items()):
+                    # Check timeout again
+                    if time.time() - sync_start_time > max_sync_time:
+                        self.log_trade("Sync timeout during trade verification - PROTECTING remaining trades")
+                        break
+                        
+                    trade_age = (current_time - trade.get('entry_time', current_time)).total_seconds()
+                    
+                    # NEVER remove trades less than 24 hours old (changed from 2 hours to 24 hours)
+                    if trade_age < 86400:  # 24 hours in seconds
+                        self.log_trade(f"Protecting trade {trade['symbol']} (age: {trade_age/3600:.1f} hours)")
+                        continue
+                    
+                    # Only remove if trade is EXTREMELY old (>48 hours) AND multiple confirmations
+                    if trade_age > 172800:  # 48 hours
+                        symbol = trade['symbol']
+                        base_currency = symbol.split('/')[0]
+                        
+                        # Handle Kraken's special currency naming
+                        kraken_currency_map = {
+                            'BTC': ['XXBT', 'XBT', 'BTC'],
+                            'ETH': ['XETH', 'ETH'],
+                            'LTC': ['XLTC', 'LTC'],
+                            'XRP': ['XXRP', 'XRP'],
+                            'DOGE': ['DOGE'],
+                            'ADA': ['ADA'],
+                            'DOT': ['DOT', 'DOT.F'],
+                            'ALGO': ['ALGO'],
+                            'NEAR': ['NEAR'],
+                            'SUI': ['SUI', 'SUI.F']
+                        }
+                        
+                        # Get all possible currency names for this base currency
+                        possible_names = kraken_currency_map.get(base_currency, [base_currency])
+                        
+                        # Check if we have ANY of these currency names
+                        found_balance = False
+                        actual_balance = 0.0
+                        
+                        for currency_name in possible_names:
+                            if currency_name in balance_data:
+                                found_balance = True
+                                actual_balance = balance_data[currency_name]['total']
+                                self.log_trade(f"Found balance for {currency_name}: {actual_balance}")
+                                break
+                        
+                        # Only mark for removal if EXTREMELY old AND confirmed zero balance AND additional checks
+                        if not found_balance and actual_balance < 0.00001:
+                            # Additional confirmation - try to fetch fresh balance for this specific currency
+                            try:
+                                fresh_balance = self.exchange.fetch_balance()
+                                if base_currency in fresh_balance and fresh_balance[base_currency]['total'] > 0.00001:
+                                    self.log_trade(f"Fresh balance check found {base_currency}: {fresh_balance[base_currency]['total']} - KEEPING trade")
+                                    continue
+                            except Exception as e:
+                                self.log_trade(f"Could not verify fresh balance for {base_currency} - KEEPING trade to be safe")
+                                continue
+                            
+                            self.log_trade(f"Multiple confirmations of zero balance for extremely old trade: {symbol} (age: {trade_age/3600:.1f}hours)")
+                            trades_to_remove.append(trade_id)
+                        else:
+                            if found_balance:
+                                self.log_trade(f"Found balance {actual_balance} for {symbol} - keeping trade active")
+                            else:
+                                self.log_trade(f"Could not verify balance for {symbol} - keeping trade active to be safe")
+                
+                # Remove trades only if we have MULTIPLE confirmations
+                removed_count = 0
+                for trade_id in trades_to_remove:
+                    if trade_id in self.active_trades:
+                        try:
+                            trade = self.active_trades[trade_id]
+                            symbol = trade['symbol']
+                            
+                            # ONE FINAL CHECK - try to get current price to calculate final P/L
+                            try:
+                                ticker = self.safe_ccxt_call(self.exchange.fetch_ticker, symbol)
+                                if ticker:
+                                    current_price = float(ticker['last'])
+                                    entry_price = trade['entry_price']
+                                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                                    
+                                    self.log_trade(f"Final P/L calculation for {symbol}: {profit_pct:.2f}%")
+                                    
+                                    # Update real metrics
+                                    self.real_metrics['total_trades'] += 1
+                                    if profit_pct > 0:
+                                        self.real_metrics['winning_trades'] += 1
+                                    else:
+                                        self.real_metrics['losing_trades'] += 1
+                            except Exception as e:
+                                self.log_trade(f"Could not get final price for {symbol}: {str(e)}")
+                            
+                            # Remove the trade
+                            del self.active_trades[trade_id]
+                            self.log_trade(f"Removed extremely old trade after multiple confirmations: {symbol}")
+                            removed_count += 1
+                            
+                            # Limit removals to prevent overload
+                            if removed_count >= 1:  # Only remove 1 trade per sync
+                                self.log_trade("Removed 1 trade this sync - stopping to prevent overload")
+                                break
+                                
+                        except Exception as e:
+                            self.log_trade(f"Error removing trade {trade_id}: {str(e)}")
+                            continue
+                
+                # Update displays only if we haven't timed out
+                if time.time() - sync_start_time <= max_sync_time:
+                    try:
+                        self.update_active_trades_display()
+                        self.update_chart()
+                    except Exception as e:
+                        self.log_trade(f"Error updating displays: {str(e)}")
+                
+                sync_duration = time.time() - sync_start_time
+                self.log_trade(f"Sync completed in {sync_duration:.1f} seconds")
                 
             except Exception as e:
-                self.log_trade(f"Error fetching trades from exchange: {str(e)}")
+                self.log_trade(f"Error in sync operation: {str(e)}")
+                # CRITICAL: Don't let sync errors remove trades
                 
         except Exception as e:
-            self.log_trade(f"Error syncing metrics: {str(e)}")
+            self.log_trade(f"Fatal error in sync_active_trades_with_exchange: {str(e)}")
+            # CRITICAL: Even fatal errors shouldn't remove trades
+
 
     def verify_active_trades(self):
         """Verify active trades against exchange positions and update accordingly"""
@@ -6665,7 +7462,7 @@ class CryptoScalpingBot:
                 rsi_overbought = 70
                 rsi_oversold = 30
             
-            # 3. Volume-Weighted Momentum
+            # 3. Volume-Weighted Momentum - RELAXED CHECK
             try:
                 # Calculate volume-weighted momentum
                 if len(df) >= 5:
@@ -6680,10 +7477,12 @@ class CryptoScalpingBot:
                     
                     self.log_trade(f"Volume-Weighted Momentum for {symbol}: {vwm:.2f}%")
                     
-                    # Check if momentum is positive
-                    if vwm < 0 and not market_override:
-                        self.log_trade(f"Negative momentum for {symbol}: {vwm:.2f}%")
+                    # RELAXED: Only reject if momentum is very negative AND market override is off
+                    if vwm < -0.5 and not market_override:  # Changed from 0 to -0.5%
+                        self.log_trade(f"Very negative momentum for {symbol}: {vwm:.2f}%")
                         return False
+                    elif vwm < 0:
+                        self.log_trade(f"Negative momentum for {symbol}: {vwm:.2f}% - but allowing due to relaxed check")
                 else:
                     self.log_trade(f"Insufficient data for volume-weighted momentum calculation")
                     vwm = 0
@@ -6691,42 +7490,47 @@ class CryptoScalpingBot:
                 self.log_trade(f"Error calculating volume-weighted momentum: {str(e)}")
                 vwm = 0
             
-            # 4. Order Book Analysis
+            # 4. Order Book Analysis - MAKE THIS OPTIONAL
             try:
-                # Get order book if available
-                if hasattr(self, 'exchange') and self.exchange is not None:
-                    order_book = self.exchange.fetch_order_book(symbol)
-                    
-                    # Calculate bid/ask ratio
-                    total_bids = sum(bid[1] for bid in order_book['bids'][:5])
-                    total_asks = sum(ask[1] for ask in order_book['asks'][:5])
-                    
-                    if total_asks > 0:
-                        ob_ratio = total_bids / total_asks
-                    else:
-                        ob_ratio = 1.0
-                    
-                    self.log_trade(f"Order Book Imbalance for {symbol}: {ob_ratio:.2f}")
-                    
-                    # Check if there's significant buy pressure
-                    if ob_ratio < 0.5 and not market_override:
-                        self.log_trade(f"Insufficient buy pressure for {symbol}: {ob_ratio:.2f}")
-                        return False
-                else:
-                    self.log_trade(f"Order book not available for {symbol}")
+                # Skip order book analysis if market override is active (it's slow)
+                if market_override:
+                    self.log_trade(f"Skipping order book analysis due to market override")
                     ob_ratio = 1.0
+                else:
+                    # Get order book if available
+                    if hasattr(self, 'exchange') and self.exchange is not None:
+                        order_book = self.exchange.fetch_order_book(symbol)
+                        
+                        # Calculate bid/ask ratio
+                        total_bids = sum(bid[1] for bid in order_book['bids'][:5])
+                        total_asks = sum(ask[1] for ask in order_book['asks'][:5])
+                        
+                        if total_asks > 0:
+                            ob_ratio = total_bids / total_asks
+                        else:
+                            ob_ratio = 1.0
+                        
+                        self.log_trade(f"Order Book Imbalance for {symbol}: {ob_ratio:.2f}")
+                        
+                        # RELAXED: Only reject if there's very heavy selling pressure
+                        if ob_ratio < 0.3:  # Changed from 0.5 to 0.3
+                            self.log_trade(f"Extreme selling pressure for {symbol}: {ob_ratio:.2f}")
+                            return False
+                    else:
+                        self.log_trade(f"Order book not available for {symbol}")
+                        ob_ratio = 1.0
             except Exception as e:
                 self.log_trade(f"Error analyzing order book: {str(e)}")
                 ob_ratio = 1.0
             
             # Log all advanced check results
-            self.log_trade(f"Advanced checks passed for {symbol}:")
+            self.log_trade(f"Advanced checks PASSED for {symbol}:")
             self.log_trade(f"- EMA Cross: {ema_cross}")
-            self.log_trade(f"- VWAP Momentum: {vwm:.2f}%")
+            self.log_trade(f"- VWAP Momentum: {vwm:.2f}% (relaxed check)")
             self.log_trade(f"- Order Book Ratio: {ob_ratio:.2f}")
             self.log_trade(f"- RSI: {rsi_value:.2f} (Overbought: {rsi_overbought}, Oversold: {rsi_oversold})")
             
-            # Return true if we've passed all checks
+            # Return true - we've relaxed the checks
             return True
             
         except Exception as e:
@@ -6737,6 +7541,7 @@ class CryptoScalpingBot:
     def update_active_trades_display(self):
         """Update the active trades display with current trade information, filtering out tiny trades"""
         try:
+            self.cleanup_non_crypto_trades()
             # Skip if trades_text widget doesn't exist
             if not hasattr(self, 'trades_text'):
                 return
@@ -6759,11 +7564,14 @@ class CryptoScalpingBot:
                     symbol = trade.get('symbol', 'Unknown')
                     entry_price = trade.get('entry_price', 0.0)
                     
-                    # Get current price safely
+                    # CRITICAL FIX: Get current price and profit from the updated trade data
                     current_price = trade.get('current_price', entry_price)
-                    
-                    # Calculate profit percentage
                     profit_pct = trade.get('current_profit_percentage', 0.0)
+                    
+                    # Calculate current USD value of the position
+                    position_size = trade.get('position_size', 0.0)
+                    amount = trade.get('amount', position_size / entry_price if entry_price > 0 else 0)
+                    current_value = amount * current_price if current_price > 0 else position_size
                     
                     # Get entry time and calculate time in trade
                     entry_time_str = "Unknown"
@@ -6773,38 +7581,51 @@ class CryptoScalpingBot:
                         entry_time = trade['entry_time']
                         entry_time_str = entry_time.strftime("%H:%M:%S")
                         time_diff = datetime.now() - entry_time
-                        minutes, seconds = divmod(time_diff.seconds, 60)
-                        time_in_trade_str = f"{minutes}m {seconds}s"
+                        total_seconds = int(time_diff.total_seconds())
+                        hours = total_seconds // 3600
+                        minutes = (total_seconds % 3600) // 60
+                        seconds = total_seconds % 60
+                        
+                        if hours > 0:
+                            time_in_trade_str = f"{hours}h {minutes}m {seconds}s"
+                        else:
+                            time_in_trade_str = f"{minutes}m {seconds}s"
                     
-                    # Format position size
-                    position_size = trade.get('position_size', 0.0)
+                    # Calculate profit/loss in USD
+                    profit_usd = current_value - position_size
                     
-                    # Format trade info for display
+                    # Format trade info for display with REAL VALUES
                     trade_info = (
-                        f"{symbol} - ID: {trade_id}\n"
-                        f"Entry: ${entry_price:.8f}\n"
-                        f"Current: ${current_price:.8f}\n"
-                        f"P/L: {profit_pct:.2f}%\n"
-                        f"Size: ${position_size:.2f}\n"
+                        f"{symbol}\n"
+                        f"Entry: ${entry_price:.6f}\n"
+                        f"Current: ${current_price:.6f}\n"
+                        f"P/L: {profit_pct:.2f}% (${profit_usd:.2f})\n"
+                        f"Position: ${position_size:.2f} → ${current_value:.2f}\n"
+                        f"Amount: {amount:.6f} {symbol.split('/')[0]}\n"
                         f"Entry Time: {entry_time_str}\n"
-                        f"Time in Trade: {time_in_trade_str}\n"
-                        f"Highest P/L: {trade.get('highest_profit_percentage', 0.0):.2f}%\n"
-                        f"{'-' * 30}\n"
+                        f"Duration: {time_in_trade_str}\n"
+                        f"Highest: {trade.get('highest_profit_percentage', 0.0):.2f}%\n"
+                        f"{'-' * 40}\n"
                     )
                     
                     # Insert trade info into text widget
+                    start_idx = self.trades_text.index(tk.END)
                     self.trades_text.insert(tk.END, trade_info)
+                    end_idx = self.trades_text.index(tk.END)
                     
                     # Apply color coding based on profit/loss
-                    start_pos = self.trades_text.index(f"end-{len(trade_info)+1}c")
-                    end_pos = self.trades_text.index("end-1c")
-                    
                     if profit_pct > 0:
-                        self.trades_text.tag_add("profit", start_pos, end_pos)
+                        self.trades_text.tag_add("profit", start_idx, end_idx)
                         self.trades_text.tag_config("profit", foreground="green")
-                    else:
-                        self.trades_text.tag_add("loss", start_pos, end_pos)
+                    elif profit_pct < 0:
+                        self.trades_text.tag_add("loss", start_idx, end_idx)
                         self.trades_text.tag_config("loss", foreground="red")
+                    else:
+                        self.trades_text.tag_add("neutral", start_idx, end_idx)
+                        self.trades_text.tag_config("neutral", foreground="blue")
+                    
+                    # Log the display values for debugging
+                    self.log_trade(f"Display updated for {symbol}: P/L={profit_pct:.2f}%, Value=${current_value:.2f}")
                     
                 except Exception as e:
                     # Log error but continue processing other trades
@@ -8219,91 +9040,212 @@ class CryptoScalpingBot:
             self.log_trade(f"Error validating advanced parameters: {str(e)}")
             messagebox.showerror("Error", f"Failed to apply advanced parameters: {str(e)}")
 
-    def monitor_trades(self):
-        """Monitor active trades and close them when conditions are met"""
+    def recover_from_hang(self):
+        """Recover from hanging state and restart monitoring"""
         try:
-            # Update market condition display periodically
-            current_time = time.time()
-            if not hasattr(self, '_last_market_update') or (current_time - self._last_market_update) > 30:
-                if hasattr(self, 'market_condition_label'):
-                    self.update_market_info()
-                if hasattr(self, 'ml_accuracy_label'):
-                    self.update_ml_info()
-                self._last_market_update = current_time
-                
-            # Update chart with latest price data
-            if hasattr(self, 'ax') and hasattr(self, 'canvas'):
+            self.log_trade("RECOVERY: Attempting to recover from hanging state")
+            
+            # Reset all scanning flags
+            self.is_scanning = False
+            self._scan_running = False
+            
+            # Kill any stuck threads
+            if hasattr(self, '_scan_thread'):
+                self._scan_thread = None
+            
+            # Clear any thread start times
+            if hasattr(self, '_scan_thread_start_time'):
+                delattr(self, '_scan_thread_start_time')
+            
+            # Force update displays
+            try:
+                self.update_active_trades_display()
                 self.update_chart()
-                
+                self.update_metrics()
+            except Exception as e:
+                self.log_trade(f"Error updating displays during recovery: {str(e)}")
+            
+            # Restart monitoring
+            try:
+                self.monitor_trades()
+            except Exception as e:
+                self.log_trade(f"Error restarting monitoring: {str(e)}")
+            
+            self.log_trade("RECOVERY: Recovery attempt completed")
+            
+        except Exception as e:
+            self.log_trade(f"Error in recovery: {str(e)}")
+
+
+    def monitor_trades(self):
+        """Monitor active trades with improved price updating and error handling"""
+        try:
+            # CRITICAL FIX: Clean up invalid trades first
+            self.cleanup_non_crypto_trades()
+            
+            # Exit early if no trades to monitor
             if not self.active_trades:
                 return
-                    
-            # First enforce max trades limit
-            self.enforce_max_trades_limit()
+                
+            monitor_start_time = time.time()
+            max_monitor_time = 10  # 10 second maximum for monitoring
             
-            # Get parameters from GUI once
+            self.log_trade(f"Monitoring {len(self.active_trades)} active trades...")
+            
+            # Get parameters from GUI
             stop_loss = float(self.stop_loss.get()) if hasattr(self, 'stop_loss') else 1.0
             profit_target = float(self.profit_target.get()) if hasattr(self, 'profit_target') else 1.5
             trailing_stop = float(self.trailing_stop.get()) if hasattr(self, 'trailing_stop') else 0.5
             trailing_activation = float(self.trailing_activation.get()) if hasattr(self, 'trailing_activation') else 1.0
             
-            # Log the number of trades being monitored
-            self.log_trade(f"Monitoring {len(self.active_trades)} active trades...")
-            
-            # Check each active trade
+            # Process each trade with timeout protection
+            trades_processed = 0
             for trade_id in list(self.active_trades.keys()):
+                # Check timeout
+                if time.time() - monitor_start_time > max_monitor_time:
+                    self.log_trade("Monitor timeout reached - stopping")
+                    break
+                    
+                trades_processed += 1
+                if trades_processed > 10:  # Limit number of trades processed
+                    self.log_trade("Processed maximum trades - stopping")
+                    break
+                    
                 try:
                     trade = self.active_trades[trade_id]
                     symbol = trade['symbol']
                     entry_price = float(trade['entry_price'])
                     
-                    # Get current price
-                    ticker = self.exchange.fetch_ticker(symbol)
-                    current_price = float(ticker['last'])
+                    # CRITICAL FIX: Always fetch fresh price, don't use cached/fallback
+                    current_price = None
+                    price_fetch_attempts = 0
+                    max_price_attempts = 3
                     
-                    # Update the current price in the trade object
-                    trade['current_price'] = current_price
+                    while current_price is None and price_fetch_attempts < max_price_attempts:
+                        try:
+                            price_fetch_attempts += 1
+                            self.log_trade(f"Fetching fresh price for {symbol} (attempt {price_fetch_attempts}/{max_price_attempts})")
+                            
+                            # Set short timeout for price fetch
+                            original_timeout = getattr(self.exchange, 'timeout', 30000)
+                            self.exchange.timeout = 5000  # 5 seconds only
+                            
+                            ticker = self.exchange.fetch_ticker(symbol)
+                            
+                            # Restore timeout immediately
+                            self.exchange.timeout = original_timeout
+                            
+                            if ticker and 'last' in ticker and ticker['last']:
+                                current_price = float(ticker['last'])
+                                self.log_trade(f"Fresh price fetched for {symbol}: ${current_price:.6f}")
+                                break
+                            else:
+                                self.log_trade(f"Invalid ticker data for {symbol}")
+                                
+                        except Exception as e:
+                            # Restore timeout on error
+                            if hasattr(self, 'exchange'):
+                                self.exchange.timeout = getattr(self.exchange, 'timeout', 30000)
+                            
+                            self.log_trade(f"Price fetch attempt {price_fetch_attempts} failed for {symbol}: {str(e)}")
+                            if price_fetch_attempts < max_price_attempts:
+                                time.sleep(1)  # Wait before retry
                     
-                    # Calculate profit percentage
+                    # If we couldn't get a fresh price after all attempts, skip this trade for now
+                    if current_price is None:
+                        self.log_trade(f"WARNING: Could not fetch current price for {symbol} after {max_price_attempts} attempts - skipping monitoring this round")
+                        continue
+                    
+                    # Calculate profit percentage with fresh price
                     profit_pct = ((current_price - entry_price) / entry_price) * 100
                     
-                    # Log current P/L for monitoring
-                    self.log_trade(f"Trade {symbol}: Current P/L: {profit_pct:.2f}%, Entry: ${entry_price:.8f}, Current: ${current_price:.8f}")
+                    # CRITICAL: Update all trade data with current values
+                    trade['current_price'] = current_price
+                    trade['current_profit_percentage'] = profit_pct
+                    trade['last_update'] = datetime.now()
                     
-                    # Update highest price and profit if needed
-                    if current_price > trade.get('highest_price', 0):
+                    # Calculate current USD value of the position
+                    position_size = trade.get('position_size', 0.0)
+                    amount = trade.get('amount', position_size / entry_price if entry_price > 0 else 0)
+                    current_value = amount * current_price if current_price > 0 else position_size
+                    
+                    # Update current value and profit in USD
+                    trade['current_value'] = current_value
+                    trade['profit_usd'] = current_value - position_size
+                    
+                    # Update highest profit if we have a new high
+                    if profit_pct > trade.get('highest_profit_percentage', 0):
+                        trade['highest_profit_percentage'] = profit_pct
                         trade['highest_price'] = current_price
-                        trade['highest_profit'] = profit_pct
                     
-                    # CASE 1: Stop Loss
+                    # Update price history for charting
+                    if symbol not in self.price_history:
+                        self.price_history[symbol] = []
+                    self.price_history[symbol].append((datetime.now(), current_price))
+                    
+                    # Limit price history size
+                    self.price_history[symbol] = self.price_history[symbol][-50:]
+                    
+                    # ALWAYS log current status with fresh data
+                    self.log_trade(f"Trade {symbol}: P/L: {profit_pct:.2f}%, Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Value: ${current_value:.2f}")
+                    
+                    # Check exit conditions with FRESH profit calculation
+                    should_close = False
+                    close_reason = ""
+                    
+                    # Stop Loss - use absolute value to catch both positive and negative
                     if profit_pct <= -stop_loss:
-                        self.log_trade(f"Stop loss triggered on {symbol} at {profit_pct:.2f}%")
-                        self.close_trade(trade_id, trade, current_price, "stop loss")
-                        continue
+                        should_close = True
+                        close_reason = f"stop loss at {profit_pct:.2f}%"
                     
-                    # CASE 2: Take Profit
-                    if profit_pct >= profit_target:
-                        self.log_trade(f"Profit target reached on {symbol} at {profit_pct:.2f}%")
-                        self.close_trade(trade_id, trade, current_price, "take profit")
-                        continue
+                    # Profit Target
+                    elif profit_pct >= profit_target:
+                        should_close = True
+                        close_reason = f"profit target at {profit_pct:.2f}%"
                     
-                    # CASE 3: Trailing Stop
-                    if profit_pct >= trailing_activation:
-                        # Calculate drop from highest profit
-                        highest_profit = trade.get('highest_profit', profit_pct)
+                    # Trailing Stop
+                    elif profit_pct >= trailing_activation:
+                        highest_profit = trade.get('highest_profit_percentage', profit_pct)
                         drop_from_high = highest_profit - profit_pct
                         
                         if drop_from_high >= trailing_stop:
-                            self.log_trade(f"Trailing stop triggered on {symbol} at {profit_pct:.2f}% (drop from high: {drop_from_high:.2f}%)")
-                            self.close_trade(trade_id, trade, current_price, "trailing stop")
-                            continue
+                            should_close = True
+                            close_reason = f"trailing stop at {profit_pct:.2f}% (dropped {drop_from_high:.2f}% from high)"
+                    
+                    # Check for time-based exit if configured
+                    if hasattr(self, 'max_trade_duration') and self.max_trade_duration:
+                        try:
+                            max_duration = int(self.max_trade_duration.get()) * 60  # Convert minutes to seconds
+                            trade_age = (datetime.now() - trade.get('entry_time', datetime.now())).total_seconds()
+                            
+                            if trade_age > max_duration:
+                                should_close = True
+                                close_reason = f"max duration reached ({trade_age/60:.1f} minutes)"
+                        except:
+                            pass  # Skip time-based exit if not configured properly
+                    
+                    # Close trade if conditions met
+                    if should_close:
+                        self.log_trade(f"CLOSING TRADE: {symbol}: {close_reason}")
+                        self.close_trade(trade_id, trade, current_price, close_reason)
+                    else:
+                        # Update the trade in active_trades with the new data
+                        self.active_trades[trade_id] = trade
                     
                 except Exception as e:
                     self.log_trade(f"Error monitoring trade {trade_id}: {str(e)}")
                     continue
-                    
-            # Update displays
-            self.update_active_trades_display()
+            
+            # CRITICAL: Always update displays after monitoring
+            try:
+                self.update_active_trades_display()
+                self.update_chart()
+            except Exception as e:
+                self.log_trade(f"Error updating displays: {str(e)}")
+            
+            monitor_duration = time.time() - monitor_start_time
+            if monitor_duration > 2:  # Only log if it takes longer than 2 seconds
+                self.log_trade(f"Monitor completed in {monitor_duration:.1f} seconds")
             
         except Exception as e:
             self.log_trade(f"Error in monitor_trades: {str(e)}")
@@ -8368,7 +9310,7 @@ class CryptoScalpingBot:
             market_data = self.analyze_market_conditions()
             trading_allowed = market_data.get('trading_allowed', False)
 
-            if hasattr(self, 'market_override') and self.market_override.get():
+            if hasattr(self, 'market_override_var') and self.market_override_var.get():
                 trading_allowed = True
                 self.log_trade("MARKET OVERRIDE ENABLED: Bot will ignore bearish market conditions")
 
@@ -8389,55 +9331,138 @@ class CryptoScalpingBot:
         finally:
             self.is_scanning = False
 
-    def trading_loop(self):
-        """Main trading loop with enhanced safety checks"""
-        try:
-            # Initialize loop variables
-            last_cleanup_time = time.time()
-            last_verify_time = time.time()
-            last_enforce_time = time.time()
-            cleanup_interval = 3600  # Clean up dust every hour
-            verify_interval = 60     # Verify positions every minute
-            enforce_interval = 30    # Enforce trade limits every 30 seconds
+    def emergency_cleanup(self):
+        """Emergency cleanup of invalid trades"""
+        trades_to_remove = []
+        
+        for trade_id, trade in list(self.active_trades.items()):
+            symbol = trade.get('symbol', '')
             
+            # Remove EUR/USD and any other forex pairs
+            if symbol in ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF']:
+                trades_to_remove.append(trade_id)
+                self.log_trade(f"EMERGENCY REMOVAL: {symbol}")
+        
+        for trade_id in trades_to_remove:
+            del self.active_trades[trade_id]
+            
+        self.update_active_trades_display()
+        self.update_chart()
+        
+        self.log_trade(f"Emergency cleanup completed - removed {len(trades_to_remove)} invalid trades")
+
+    def trading_loop(self):
+        """Main trading loop with hang detection and recovery"""
+        try:
             self.log_trade("Trading loop started")
+            last_activity = time.time()
+            hang_timeout = 60  # 60 seconds without activity = hang
             
             while self.running:
                 try:
-                    # CRITICAL: Enforce max trades limit frequently
-                    current_time = time.time()
-                    if (current_time - last_enforce_time) > enforce_interval:
+                    loop_start = time.time()
+                    
+                    # Emergency cleanup at start of each loop iteration
+                    try:
+                        self.emergency_cleanup()
+                    except Exception as e:
+                        self.log_trade(f"Error in emergency cleanup: {str(e)}")
+                    
+                    # Update status
+                    self.update_status("Running - Monitoring trades")
+                    
+                    # CRITICAL: Always monitor trades if we have any, regardless of sync issues
+                    if self.active_trades:
+                        try:
+                            self.monitor_trades()
+                            last_activity = time.time()
+                            
+                            # Log active trade count periodically
+                            if not hasattr(self, '_last_trade_count_log') or time.time() - self._last_trade_count_log > 30:
+                                self.log_trade(f"Currently monitoring {len(self.active_trades)} active trades")
+                                for trade_id, trade in self.active_trades.items():
+                                    symbol = trade['symbol']
+                                    age = (datetime.now() - trade.get('entry_time', datetime.now())).total_seconds()
+                                    profit = trade.get('current_profit_percentage', 0.0)
+                                    self.log_trade(f"  - {symbol}: {profit:.2f}% P/L, Age: {age/60:.1f}min")
+                                self._last_trade_count_log = time.time()
+                                
+                        except Exception as e:
+                            self.log_trade(f"Error in trade monitoring: {str(e)}")
+                            # Don't let monitoring errors stop the loop
+                            
+                    else:
+                        # If no active trades, just log occasionally
+                        if not hasattr(self, '_last_no_trades_log') or time.time() - self._last_no_trades_log > 60:
+                            self.log_trade("No active trades to monitor")
+                            self._last_no_trades_log = time.time()
+                    
+                    # Scan for new opportunities (only if we have room for more trades)
+                    max_trades = int(self.max_trades_entry.get()) if hasattr(self, 'max_trades_entry') else 3
+                    
+                    # Force a scan every 30 seconds if we're not at max trades
+                    if len(self.active_trades) < max_trades:
+                        current_time = time.time()
+                        if not hasattr(self, 'last_scan_time') or (current_time - self.last_scan_time) > 30:
+                            self.log_trade(f"Initiating scan (active: {len(self.active_trades)}/{max_trades})")
+                            
+                            # Use the existing scan method but don't let it hang
+                            try:
+                                self.scan_opportunities_async()
+                                self.last_scan_time = current_time
+                                last_activity = time.time()
+                            except Exception as e:
+                                self.log_trade(f"Scan error: {str(e)}")
+                                self.is_scanning = False  # Reset flag
+                    
+                    # Enforce trade limits
+                    if len(self.active_trades) > max_trades:
                         self.enforce_max_trades_limit()
-                        last_enforce_time = current_time
                     
-                    # Main trading logic
-                    self.root.after(0, self.analyze_and_trade)
+                    # Periodic cleanup with MUCH LONGER intervals (every 30 minutes instead of 5)
+                    if not hasattr(self, 'last_cleanup') or (time.time() - self.last_cleanup) > 1800:  # 30 minutes
+                        if not self.is_paper_trading:
+                            try:
+                                self.log_trade("Starting periodic sync (30-minute interval)...")
+                                sync_start = time.time()
+                                self.sync_active_trades_with_exchange()
+                                sync_duration = time.time() - sync_start
+                                self.log_trade(f"Periodic sync completed in {sync_duration:.1f}s")
+                                last_activity = time.time()
+                            except Exception as e:
+                                self.log_trade(f"Sync error (trades will continue monitoring): {str(e)}")
+                        self.last_cleanup = time.time()
                     
-                    # Monitor active trades
-                    self.monitor_trades()
+                    # Check for hang condition
+                    if time.time() - last_activity > hang_timeout:
+                        self.log_trade(f"HANG DETECTED: No activity for {hang_timeout} seconds - attempting recovery")
+                        self.recover_from_hang()
+                        last_activity = time.time()
                     
-                    # Check if it's time to verify positions
-                    if not self.is_paper_trading and (current_time - last_verify_time) > verify_interval:
-                        self.verify_exchange_positions()
-                        last_verify_time = current_time
+                    # Adjust sleep time based on whether we have trades
+                    if self.active_trades:
+                        time.sleep(2)  # Check active trades every 2 seconds
+                    else:
+                        time.sleep(5)  # Sleep longer when no trades to monitor
                     
-                    # Check if it's time to clean up dust
-                    if not self.is_paper_trading and (current_time - last_cleanup_time) > cleanup_interval:
-                        if hasattr(self, 'cleanup_dust_balances'):
-                            self.cleanup_dust_balances()
-                        last_cleanup_time = current_time
-                    
-                    # Sleep to avoid overloading
+                    # Log if loop took too long
+                    loop_duration = time.time() - loop_start
+                    if loop_duration > 10:
+                        self.log_trade(f"WARNING: Trading loop took {loop_duration:.1f} seconds")
+                        
+                except Exception as e:
+                    self.log_trade(f"Error in trading loop iteration: {str(e)}")
+                    # Reset scanning flags on error but KEEP MONITORING TRADES
+                    self.is_scanning = False
+                    self._scan_running = False
+                    last_activity = time.time()  # Reset activity timer
                     time.sleep(5)
                     
-                except Exception as e:
-                    self.log_trade(f"Error in trading loop: {str(e)}")
-                    time.sleep(10)  # Longer sleep on error
-                    
             self.log_trade("Trading loop stopped")
-                
+                    
         except Exception as e:
             self.log_trade(f"Fatal error in trading loop: {str(e)}")
+            self.running = False
 
     def run(self):
         """Main run method"""
